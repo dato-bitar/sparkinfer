@@ -3775,6 +3775,19 @@ int main(int argc, char** argv) {
     const long write_timeout_s = getenv("SPARKINFER_WRITE_TIMEOUT_S") ? atol(getenv("SPARKINFER_WRITE_TIMEOUT_S")) : 300;
     svr.set_read_timeout(read_timeout_s, 0);
     svr.set_write_timeout(write_timeout_s, 0);
+    // Worker threads. cpp-httplib defaults to hardware_concurrency() - 1, and a streaming request
+    // holds its worker for its whole generation (a keep-alive connection, until it closes), so on
+    // the 24-CPU eval box a 24th concurrent stream was not even read until another one FINISHED.
+    // Measured with AIPerf at concurrency 32: TTFT p50 2.6 s against p99 36 s, and less aggregate
+    // throughput than at 16. The engine already batches up to its packed width and queues past
+    // it, so the transport must not be what caps concurrency. An idle worker is a thread blocked
+    // on a condition variable.
+    const size_t http_threads = [] {
+        const char* e = getenv("SPARKINFER_HTTP_THREADS");
+        const long v = e ? atol(e) : 256;
+        return (size_t)(v < 8 ? 8 : v);
+    }();
+    svr.new_task_queue = [http_threads] { return new httplib::ThreadPool(http_threads); };
 
     std::signal(SIGTERM, on_shutdown_signal);
     std::signal(SIGINT, on_shutdown_signal);

@@ -440,10 +440,12 @@ Each `/v1/chat/completions` call is submitted to `ContinuousBatchEngine`, which:
 
 - Allocates a **per-request `seq_id`** with **right-sized KV** (`prompt + max_tokens + headroom`, not `max_seq`)
 - Runs **vLLM V1-style iteration-level scheduling**: each step packs pending decode
-  requests first (up to `SPARKINFER_BATCH_TOKENS`), then admits at most one prefill into
-  the remaining budget. Prefills larger than `SPARKINFER_PREFILL_MIX_MAX` wait until
-  decode drains (hybrid batched prefill is atomic — mixing an 8k pass mid-decode would
-  spike ITL by hundreds of ms)
+  requests first (up to `SPARKINFER_BATCH_TOKENS`), then admits prefills into the remaining
+  budget, oldest first (one per step once the decode batch is wide; more while it is still
+  filling). While decode is in flight, at most `SPARKINFER_LONG_PREFILLS_PER_STEP` (1) of the
+  prefills larger than `SPARKINFER_PREFILL_MIX_MAX` run per step: hybrid batched prefill is
+  atomic, so each 8k pass admitted mid-decode stalls the decoding requests for its duration,
+  but holding them until decode drains starved them under steady load
 - Under `chunked` (or when decode is waiting under `continuous`), non-batched models
   advance prefills in chunks of `SPARKINFER_PREFILL_CHUNK_TOKENS` before yielding
 - Decodes the packed requests in **one forward** (`decode_packed`) rather than one per request.
@@ -514,7 +516,8 @@ uncached resume bit for bit in deterministic mode.
 | `SPARKINFER_BATCH_TOKENS` | `64` | Scheduler token budget per step (decode packing) |
 | `SPARKINFER_SCHED_POLICY` | `continuous` | `continuous` (pack+mix), `chunked` (CHUNKED_PREFILL), or `priority` (exclusive prefill) |
 | `SPARKINFER_PREFILL_CHUNK_TOKENS` | `512` | Token-loop prefill yield size when batched prefill is unavailable (`0` = unlimited). Hybrid models always use full batched GEMM prefill. |
-| `SPARKINFER_PREFILL_MIX_MAX` | `2048` | Max prompt tokens allowed to mix with decode in one step (`0` = always mix). Larger atomic prefills wait until decode drains to avoid ITL spikes. |
+| `SPARKINFER_PREFILL_MIX_MAX` | `2048` | Prompts longer than this are metered while decode is in flight (`0` = no prompt counts as long). |
+| `SPARKINFER_LONG_PREFILLS_PER_STEP` | `1` | How many of those long prefills one step admits while decode is in flight. `0` holds them until decode drains, the old rule, which starves them under steady load (8K prompts at 16 concurrent requests: TTFT p99 127 s). |
 
 Prior requests cannot leak decode context into later ones (KV is freed after each completion).
 
@@ -530,7 +533,7 @@ Prior requests cannot leak decode context into later ones (KV is freed after eac
 | `SPARKINFER_SERVER_PREFIX_TOKEN_IDS` | — | Comma-separated token ids (same as above) |
 | `SPARKINFER_PREFIX_CACHE` | `1` | Automatic prefix cache (see **Automatic prefix cache**). `0` disables; `SPARKINFER_DETERMINISTIC=1` also disables it. |
 | `SPARKINFER_PREFIX_CACHE_ENTRIES` | `32` | Most cached prefixes held at once; least-recently-used is evicted. |
-| `SPARKINFER_PREFIX_CACHE_HOST_MB` | `8192` | Pinned host memory for recurrent-state snapshots (~205 MB each on Qwen3.8-27B; none on Muse Glimmer). |
+| `SPARKINFER_PREFIX_CACHE_HOST_MB` | `8192` | Pinned host memory for recurrent-state snapshots (~205 MB each on Qwen3.8-27B; none on Muse Glimmer). Up to 8 more snapshot buffers are kept pinned for reuse; `SPARKINFER_SNAPSHOT_POOL=0` allocates and frees one per snapshot instead. |
 | `SPARKINFER_PREFIX_CACHE_MIN_TOKENS` | `1024` | Shortest prompt position a request checkpoints at. Shorter prompts still reuse cached prefixes but do not create one. |
 | `SPARKINFER_PREFILL_BATCHED` | `1` | Batched prefill in `cache_prefix` / cold prompts |
 | `SPARKINFER_DETERMINISTIC` | `0` | `1` = bit-reproducible output (see **Determinism** above). Decode speed unchanged; TTFT +2–8%. |
@@ -545,6 +548,7 @@ Prior requests cannot leak decode context into later ones (KV is freed after eac
 | `SPARKINFER_DRAIN_GRACE_S` | `30` | How long `SIGTERM`/`SIGINT` waits for in-flight requests before force-exiting; `0` waits indefinitely. The process exits at once when nothing is in flight. `SPARKINFER_SHUTDOWN_GRACE_S` is the old name and is still read. |
 | `SPARKINFER_REQUEST_TIMEOUT_S` | `0` (disabled) | Per-request wall-clock deadline from submission to finish; exceeding it returns `504`. Left disabled by default — a cold 32k-context prefill alone has been measured taking ~90s of TTFT, so an aggressive default would misfire on legitimate long-context requests. |
 | `SPARKINFER_READ_TIMEOUT_S` / `SPARKINFER_WRITE_TIMEOUT_S` | `300` | Transport-level socket timeouts (httplib). Reset on each byte transferred, so a slow-but-progressing stream doesn't trip them. |
+| `SPARKINFER_HTTP_THREADS` | `256` | HTTP worker threads. A streaming request (and a keep-alive connection) holds one for its whole life, so this is the most requests served at once; httplib's own default is one per CPU. |
 | `SPARKINFER_MODEL_CREATED` | `0` | Model creation time as a Unix timestamp for OpenRouter schema v2.4. `run_openrouter.sh` requires a real value. |
 | `SPARKINFER_REQUESTS_PER_MINUTE` | — | Optional request/minute capacity published by `/v1/models`. Enforcement belongs at the gateway; this declaration must match it. |
 | `SPARKINFER_PROMPT_TOKENS_PER_MINUTE` | — | Optional prompt-token/minute capacity published by `/v1/models`. |

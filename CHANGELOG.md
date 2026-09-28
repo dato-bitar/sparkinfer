@@ -7,6 +7,14 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Serving
 
+- **Concurrent load no longer stalls on the HTTP pool, long prompts or prefix-cache snapshots.**
+  - **HTTP pool:** it was one worker per CPU, and a streaming request holds one for its whole life. On a 24-CPU box, stream 24 waited for another to finish. The pool is now 256 (`SPARKINFER_HTTP_THREADS`).
+  - **Long prompts:** a prompt over `SPARKINFER_PREFILL_MIX_MAX` waited for decode to drain, which it never does under steady load. One such prefill is now admitted per step (`SPARKINFER_LONG_PREFILLS_PER_STEP`), and equal priorities go in arrival order.
+  - **Snapshots:** prefix-cache snapshots reuse their pinned buffers instead of pinning ~205 MB each.
+  - **Measured** with AIPerf on the release Qwen3.8-27B NVFP4 checkpoint (RTX 5090, `--ctx 131072`), output tok/s against the previous main:
+    - chat c32: 480 → 645, TTFT p99 46 s → 7 s;
+    - 1k-token answers c32: 1,028 → 1,395, TTFT p99 81 s → 0.9 s;
+    - 8K prompts c16: 64 → 149 and c32: 62 → 150, TTFT p99 127 s → 12 s and 196 s → 26 s.
 - **Sampled requests batch again.** The continuous-batch engine's packed decode took only greedy
   rows, and since requests that set no sampler take the checkpoint's `generation_config`
   (temperature 1.0 on Qwen3.8), nearly every server request decoded one forward per sequence:

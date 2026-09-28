@@ -5,9 +5,11 @@
 //   1. Pack pending decode requests first (up to max_tokens_per_batch) — protects ITPS
 //   2. Fill remaining budget with at most one prefill
 // Large prefills (prefill_remaining > SPARKINFER_PREFILL_MIX_MAX, default 2048) are
-// NOT mixed with decode: sparkinfer's hybrid batched prefill is atomic (one GEMM pass),
-// so admitting an 8k prefill mid-decode creates a multi-hundred-ms ITL spike. Small
-// prefills may still mix. PRIORITY keeps exclusive prefill-first (no mix).
+// metered while decode is in flight -- SPARKINFER_LONG_PREFILLS_PER_STEP per iteration,
+// default 1: sparkinfer's hybrid batched prefill is atomic (one GEMM pass), so each 8k
+// prefill admitted mid-decode is a multi-hundred-ms ITL spike, but holding them until
+// decode drains starves them under steady load. Small prefills mix freely. PRIORITY
+// keeps exclusive prefill-first (no mix).
 
 #include "sparkinfer/scheduler.h"
 
@@ -71,10 +73,29 @@ int prefills_per_step() {
 int prefill_mix_max_tokens() {
     static int v = [] {
         const char* e = getenv("SPARKINFER_PREFILL_MIX_MAX");
-        // 0 = always allow mix; default 2048 keeps TTFT-friendly short prompts mixed
-        // while deferring long atomic prefills until decode drains.
+        // 0 = no prefill counts as long; default 2048 admits TTFT-friendly short prompts freely
+        // and meters long atomic prefills (long_prefills_per_step()) while decode is in flight.
         int x = e ? atoi(e) : 2048;
         return x >= 0 ? x : 2048;
+    }();
+    return v;
+}
+// How many prefills longer than prefill_mix_max_tokens() one iteration may admit while decode is
+// in flight. Each runs as one atomic pass ahead of the next decode step, so this bounds the stall
+// every decoding row sees to that many long prefills.
+//
+// It used to be 0: a long prompt waited until decode DRAINED. Under steady load decode never
+// drains -- every finished request is replaced -- so a long prompt waited for every request ahead
+// of it to finish first. Measured with AIPerf on Qwen3.8-27B NVFP4 (RTX 5090, 8192-token prompts,
+// 128-token answers): at concurrency 16, TTFT p99 127 s and 64 output tok/s; admitting every long
+// prompt at once (SPARKINFER_PREFILL_MIX_MAX=0) gave TTFT p99 25 s and 136 tok/s, but ran all of
+// them back to back ahead of one decode step. One per iteration keeps that throughput and lets a
+// decode step run between long prefills. 0 restores waiting for decode to drain.
+int long_prefills_per_step() {
+    static const int v = [] {
+        const char* e = getenv("SPARKINFER_LONG_PREFILLS_PER_STEP");
+        const int x = e ? atoi(e) : 1;
+        return x < 0 ? 0 : x;
     }();
     return v;
 }
@@ -98,9 +119,13 @@ ScheduleBatch Scheduler::schedule(const std::vector<ScheduledSequence>& active, 
     std::vector<const ScheduledSequence*> ordered;
     ordered.reserve(active.size());
     for (const auto& s : active) ordered.push_back(&s);
+    // Equal priorities go in arrival order (request ids are handed out in submit order). The
+    // caller builds `active` from a hash map, so without the tie-break a prefill that loses the
+    // one long-prefill slot per iteration could keep losing it.
     std::sort(ordered.begin(), ordered.end(),
               [](const ScheduledSequence* a, const ScheduledSequence* b) {
-                  return a->priority > b->priority;
+                  if (a->priority != b->priority) return a->priority > b->priority;
+                  return a->request_id < b->request_id;
               });
 
     const bool mix = impl_->policy == SchedulePolicy::CHUNKED_PREFILL ||
@@ -242,13 +267,15 @@ ScheduleBatch Scheduler::schedule(const std::vector<ScheduledSequence>& active, 
         const bool deep_ramp = fill * 2 >= wide ||
                                (deep_rows < wide && have > 0 && fill * 2 < wide) || narrow_start;
         const int allow = (have < wide && deep_ramp) ? prefills_per_step() : 1;
-        int taken = 0;
+        const int long_cap = long_prefills_per_step();
+        int taken = 0, long_taken = 0;
         for (const ScheduledSequence* s : ordered) {
             if (s->phase != SeqPhase::PREFILL) continue;
-            // Defer large atomic prefills while decode is in flight.
+            // Meter large atomic prefills while decode is in flight.
             if (!batch.decode_request_ids.empty() && mix_max > 0 &&
                 s->prefill_remaining > mix_max) {
-                continue;
+                if (long_taken >= long_cap) continue;
+                ++long_taken;
             }
             batch.prefill_request_ids.push_back(s->request_id);
             batch.total_tokens += 1;

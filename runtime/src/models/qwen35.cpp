@@ -4277,6 +4277,56 @@ int Qwen35Model::prefill_batched_resume(const int* prompt_ids, int start, int en
     return seed;
 }
 
+// Pinned host buffers for recurrent-state snapshots, reused instead of allocated per snapshot.
+// cudaHostAlloc pins every page of a snapshot (~205 MB on Qwen3.8-27B) and cudaFreeHost unpins
+// them again, and a chat request past the checkpoint minimum takes one snapshot per checkpoint
+// while its prefill waits on it: under load that showed up as ~90 ms of prefill per request that
+// the same server without the prefix cache did not pay. A buffer comes back here when the last
+// snapshot holding it goes -- the cache evicting its entry, or a job retiring without offering
+// it -- and at most kSnapshotPoolMax wait unused. Never destroyed: a snapshot can outlive every
+// other static at exit. SPARKINFER_SNAPSHOT_POOL=0 allocates and frees per snapshot as before.
+namespace {
+constexpr size_t kSnapshotPoolMax = 8;
+struct SnapshotPool {
+    std::mutex mu;
+    size_t bytes = 0;
+    std::vector<void*> free;
+};
+SnapshotPool& snapshot_pool() {
+    static SnapshotPool* p = new SnapshotPool;
+    return *p;
+}
+std::shared_ptr<void> pinned_snapshot_buffer(size_t bytes) {
+    static const bool pooled = [] {
+        const char* e = getenv("SPARKINFER_SNAPSHOT_POOL");
+        return !(e && e[0] == '0');
+    }();
+    void* host = nullptr;
+    if (pooled) {
+        SnapshotPool& p = snapshot_pool();
+        std::lock_guard<std::mutex> lock(p.mu);
+        if (p.bytes == bytes && !p.free.empty()) {
+            host = p.free.back();
+            p.free.pop_back();
+        }
+    }
+    if (!host && (cudaHostAlloc(&host, bytes, cudaHostAllocDefault) != cudaSuccess || !host))
+        return nullptr;
+    if (!pooled) return std::shared_ptr<void>(host, [](void* h) { cudaFreeHost(h); });
+    return std::shared_ptr<void>(host, [bytes](void* h) {
+        SnapshotPool& p = snapshot_pool();
+        std::lock_guard<std::mutex> lock(p.mu);
+        if (p.bytes != bytes) {
+            for (void* f : p.free) cudaFreeHost(f);
+            p.free.clear();
+            p.bytes = bytes;
+        }
+        if (p.free.size() < kSnapshotPoolMax) p.free.push_back(h);
+        else cudaFreeHost(h);
+    });
+}
+}  // namespace
+
 bool Qwen35Model::snapshot_recurrent_state(uint64_t seq_id, RecurrentStateSnapshot& out) {
     std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
     Impl& s = *p_;
@@ -4292,10 +4342,9 @@ bool Qwen35Model::snapshot_recurrent_state(uint64_t seq_id, RecurrentStateSnapsh
                             s.cfg.linear_head_dim * sizeof(float);
     const size_t cv_bytes = (size_t)s.cfg.n_layers * (s.cfg.linear_conv_kernel - 1) *
                             s.linear_qkvdim * sizeof(bf16);
-    void* host = nullptr;
-    if (cudaHostAlloc(&host, st_bytes + cv_bytes, cudaHostAllocDefault) != cudaSuccess || !host)
-        return false;
-    std::shared_ptr<void> owned(host, [](void* p) { cudaFreeHost(p); });
+    std::shared_ptr<void> owned = pinned_snapshot_buffer(st_bytes + cv_bytes);
+    if (!owned) return false;
+    void* host = owned.get();
     // Prefill may still have work queued on any of the model's streams; the state is final only
     // once all of it has run.
     cudaDeviceSynchronize();

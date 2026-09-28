@@ -35,15 +35,20 @@ int main() {
         assert(batch.total_tokens == 3);
     }
 
-    // Large prefill is deferred while decode is in flight (avoids atomic-prefill ITL spikes).
+    // While decode is in flight, one large prefill per step is admitted (not deferred until decode
+    // drains, which under steady load is never), oldest first; short ones are not held back by it.
     {
-        Scheduler sched(SchedulePolicy::CONTINUOUS_BATCHING, 4);
+        Scheduler sched(SchedulePolicy::CONTINUOUS_BATCHING, 8);
         std::vector<ScheduledSequence> active;
         active.push_back({1, 10, SeqPhase::DECODE, 5, 3, 0});
-        active.push_back({3, 12, SeqPhase::PREFILL, 9, 0, 8192});
+        active.push_back({4, 13, SeqPhase::PREFILL, 0, 0, 8192});
+        active.push_back({3, 12, SeqPhase::PREFILL, 0, 0, 8192});
+        active.push_back({5, 14, SeqPhase::PREFILL, 0, 0, 128});
         ScheduleBatch batch = sched.schedule(active);
         assert(batch.decode_request_ids.size() == 1);
-        assert(batch.prefill_request_ids.empty());
+        assert(batch.prefill_request_ids.size() == 2);
+        assert(batch.prefill_request_ids[0] == 3);
+        assert(batch.prefill_request_ids[1] == 5);
     }
 
     // Large prefill runs once decode drains.
