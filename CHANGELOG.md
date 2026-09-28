@@ -3,6 +3,32 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
+## [Unreleased]
+
+### Performance
+
+- **Prefill of a prompt whose length is not a multiple of 8 is up to 1.9x faster.**
+  - **Cause:** the NVFP4 prefill GEMMs take a row count that is a multiple of 8, so such a pass ran every layer on the fallback.
+  - **Scale:** that is seven prompt lengths in eight. Qwen3.8-27B NVFP4, RTX 5090, prefill tok/s:
+    - 15,146 at 1024 against 5,455 at 1030;
+    - 15,199 at 8192 against 7,567 at 8210.
+  - **Fix:** the aligned body now takes one pass and the last 1–7 tokens go through the decode step (`SPARKINFER_PREFILL_ALIGN8_MIN`, 128 tokens by default, 0 turns it off). Prefill tok/s:
+    - 1030: 5,455 → 7,813;
+    - 4102: 7,291 → 13,039;
+    - 8210: 7,574 → 14,350;
+    - Muse Glimmer at 4102: 7,575 → 15,066.
+
+    Aligned lengths do not change.
+- **A prefix-cache checkpoint is taken inside the one prefill pass.**
+  - **Before:** a request with a checkpoint was prefilled in one pass per segment, with a snapshot of the recurrent state between. For a chat request that meant a second, eager pass over its last 10–25 tokens and a device-wide sync.
+  - **Now:** each Gated-DeltaNet layer runs its conv and scan once per segment, carrying the state across, and copies the state out at the checkpoint (`Qwen35Model::ingest_prompt_checkpointed`).
+  - **Accuracy:** the snapshot is bit-identical to the old one for a checkpoint up to 515 tokens from the end. Under `SPARKINFER_DETERMINISTIC=1`, a cache hit from it reproduces the old hit exactly (`prefix_resume_check`, which now measures this route too).
+- **Measured with AIPerf** on the release checkpoint, both changes together, against v0.5.13:
+  - chat at 16 / 32 concurrent requests: 549 → 590 and 627 → 696 output tok/s, TTFT p50 3.45 → 2.78 s and 7.30 → 5.95 s;
+  - 8K prompts at 16 / 32: 149 → 157 and 150 → 157 tok/s;
+  - a 1K-token answer's TTFT at one request: 103 → 71 ms;
+  - an 8K prompt without the prefix cache: TTFT 1,103 → 616 ms.
+
 ## [0.5.13] — 2026-09-28
 
 **The server scales with concurrency again.** Since #1088, a request that sets no sampler takes the checkpoint's `generation_config`. Packed decode took only greedy requests, so those requests decoded one at a time: about 90 tok/s on an RTX 5090 however many users. Now:
