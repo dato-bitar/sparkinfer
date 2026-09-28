@@ -35,9 +35,15 @@ RUN strip build/server/sparkinfer_server build/runtime/qwen38_hf_dflash_bench ||
 FROM nvidia/cuda:12.8.1-base-ubuntu24.04
 ENV DEBIAN_FRONTEND=noninteractive
 # ffmpeg is REQUIRED for video input -- the server shells out to it for frame extraction.
+# huggingface_hub and tokenizers are pinned together: every tokenizers release requires
+# huggingface_hub < 2, so once huggingface_hub 2.0.0 shipped (2026-09-24) pip walked tokenizers back
+# to releases with no wheel for this Python and failed building one without Rust (v0.5.13's first
+# build). Wheels only, so a break like that fails here, by name, rather than in a source build.
+# huggingface_hub 1.x ships the `hf` CLI the entrypoint downloads with.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg python3 python3-pip python3-yaml ca-certificates curl \
-    && pip3 install --no-cache-dir --break-system-packages "huggingface_hub[cli]" tokenizers jinja2 \
+    && pip3 install --no-cache-dir --break-system-packages --only-binary=:all: \
+        "huggingface_hub>=1.0,<2" "tokenizers>=0.22,<0.24" jinja2 \
     && apt-get purge -y python3-pip && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/* /root/.cache
 
