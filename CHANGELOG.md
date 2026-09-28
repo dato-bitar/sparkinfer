@@ -17,6 +17,11 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
   AIPerf on the release Qwen3.8-27B NVFP4 checkpoint (`--ctx 131072`, default sampling): 3.0x /
   5.8x / 5.5x output throughput for 1k-token chat at 4 / 16 / 32 concurrent requests, 3.5x /
   10.5x / 12.5x for 1k-token answers.
+- **The first token of a sampled response is sampled.** It was the prefill's argmax whatever the
+  request's temperature, top-k, top-p or seed, so every sampled response to one prompt began with
+  the same token. It is now drawn from the same logits with `forward_token`'s sampler at sampler
+  step 0 (decode starts at 1), in single and packed prefill alike, and its logprob describes the
+  drawn token. Greedy requests, forced tokens and the exclusive prefix session keep the argmax.
 - **The release container defaults to `CTX=131072`.** The full 262,144-token pool left ~3 GB on a
   32 GB card: packed decode and batched prefill could not allocate, and 16 concurrent 8K-token
   prompts stalled the server. `-e CTX=262144` still serves the full context to one conversation at

@@ -3852,6 +3852,46 @@ void Qwen35Model::release_lm_head_fp4() {
     s.lm_head_fp4_sf_buf = nullptr;
 }
 
+// Draws one token from the single row of final logits in s.logits with forward_token's sampler
+// tail -- top_k/top_p mask, Gumbel-max temperature noise, argmax, chosen-logit lookup -- so the
+// token and the logprob scratch after it are what a forward_token with these values would have
+// left. No penalty kernel: the only caller is the first token, which has no counts to apply.
+template <class Impl>
+static int sample_logits_row(Impl& s, float temperature, unsigned long long seed,
+                             unsigned long long step, int top_k, float top_p) {
+    cudaStream_t st = s.stream;
+    const int vocab = s.cfg.vocab;
+    *s.h_sample_temp = temperature;
+    *s.h_sample_seed = seed;
+    *s.h_sample_step = step;
+    *s.h_sample_top_k = top_k;
+    *s.h_sample_top_p = top_p;
+    cu(cudaMemcpyAsync(s.d_sample_temp, s.h_sample_temp, sizeof(float), cudaMemcpyHostToDevice, st), "seed sample temp");
+    cu(cudaMemcpyAsync(s.d_sample_seed, s.h_sample_seed, sizeof(unsigned long long), cudaMemcpyHostToDevice, st), "seed sample seed");
+    cu(cudaMemcpyAsync(s.d_sample_step, s.h_sample_step, sizeof(unsigned long long), cudaMemcpyHostToDevice, st), "seed sample step");
+    cu(cudaMemcpyAsync(s.d_sample_top_k, s.h_sample_top_k, sizeof(int), cudaMemcpyHostToDevice, st), "seed sample top_k");
+    cu(cudaMemcpyAsync(s.d_sample_top_p, s.h_sample_top_p, sizeof(float), cudaMemcpyHostToDevice, st), "seed sample top_p");
+    kernels::launch_topk_topp_mask(s.logits, vocab, s.d_vocab_iota, s.d_sorted_logits, s.d_sorted_idx,
+                                   s.d_topk_exp, s.d_topk_cumsum, s.d_sort_temp, s.sort_temp_bytes,
+                                   s.d_scan_temp, s.scan_temp_bytes,
+                                   s.d_sample_top_k, s.d_sample_top_p, s.d_rank_by_id, st);
+    kernels::launch_temperature_sample(s.logits, 1, vocab, s.d_sample_temp, s.d_sample_seed,
+                                       s.d_sample_step, st);
+    kernels::launch_argmax(s.logits, s.d_out_id, 1, vocab, st);
+    kernels::launch_extract_chosen_logit(s.d_out_id, s.d_rank_by_id, s.d_sorted_logits,
+                                         s.d_chosen_logit, st);
+    cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "seed sample readback");
+    cu(cudaStreamSynchronize(st), "seed sample sync");
+    return *s.h_out_id;
+}
+
+int Qwen35Model::sample_seed_token(float temperature, unsigned long long seed,
+                                   unsigned long long step, int top_k, float top_p) {
+    std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
+    if (!(temperature > 0.f)) return -1;
+    return sample_logits_row(*p_, temperature, seed, step, top_k, top_p);
+}
+
 int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_logprob,
                                  int pos0) {
     Impl& s = *p_;
@@ -3994,7 +4034,8 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
 }
 
 bool Qwen35Model::ingest_prompts_packed(const uint64_t* seq_ids, const int* const* prompts,
-                                        const int* lens, int n_prompts, int* seeds) {
+                                        const int* lens, int n_prompts, int* seeds,
+                                        const PackedSampling* sampling) {
     std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
     Impl& s = *p_;
     if (!seq_ids || !prompts || !lens || !seeds || n_prompts < 2) return false;
@@ -4069,6 +4110,21 @@ bool Qwen35Model::ingest_prompts_packed(const uint64_t* seq_ids, const int* cons
         return v < 1 ? 1 : v;
     }();
     const int limit = s.cfg.muse_glimmer ? muse_pack_tokens : total;
+    // A sampled prompt's seed is redrawn from its own logits as the pass produces them; `base`
+    // turns the sub-pack's prompt index back into this call's.
+    struct SeedSampler { Impl* s; const PackedSampling* samp; int base; };
+    SeedSampler sampler{ &s, sampling, 0 };
+    if (sampling && sampling->temperature && sampling->seed && sampling->step &&
+        sampling->top_k && sampling->top_p) {
+        ctx.multi_sample = [](void* user, int i) -> int {
+            const SeedSampler& x = *static_cast<const SeedSampler*>(user);
+            const int k = x.base + i;
+            if (!(x.samp->temperature[k] > 0.f)) return -1;
+            return sample_logits_row(*x.s, x.samp->temperature[k], x.samp->seed[k],
+                                     x.samp->step[k], x.samp->top_k[k], x.samp->top_p[k]);
+        };
+        ctx.multi_sample_user = &sampler;
+    }
     for (int b = 0; b < n_prompts;) {
         int e = b, rows = 0;
         while (e < n_prompts && (e == b || rows + lens[e] <= limit)) rows += lens[e++];
@@ -4084,6 +4140,7 @@ bool Qwen35Model::ingest_prompts_packed(const uint64_t* seq_ids, const int* cons
         ctx.multi_lin_state = lin_state.data() + b;
         ctx.multi_lin_conv = lin_conv.data() + b;
         ctx.multi_seed = seeds + b;
+        sampler.base = b;
         if (prefill_batched_run(ctx, ids.data() + off[(size_t)b], rows, 0) < 0) return false;
         b = e;
     }

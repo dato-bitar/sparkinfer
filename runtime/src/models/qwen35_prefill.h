@@ -174,6 +174,11 @@ struct Qwen35PrefillCtx {
     float* const*        multi_lin_state  = nullptr;
     void* const*         multi_lin_conv   = nullptr;
     int*                 multi_seed       = nullptr;
+    // Optional: redraws prompt i's seed with its request's sampler. Called after prompt i's
+    // argmax is read back, with its last-position logits still in `logits`; returns the token to
+    // keep, or -1 to keep the argmax. Null keeps every argmax.
+    int                (*multi_sample)(void* user, int i) = nullptr;
+    void*                multi_sample_user = nullptr;
 
     // Set to true (never back to false) when this call declines because a scratch allocation
     // could not get its VRAM -- as opposed to every other reason prefill_batched_run returns -1,

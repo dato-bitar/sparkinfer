@@ -468,14 +468,33 @@ public:
     void release_lm_head_fp4();
     int prefill_batched(const int* prompt_ids, int n, bool want_seed_logprob = false,
                         int pos0 = 0);
+    // Per-row sampler settings for the packed paths (ingest_prompts_packed, decode_packed). HOST
+    // arrays of one entry per row, each value what forward_token takes for that row.
+    struct PackedSampling {
+        const float* temperature = nullptr;            // [n]; <= 0 is greedy
+        const unsigned long long* seed = nullptr;      // [n]
+        const unsigned long long* step = nullptr;      // [n]; forward_token's sample_step
+        const int* top_k = nullptr;                    // [n]; <= 0 or >= vocab is off
+        const float* top_p = nullptr;                  // [n]; >= 1 is off
+    };
     // Prefill several FRESH sessions' prompts in ONE batched pass (Qwen35PrefillCtx::multi_n):
     // each session opened with nothing ingested yet, text only, no logit_bias. On success writes
-    // each prompt's argmax seed -- the token ingest_prompt_range() would have returned for it -- to
-    // seeds[i] and returns true. Returns false when the pack is not eligible or a stage declines;
-    // the caller then ingests the prompts one at a time from position 0, which resets whatever
-    // this pass had written.
+    // each prompt's seed to seeds[i] and returns true: the argmax -- the token
+    // ingest_prompt_range() would have returned for it -- or, for a row `sampling` gives a
+    // temperature above 0, the token sample_seed_token() draws from the same logits. Returns false
+    // when the pack is not eligible or a stage declines; the caller then ingests the prompts one
+    // at a time from position 0, which resets whatever this pass had written.
     bool ingest_prompts_packed(const uint64_t* seq_ids, const int* const* prompts, const int* lens,
-                               int n_prompts, int* seeds);
+                               int n_prompts, int* seeds, const PackedSampling* sampling = nullptr);
+    // The response's FIRST token for a sampled request. Prefill's seed is the argmax of the last
+    // prompt position; this redraws it from those same logits the way forward_token draws every
+    // later token -- top_k/top_p mask, Gumbel-max noise from Philox(seed, vocab index, step), then
+    // argmax -- and leaves last_token_logprobs() describing the drawn token. Presence/frequency
+    // penalties have nothing to count yet, and a logit bias is already in the logits. Valid only
+    // straight after the ingest_prompt_range() call that returned the seed, before any other
+    // forward. Returns -1 (drawing nothing) when temperature <= 0: the argmax already stands.
+    int sample_seed_token(float temperature, unsigned long long seed, unsigned long long step,
+                          int top_k, float top_p);
     // Same pass, ingested as position-windows so the scratch arena is bounded by the window
     // rather than by n. Returns the seed for the last token, or -1 if a window was refused --
     // in which case *out_done (when given) reports how many leading tokens ARE in the cache,
@@ -583,13 +602,6 @@ public:
     // batch engine steps a row that uses them on its own.
     //
     // Every sequence must have an open session and live KV. n is capped by the packed graph tiers.
-    struct PackedSampling {
-        const float* temperature = nullptr;            // [n]; <= 0 is greedy
-        const unsigned long long* seed = nullptr;      // [n]
-        const unsigned long long* step = nullptr;      // [n]; forward_token's sample_step
-        const int* top_k = nullptr;                    // [n]; <= 0 or >= vocab is off
-        const float* top_p = nullptr;                  // [n]; >= 1 is off
-    };
     bool decode_packed(const int* tokens, const int* positions, const uint64_t* seq_ids, int n,
                        int* out_sampled, const PackedSampling* sampling = nullptr);
     // Largest n decode_packed() accepts. Matches the packed graph tiers.

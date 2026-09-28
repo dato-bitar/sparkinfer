@@ -984,16 +984,33 @@ void ContinuousBatchEngine::step_prefills_packed(std::vector<uint64_t>& prefill_
         if (pk.size() < 2) continue;
         std::vector<uint64_t> sids;
         std::vector<const int*> prompts;
-        std::vector<int> lens, seeds(pk.size(), -1);
+        std::vector<int> lens, seeds(pk.size(), -1), top_k;
+        std::vector<float> temp, top_p;
+        std::vector<unsigned long long> seed, step;
+        bool any_sampled = false;
         for (Job* j : pk) {
             sids.push_back(j->seq_id);
             prompts.push_back(j->req.prompt.data());
             lens.push_back((int)j->req.prompt.size());
+            // step_job's arguments to sample_seed_token, prompt by prompt.
+            temp.push_back(j->req.temperature);
+            seed.push_back((unsigned long long)j->req.seed);
+            step.push_back((unsigned long long)j->decode_emitted);
+            top_k.push_back(j->req.top_k);
+            top_p.push_back(j->req.top_p);
+            any_sampled = any_sampled || j->req.temperature > 0.f;
         }
+        Qwen35Model::PackedSampling samp;
+        samp.temperature = temp.data();
+        samp.seed = seed.data();
+        samp.step = step.data();
+        samp.top_k = top_k.data();
+        samp.top_p = top_p.data();
         // Text-only prompts: clear the rotary decode offset, exactly as step_job does before each.
         model_->reset_mrope_offset();
         if (!model_->ingest_prompts_packed(sids.data(), prompts.data(), lens.data(),
-                                           (int)pk.size(), seeds.data()))
+                                           (int)pk.size(), seeds.data(),
+                                           any_sampled ? &samp : nullptr))
             continue;
         for (size_t k = 0; k < pk.size(); ++k) {
             pk[k]->prefill_pos = lens[k];
@@ -1160,18 +1177,21 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
         if (job.prefill_pos >= n) {
             // The prefill's scratch memory is back: a request waiting on a failed allocation retries.
             cv_.notify_all();
-            // Known v1 scope limitation for temperature sampling (runtime/src/models/qwen35.cpp's
-            // forward_token doc comment): ingest_prompt_range() is a single funnel shared by
-            // cache_prefix()'s exclusive-session path and several other internal call sites, so
-            // its own argmax seed pick is not made temperature-aware here -- threading it through
-            // would mean changing a widely-shared function for the benefit of exactly one token.
-            // Concretely: the FIRST emitted token of every response is always the greedy/argmax
-            // token regardless of `temperature`; every token from the second one onward (all of
-            // which flow through forward_token() below) correctly respects temperature/seed.
             job.next_token = seed;
             if (job.next_token < 0 && job.req.use_prefix_session)
                 job.next_token = model_->prefix_seed_token();
             job.phase = SeqPhase::DECODE;
+            const bool forcing = !job.req.forced_tokens.empty();
+            // ingest_prompt_range() returns the argmax. A sampled request draws its first token
+            // from those same logits the way forward_token() draws every later one, at sampler
+            // step 0 (the first forward_token below is step 1). Not for a seed that came from the
+            // cached prefix's own pass (seed < 0 above), whose logits are gone.
+            if (!forcing && seed >= 0 && job.req.temperature > 0.f) {
+                const int drawn = model_->sample_seed_token(
+                    job.req.temperature, (unsigned long long)job.req.seed,
+                    (unsigned long long)job.decode_emitted, job.req.top_k, job.req.top_p);
+                if (drawn >= 0) job.next_token = drawn;
+            }
             // Stage the seed's logprob exactly the way the decode branch stages every subsequent
             // token's: the NEXT step_job() call emits job.next_token and flushes this pending
             // entry alongside it, so the first entry describes the first emitted token and
@@ -1184,10 +1204,9 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
             // Teacher-forced scoring: the first token of the "response" is the caller's, not the
             // model's, so replace the argmax seed before anything reports on it. The distribution
             // just computed at the last prompt position is exactly the one that predicts it.
-            const bool forcing = !job.req.forced_tokens.empty();
             if (forcing) job.next_token = job.req.forced_tokens[0];
-            if (want_seed_logprob && job.next_token >= 0 && (forcing || job.next_token == seed)) {
-                // job.next_token == seed guard (generation case): the use_prefix_session fallback
+            if (want_seed_logprob && job.next_token >= 0 && (forcing || seed >= 0)) {
+                // seed >= 0 guard (generation case): the use_prefix_session fallback
                 // above can substitute a token from a DIFFERENT forward pass (the cached prefix's
                 // own seed), which this scratch does not describe -- reporting it would be a wrong
                 // number rather than a missing one, so that case keeps the old one-short

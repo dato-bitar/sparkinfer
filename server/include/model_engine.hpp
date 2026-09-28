@@ -180,8 +180,8 @@ public:
     // back with .cancelled = true, not an error.
     //
     // temperature <= 0 (default) is plain greedy argmax. > 0 samples via Gumbel-max -- see
-    // ContinuousBatchEngine::Request's doc comment for the reproducibility contract and the
-    // known "first token is always greedy" v1 scope limitation. top_k/top_p truncate the
+    // ContinuousBatchEngine::Request's doc comment for the reproducibility contract; the first
+    // token is sampled like every later one. top_k/top_p truncate the
     // candidate set before the Gumbel draw; neither requires temperature > 0 (see
     // ContinuousBatchEngine::Request's doc comment for the inertness proof).
     //

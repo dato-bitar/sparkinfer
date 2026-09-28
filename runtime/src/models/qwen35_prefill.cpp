@@ -4309,6 +4309,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                   "packed prefill seed");
             pf_cu(cudaStreamSynchronize(st), "packed prefill seed sync");
             s.multi_seed[si] = *s.h_out_id;
+            if (s.multi_sample) {
+                const int drawn = s.multi_sample(s.multi_sample_user, si);
+                if (drawn >= 0) s.multi_seed[si] = drawn;
+            }
         }
     }
     // Close the capture BEFORE the D2H + sync: a synchronize cannot be recorded, and the seed

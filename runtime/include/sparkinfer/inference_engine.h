@@ -58,16 +58,15 @@ public:
         bool prefix_cache = false;
         std::vector<int> cache_checkpoints;
         // <= 0 (default) is plain greedy argmax, byte-identical to pre-sampling behavior. > 0
-        // samples via Gumbel-max (Qwen35Model::forward_token). Note: the prefill-phase seed
-        // token (the very first token of the response) is always greedy regardless of this
-        // value -- see step_job()'s PREFILL branch comment; every token from the second onward
-        // respects it.
+        // samples via Gumbel-max (Qwen35Model::forward_token), the first token included: prefill
+        // hands back the argmax and step_job()'s PREFILL branch (or the packed prefill) redraws it
+        // with Qwen35Model::sample_seed_token at sampler step 0.
         float temperature = 0.f;
         uint64_t seed = 0;              // only meaningful when temperature > 0
         // top_k <= 0 or >= vocab disables top_k (no truncation). top_p <= 0 or >= 1.0 disables
         // top_p. Both truncate the candidate set before the Gumbel draw above; neither requires
         // temperature > 0 to be accepted -- see Qwen35Model::forward_token's doc comment for the
-        // inertness proof. Same prefill-phase-seed-token caveat as temperature applies unchanged.
+        // inertness proof.
         int top_k = 0;
         float top_p = 1.0f;
         // [-2.0, 2.0]; 0 (default) disables both. OpenAI semantics: subtracted from every vocab
@@ -90,9 +89,8 @@ public:
         // to leave the sampler distribution populated for the seed and stages its logprob the
         // same way decode stages every other token's.
         //
-        // The temperature gap below is NOT fixed by that and still stands: the seed is still
-        // always the greedy argmax. The logprob reported for it is the true logprob of the token
-        // that was actually emitted either way, so the two are independent.
+        // A sampled request's seed is redrawn before that logprob is staged, so it describes
+        // the token actually emitted.
         bool logprobs = false;
         int top_logprobs = 0;   // 0-20; only meaningful when logprobs is true
         // OpenAI's logit_bias: (token_id, bias in [-100,100]) pairs, added to every vocab logit
