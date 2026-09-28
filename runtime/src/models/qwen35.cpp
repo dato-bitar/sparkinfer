@@ -3901,6 +3901,49 @@ int Qwen35Model::sample_seed_token(float temperature, unsigned long long seed,
 int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_logprob,
                                  int pos0) {
     Impl& s = *p_;
+    // The block-scaled NVFP4 GEMMs take a row count that is a multiple of 8
+    // (prefill_nvfp4_supported), and a pass whose length is not one runs EVERY layer on the
+    // fallback. Measured on an RTX 5090, Qwen3.8-27B NVFP4, prefill tok/s: 15,146 at 1024 against
+    // 5,455 at 1030, 16,748 at 2048 against 7,275 at 2054, 15,199 at 8192 against 7,567 at 8210 --
+    // seven prompt lengths in eight took the slow arm, and nothing measured it because every
+    // scored context is a round number. So prefill the aligned body in one pass and feed the last
+    // 1-7 tokens through forward_token: the decode step, ~10 ms each, and the arithmetic every
+    // later token gets anyway. A prefix-cache checkpoint always falls inside the body (it is at
+    // least 16 tokens short of the end). Not for a pass with image or MRoPE staging, whose rows
+    // are the whole prompt's, or a DSpark hidden-state capture, which records the pass itself.
+    // Split this way, prefill tok/s at 131 / 262 / 518 / 1030 / 2054 / 4102 / 8210 tokens went
+    // 1,297 -> 2,242 / 2,372 -> 2,925 / 3,817 -> 4,886 / 5,455 -> 7,813 / 7,281 -> 10,914 /
+    // 7,291 -> 13,039 / 7,574 -> 14,350; 135 (the worst tail, seven decode steps behind a 128-row
+    // pass) still gains, and aligned lengths do not change. SPARKINFER_PREFILL_ALIGN8_MIN is the
+    // smallest body split this way (0 turns it off).
+    static const int align8_min = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ALIGN8_MIN");
+        const int v = e ? atoi(e) : 128;
+        return v < 0 ? 0 : v;
+    }();
+    const int body = n & ~7;
+    if (align8_min > 0 && body >= align8_min && body < n && !s.w.layers.empty() &&
+        s.w.layers[0].gate_fp4 && !s.d_vision_emb && !s.d_mrope_pos && !s.dflash_capture) {
+        if (prefill_batched(prompt_ids, body, false, pos0) < 0) return -1;   // nothing landed
+        int seed = -1;
+        for (int i = body; i < n; ++i) seed = forward_token(prompt_ids[i], pos0 + i, i + 1 == n);
+        // The last step counted its pick toward presence/frequency penalties, which a batched
+        // prefill's seed never is: take that one count back so the request sees the same counts
+        // whichever way its prompt was split. forward_token has synchronized its stream.
+        if (seed >= 0 && seed < s.cfg.vocab && s.penalty_counts) {
+            int count = 0;
+            cu(cudaMemcpyAsync(&count, s.penalty_counts + seed, sizeof(int), cudaMemcpyDeviceToHost,
+                               s.stream), "prefill tail count read");
+            cu(cudaStreamSynchronize(s.stream), "prefill tail count sync");
+            if (count > 0) {
+                --count;
+                cu(cudaMemcpyAsync(s.penalty_counts + seed, &count, sizeof(int), cudaMemcpyHostToDevice,
+                                   s.stream), "prefill tail count write");
+                cu(cudaStreamSynchronize(s.stream), "prefill tail count write sync");
+            }
+        }
+        return seed;
+    }
     // A long batched prefill needs the scratch arena more than a wide decode needs the head, and
     // on a 32-GB card the two do not both fit: measured at ctx=32768 the arena wants 3.6 GB and
     // the head operand's 0.81 GB is enough to make it fail, which drops the WHOLE prompt onto the
