@@ -24,6 +24,12 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Project
 
+- **The Qwen3.8 bot checks that the server still batches** (`eval/serve_concurrency.py`, guard
+  3d).
+  - **What it runs:** `sparkinfer_server` on the ModelOpt release checkpoint. It sends one chat request, then 16 at once, both with default sampling and with an explicit temperature.
+  - **Floor:** the aggregate must reach 3× a single stream wherever `main`'s does. It measures 11.6× on `main` and 1.04× with packed decode off.
+  - **Why:** every other concurrency number drives the engine with greedy requests, which is how #1088 went unseen for two weeks.
+  - **Never charged to a PR:** a server that fails to configure, or hits a box fault, skips the guard; a PR run that measures nothing is retried.
 - **Ternary-Bonsai-2-27B has a PR eval bot** (`eval/pr_bonsai_bot.py`, #1138). It scores decode and
   prefill at ctx 128–32k and concurrent decode at c2–c32 against a same-box `main`. llama.cpp
   cannot read PTQ1_0, so accuracy is differential, with three gates: the teacher-forced score

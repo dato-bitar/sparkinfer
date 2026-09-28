@@ -418,6 +418,21 @@ closes the PR; a `none` closes it only as the shared rules above allow.
      charged to the PR after three rounds at one commit (`guard-cb`), as a scored width is. Beside
      another REJECT, the comment shows that guard's concurrent decode as not measured.
 
+4. **Server concurrency guard** (added 2026-09-28), a hard REJECT:
+   - **What it runs:**
+     - `sparkinfer_server` itself, on the ModelOpt checkpoint the release container serves, with no env pins.
+     - `eval/serve_concurrency.py` sends one chat request at a time, then 16 at once.
+     - It does that twice: once with no sampler fields, once with an explicit temperature and seed.
+   - **Floor:** each mode's aggregate must reach 3× a single stream.
+   - **Why:** every other concurrency number here drives the engine directly with greedy requests. That is how #1088 went unseen: it made every default request decode on its own for two weeks.
+   - **Scale:** on `main` 8ec7608 it measures 11.6×, and 1.04× with packed decode off. It is a floor, not a comparison: server throughput moves a few percent run to run, and what it guards is batching switching off.
+   - **What counts against a PR:**
+     - A mode fails only when `main` clears the floor and the PR does not.
+     - A server that builds on `main` but not on the PR fails too.
+   - **What is never charged to a PR:**
+     - A server that doesn't configure (its dependencies are fetched then) or hits a box-side build fault skips the guard for the round.
+     - A PR run with no result at all is retried (`guard-unmeasured`).
+
 **Not evaluated:**
 - PRs whose template declares a different target model (#1027).
 - PRs that change the measuring harness: `qwen3_gguf_bench.cpp`, `qwen3_gguf_cb_bench.cpp`,

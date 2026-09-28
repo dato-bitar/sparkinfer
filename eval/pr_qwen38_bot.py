@@ -90,6 +90,16 @@ becomes the eval scope (see eval/README.md). Narrowly scoped on purpose:
               well as 32k because the dense-GGUF prefill work on that model lives at short
               prompts (#1139: 1.94x at 128, flat at 4k); both come from one model load.
 
+  3d. Server concurrency guard (2026-09-28) -- sparkinfer_server itself, on the ModelOpt checkpoint
+              the release container serves: eval/serve_concurrency.py sends one chat request at a
+              time and then SERVECONC_CONC at once, with no sampler fields and with explicit
+              sampling, and each mode's aggregate must reach SERVECONC_FLOOR times a single
+              stream. Every other concurrency number here drives the engine directly with greedy
+              requests, and was blind to #1088 making default requests decode one at a time for two
+              weeks (~11.6x at c16 with packing, 1.04x without). A floor, not a comparison: a mode
+              fails only when main clears it and the PR does not, and a build or box fault
+              that leaves the server unmeasured is retried, never charged to the PR.
+
 Applies `eval-qwen38:<TIER>` AND mirrors it to the generic `eval:<TIER>` label (SN74 scoring reads
 eval:* tiers). Auto-close is live: a REJECT closes; a `none` closes only a PR declared for
 Qwen3.8 alone that no other bot scored a speedup or made merge-first (arb.none_may_close,
@@ -228,7 +238,8 @@ QWEN38_NEEDS_REBASE = "qwen38-needs-rebase"
 # v3 (2026-09-15): ModelOpt Qwen3.8 and Muse Glimmer no-regression guards added.
 # v4 (2026-09-15): those guards also cover concurrent decode at c16/c32.
 # v6 (2026-09-24): Ternary-Bonsai-2-27B no-regression guard added (pt. 3c).
-EVAL_SCHEMA_VERSION = "v6-unsloth-concurrency-cross-model-guards-cb-longctx256k-bonsai"
+# v7 (2026-09-28): server concurrency guard added (pt. 3d).
+EVAL_SCHEMA_VERSION = "v7-unsloth-concurrency-cross-model-guards-cb-longctx256k-bonsai-serveconc"
 MARKER_RE = re.compile(
     r"<!-- sparkinfer-qwen38-eval:" + re.escape(EVAL_SCHEMA_VERSION) + r":([0-9a-f]+)(?:\s+(\{.*?\}))? -->",
     re.DOTALL,
@@ -306,6 +317,11 @@ GUARD_REPS = 5
 # (7,970 of 8,200 tokens), which cb_complete rejects and re-runs. 8-12 s a run, so the four guards
 # add about two minutes per ref.
 CB_GUARD_CONCS = [16, 32]
+# Server concurrency guard (pt. 3d): requests in flight for the wide wave, and the floor its
+# aggregate must reach as a multiple of one stream. Measured on the eval box on 8ec7608: 11.6x with
+# packed decode, 1.04x with it off -- the floor only has to separate those two.
+SERVECONC_CONC = int(os.environ.get("QWEN38_SERVECONC_CONC", "16"))
+SERVECONC_FLOOR = float(os.environ.get("QWEN38_SERVECONC_FLOOR", "3.0"))
 
 # Auto-merge (the shape of pr_dflash_bot.py's auto_merge_ok_dflash/try_auto_merge_dflash) is OFF
 # unless this exact env var is "1". The eval host's .env.eval sets it (explicit decision; see the
@@ -506,6 +522,48 @@ def check_muse_cb_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
     """Muse Glimmer concurrent-decode no-regression guard (pt. 3b), aggregate tok/s at CB_GUARD_CONCS."""
     return _check_model_guard(pr, main, "guardcbmg", "muse glimmer concurrent", tol,
                               metrics=("cb-decode",), label_for=lambda c: f"c{c}")
+
+
+def check_serve_concurrency(pr: dict, main: dict, floor: float = SERVECONC_FLOOR):
+    """Server concurrency guard (pt. 3d). Returns (state, problems), state one of:
+
+      "ok"          every mode main clears the floor in, the PR clears too;
+      "fail"        the PR is below the floor where main is not, or its server did not build
+                    where main's did -- a REJECT;
+      "unmeasured"  main was measured but the PR has no result at all -- infra until proven
+                    otherwise, retried like any guard that measured nothing;
+      "skip"        nothing to judge against: main unmeasured, below the floor itself, or the PR's
+                    run lost to a box-side fault.
+
+    A floor, not a comparison with main's number: server-level throughput moves several percent
+    run to run, and what this guard exists for is batching switching off (#1088: 11.6x -> 1.04x)."""
+    main_r = main.get("serveconc") or {}
+    if main.get("serveconc_build_failed") or not main_r:
+        why = main.get("serveconc_unavailable") or ("its server did not build" if main.get("serveconc_build_failed")
+                                                    else "no result")
+        return "skip", [f"not measured on main ({why})"]
+    passing = {m: r for m, r in sorted(main_r.items()) if r >= floor}
+    if not passing:
+        seen = ", ".join(f"{m} {r:.2f}x" for m, r in sorted(main_r.items()))
+        return "skip", [f"main itself is below the {floor:.1f}x floor ({seen}) -- not charged to the PR"]
+    if pr.get("serveconc_build_failed"):
+        return "fail", ["sparkinfer_server did not build on the PR (main's did)"]
+    if pr.get("serveconc_unavailable"):
+        return "skip", [f"not measured on the PR ({pr['serveconc_unavailable']})"]
+    pr_r = pr.get("serveconc") or {}
+    if not pr_r:
+        why = "; ".join(pr.get("serveconc_failed") or []) or "no result"
+        return "unmeasured", [f"server concurrency guard measurement unavailable ({why})"]
+    problems = []
+    for mode, base in passing.items():
+        cur = pr_r.get(mode)
+        if cur is None:
+            why = "; ".join(f for f in pr.get("serveconc_failed") or [] if f.startswith(f"{mode}:")) or "no result"
+            problems.append(f"{mode}: no result on the PR ({why}); main {base:.2f}x")
+        elif cur < floor:
+            problems.append(f"{mode}: c{SERVECONC_CONC} aggregate is {cur:.2f}x a single stream on the PR, "
+                            f"main {base:.2f}x (floor {floor:.1f}x) -- requests are not batching")
+    return ("fail" if problems else "ok"), problems
 
 
 def qwen38_evaluated_commits(repo, num):
@@ -864,6 +922,7 @@ def _remote_script(ref: str, role: str = "pr", onto: str | None = None) -> str:
     bn_sweep_args = " ".join(f"{c} {GUARD_REPS}" for c in BONSAI_GUARD_CTXS)
     bn_ctx_list = " ".join(str(c) for c in BONSAI_GUARD_CTXS)
     cb_guard_concs = " ".join(str(c) for c in CB_GUARD_CONCS)
+    serveconc_conc, serveconc_floor = SERVECONC_CONC, SERVECONC_FLOOR
     return f"""
 set -euo pipefail
 # Surface *why* a crash happened instead of dying silently -- same diagnostic trap as the sibling
@@ -930,7 +989,7 @@ git remote set-url origin https://github.com/gittensor-ai-lab/sparkinfer.git 2>/
 timeout 600 git fetch -q origin main || {{ echo "RETRYABLE_INFRA_FAILURE git fetch main failed" >&2; exit 1; }}
 git checkout -q {base_q} -- runtime/examples/qwen3_gguf_bench.cpp \
   runtime/examples/qwen3_gguf_cb_bench.cpp runtime/examples/qwen3_gguf_score.cpp runtime/examples/qwen_checkpoint.h \
-  runtime/examples/qwen3_gguf_config.h bench/scripts 2>/dev/null || {{
+  runtime/examples/qwen3_gguf_config.h bench/scripts eval/serve_concurrency.py 2>/dev/null || {{
   echo "HARNESS_PIN_FAILED -- could not take the harness from {base}" >&2
   exit 1
 }}
@@ -955,11 +1014,19 @@ if [ -f build/CMakeCache.txt ] && ! grep -q '^CMAKE_CUDA_COMPILER:FILEPATH=/usr/
   rm -rf build && mkdir -p build
 fi
 export CUDACXX="${{CUDACXX:-/usr/local/cuda/bin/nvcc}}"
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/tmp/q38_cmake.log 2>&1 || {{
-  echo "BUILD_FAILED -- cmake configure; tail:" >&2
-  tail -40 /tmp/q38_cmake.log >&2
-  exit 1
-}}
+# With the server (pt. 3d), whose dependencies FetchContent downloads at configure time: a network
+# failure there is the box's, so it drops only the server guard and the round goes on without it.
+export PATH="$PATH:$HOME/.cargo/bin"
+SERVER_CONFIGURED=1
+if ! cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SERVER=ON >/tmp/q38_cmake.log 2>&1; then
+  SERVER_CONFIGURED=0
+  echo "SERVECONC_UNAVAILABLE the server did not configure: $(grep -m1 -iE 'error' /tmp/q38_cmake.log | cut -c1-160)"
+  cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SERVER=OFF >/tmp/q38_cmake.log 2>&1 || {{
+    echo "BUILD_FAILED -- cmake configure; tail:" >&2
+    tail -40 /tmp/q38_cmake.log >&2
+    exit 1
+  }}
+fi
 {arb.BUILD_FAILURE_SH}
 build_targets() {{
   cmake --build build --target qwen3_gguf_bench qwen3_gguf_score qwen3_gguf_generate qwen3_gguf_cb_bench -j"$1" >/tmp/q38_build.log 2>&1
@@ -985,6 +1052,20 @@ fi
 test -x build/runtime/qwen3_gguf_bench
 test -x build/runtime/qwen3_gguf_score
 test -x build/runtime/qwen3_gguf_cb_bench
+# sparkinfer_server for the server concurrency guard (pt. 3d), after the scored targets so it can
+# never cost them. A box-side fault leaves the guard unmeasured; a compile error is the PR's.
+SERVE_BIN=""
+if [ "$SERVER_CONFIGURED" = 1 ]; then
+  if cmake --build build --target sparkinfer_server -j"$(nproc)" >/tmp/q38_build_server.log 2>&1 && \\
+     test -x build/server/sparkinfer_server; then
+    SERVE_BIN="$PWD/build/server/sparkinfer_server"
+  elif FAULT=$(build_box_fault /tmp/q38_build_server.log); then
+    echo "SERVECONC_UNAVAILABLE the server build hit a box-side fault ($FAULT)"
+  else
+    echo "SERVECONC_BUILD_FAILED"
+    grep -m15 -E "error" /tmp/q38_build_server.log >&2 || tail -30 /tmp/q38_build_server.log >&2
+  fi
+fi
 
 # --- decode @ ctx=128 on the NVFP4 checkpoint ---
 # The single scored dimension (module docstring pt. 1). Prefill is deliberately NOT scored here:
@@ -1307,6 +1388,19 @@ if [ -f "$MUSE_GUARD_GGUF" ]; then
     fi
   done
 fi
+
+# --- Server concurrency guard (pt. 3d) ---
+# sparkinfer_server on the checkpoint the release container serves, run as it runs there (no env
+# pins). serve_concurrency.py prints SERVECONC* lines and exits 1 when a mode is below the floor;
+# that is judged in Python against main, so its status must not trip `set -e` here. Its server runs
+# in a session of its own, which it kills on exit, SIGTERM from `timeout` included.
+if [ -n "$SERVE_BIN" ] && [ -d "$MODELOPT_GUARD_MODEL_DIR" ]; then
+  wait_gpu_clear
+  timeout 1800 python3 eval/serve_concurrency.py --server "$SERVE_BIN" --model "$MODELOPT_GUARD_MODEL_DIR" \\
+    --ctx 32768 --conc {serveconc_conc} --min-scaling {serveconc_floor} 2>/tmp/q38_serveconc.err || true
+elif [ -n "$SERVE_BIN" ]; then
+  echo "SERVECONC_UNAVAILABLE checkpoint $MODELOPT_GUARD_MODEL_DIR not installed"
+fi
 echo "GUARD_END"
 """
 
@@ -1438,6 +1532,25 @@ def _parse_remote(stdout: str) -> dict:
             out["longctx_unmeasured"] = True
         elif line.strip() in ("GUARDMO_UNAVAILABLE", "GUARDMG_UNAVAILABLE", "GUARDBN_UNAVAILABLE"):
             out[line.strip().split("_")[0].lower() + "_unavailable"] = True
+        # Server concurrency guard (pt. 3d), eval/serve_concurrency.py's lines.
+        elif line.startswith("SERVECONC_SCALING "):
+            parts = line.split()
+            try:
+                out.setdefault("serveconc", {})[parts[1]] = float(parts[2])
+            except (ValueError, IndexError):
+                pass
+        elif line.startswith("SERVECONC_FAILED "):
+            out.setdefault("serveconc_failed", []).append(line.split(" ", 1)[1].strip())
+        elif line.startswith("SERVECONC_UNAVAILABLE"):
+            out["serveconc_unavailable"] = line.partition(" ")[2].strip() or "unavailable"
+        elif line.strip() == "SERVECONC_BUILD_FAILED":
+            out["serveconc_build_failed"] = True
+        elif line.startswith("SERVECONC "):
+            parts = line.split()   # SERVECONC <mode> c<N> <agg tok/s> <completed>/<sent>
+            try:
+                out.setdefault("serveconc_agg", {})[f"{parts[1]}_{parts[2]}"] = float(parts[3])
+            except (ValueError, IndexError):
+                pass
     out["guard36"] = guard36
     out["guardmo"] = cross_guards["GUARDMO"]
     out["guardmg"] = cross_guards["GUARDMG"]
@@ -1925,6 +2038,20 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
             label = "REJECT"
             passed = False
         cross[key] = (ok, problems, skipped)
+    # Server concurrency guard (pt. 3d): same hard REJECT; a PR with no measurement at all takes the
+    # retry the cross-model guards take for one ("guard-unmeasured").
+    sc_state, sc_problems = check_serve_concurrency(pr, main)
+    if sc_state == "fail":
+        reason = "server concurrency guard failed: " + "; ".join(sc_problems[:4]) + f" | {reason}"
+        label = "REJECT"
+        passed = False
+    elif sc_state == "unmeasured" and label != "REJECT":
+        return {"ok": False, "pr_tip": pr.get("pr_tip"), "retry": True, "strike_key": "guard-unmeasured",
+                "reason": "; ".join(sc_problems) + " — infra, not a regression; the PR is "
+                          "re-evaluated next round rather than rejected",
+                "log": ""}
+    elif sc_state == "skip":
+        print(f">> server concurrency guard not judged: {'; '.join(sc_problems)}")
     if cb_incomplete:
         why = (f"the {' and '.join(cb_detail)} concurrent-decode guard{'s' if len(cb_detail) > 1 else ''} "
                f"did not complete on the PR build while main's did")
@@ -1982,6 +2109,10 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         "bonsai_guard_ok": cross["guardbn"][0],
         "bonsai_guard_problems": cross["guardbn"][1],
         "bonsai_guard_skipped": cross["guardbn"][2],
+        "serveconc_state": sc_state,
+        "serveconc_problems": sc_problems,
+        "serveconc_pr": pr.get("serveconc") or {},
+        "serveconc_main": main.get("serveconc") or {},
         "pr_head": pr.get("head"),
         "main_head": main.get("head"),
         "pr_tip": pr.get("pr_tip"),
@@ -2024,6 +2155,7 @@ def format_comment(commit: str, res: dict) -> str:
         "modelopt_guard_ok": res.get("modelopt_guard_ok"),
         "muse_guard_ok": res.get("muse_guard_ok"),
         "bonsai_guard_ok": res.get("bonsai_guard_ok"),
+        "serveconc_ok": res.get("serveconc_state") != "fail" if res.get("serveconc_state") else None,
     }
     if not res.get("ok"):
         # A failed run that reaches here is the PR's (box faults return earlier, posting nothing):
@@ -2087,6 +2219,22 @@ def format_comment(commit: str, res: dict) -> str:
             cross_rows += (f"| {name} | ❌ **FAILED** — {probs} — "
                            "**verdict forced to REJECT regardless of speed/accuracy**"
                            f"{cb_missing if short in cb_incomplete else ''} |\n")
+    serveconc_row = ""
+    sc_state = res.get("serveconc_state")
+    if sc_state:
+        def _ratios(d):
+            return " / ".join(f"{m} {d[m]:.1f}×" for m in sorted(d)) or "—"
+        sc_what = (f"`sparkinfer_server`, ModelOpt checkpoint: c{SERVECONC_CONC} aggregate ÷ one stream, "
+                   f"floor {SERVECONC_FLOOR:.0f}×")
+        sc_probs = "; ".join((res.get("serveconc_problems") or [])[:3])
+        if sc_state == "ok":
+            serveconc_row = (f"| server concurrency guard | ✅ PR {_ratios(res.get('serveconc_pr') or {})} · "
+                             f"main {_ratios(res.get('serveconc_main') or {})} ({sc_what}) |\n")
+        elif sc_state == "fail":
+            serveconc_row = (f"| server concurrency guard | ❌ **FAILED** — {sc_probs} — "
+                             "**verdict forced to REJECT regardless of speed/accuracy** |\n")
+        else:
+            serveconc_row = f"| server concurrency guard | ⚠️ NOT CHECKED — {sc_probs} |\n"
     polaris = res.get("polaris") or {}
     receipt = polaris.get("receipt")
     if receipt:
@@ -2124,6 +2272,7 @@ def format_comment(commit: str, res: dict) -> str:
         f"{main_acc_note}"
         f"{q36_row}"
         f"{cross_rows}"
+        f"{serveconc_row}"
         f"| PPL PR / main | {res.get('pr_ppl') or '?'} / {res.get('main_ppl') or '?'} |\n"
         f"{polaris_row}"
         f"| commit | `{commit[:9]}`"
@@ -2140,7 +2289,8 @@ def format_comment(commit: str, res: dict) -> str:
         "guards for Qwen3.6 (decode+prefill, ctx 0/512/4k/16k/32k) and for the ModelOpt Qwen3.8 "
         "checkpoint and Muse Glimmer (decode+prefill @ 32k, concurrent decode @ c16/c32) and "
         "Ternary-Bonsai-2-27B (decode+prefill @ 128 and 32k), because Qwen3.8 PRs can touch code "
-        "shared with other models. A `none` label means no measurable speedup on these axes, "
+        "shared with other models, and on the server still batching concurrent requests "
+        "(`eval/serve_concurrency.py`). A `none` label means no measurable speedup on these axes, "
         "which is expected if that is not what your change is about.</sub>\n"
     )
 

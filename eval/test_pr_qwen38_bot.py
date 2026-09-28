@@ -242,6 +242,71 @@ class ConcurrencyGuardTests(unittest.TestCase):
 
 
 
+class ServeConcurrencyGuardTests(unittest.TestCase):
+    """Pt. 3d (2026-09-28): #1088 made every default server request decode on its own for two weeks,
+    and no bot saw it -- they all drive the engine with greedy requests."""
+    MAIN = ("SERVECONC default c1 92.3 3/3\nSERVECONC default c16 1074.5 32/32\n"
+            "SERVECONC_SCALING default 11.64\nSERVECONC sampled c1 92.4 3/3\n"
+            "SERVECONC sampled c16 1079.7 32/32\nSERVECONC_SCALING sampled 11.69\n")
+
+    def test_the_script_builds_and_runs_the_server_without_risking_the_round(self):
+        s = bot._remote_script("main", role="main")
+        self.assertIn("-DBUILD_SERVER=ON", s)
+        self.assertIn("-DBUILD_SERVER=OFF", s)                     # a failed configure drops only this guard
+        self.assertIn("--target sparkinfer_server", s)
+        self.assertLess(s.index("test -x build/runtime/qwen3_gguf_cb_bench"),
+                        s.index("--target sparkinfer_server"))       # after the scored targets
+        self.assertIn("eval/serve_concurrency.py 2>/dev/null ||", s)  # pinned from main like the rest
+        run = s[s.index("# --- Server concurrency guard"):s.index('echo "GUARD_END"')]
+        self.assertIn("|| true", run)                               # judged in Python, not by set -e
+        self.assertIn(f"--conc {bot.SERVECONC_CONC} --min-scaling {bot.SERVECONC_FLOOR}", run)
+
+    def test_lines_parse(self):
+        p = bot._parse_remote(self.MAIN)
+        self.assertEqual(p["serveconc"], {"default": 11.64, "sampled": 11.69})
+        self.assertEqual(p["serveconc_agg"]["default_c16"], 1074.5)
+        f = bot._parse_remote("SERVECONC_FAILED server never became healthy\nSERVECONC_BUILD_FAILED\n"
+                              "SERVECONC_UNAVAILABLE checkpoint /x not installed\n")
+        self.assertEqual(f["serveconc_failed"], ["server never became healthy"])
+        self.assertTrue(f["serveconc_build_failed"])
+        self.assertEqual(f["serveconc_unavailable"], "checkpoint /x not installed")
+
+    def test_batching_switched_off_on_the_pr_rejects(self):
+        main = bot._parse_remote(self.MAIN)
+        pr = bot._parse_remote("SERVECONC_SCALING default 1.04\nSERVECONC_SCALING sampled 11.2\n"
+                               "SERVECONC_FAILED default: c16 aggregate is 1.04x a single stream\n")
+        state, problems = bot.check_serve_concurrency(pr, main)
+        self.assertEqual(state, "fail")
+        self.assertEqual(len(problems), 1)
+        self.assertIn("default", problems[0])
+        self.assertEqual(bot.check_serve_concurrency(bot._parse_remote(self.MAIN), main), ("ok", []))
+
+    def test_a_server_that_does_not_build_on_the_pr_rejects(self):
+        state, _ = bot.check_serve_concurrency({"serveconc_build_failed": True}, bot._parse_remote(self.MAIN))
+        self.assertEqual(state, "fail")
+
+    def test_what_main_cannot_judge_is_never_charged_to_the_pr(self):
+        slow = bot._parse_remote("SERVECONC_SCALING default 1.1\nSERVECONC_SCALING sampled 1.0\n")
+        self.assertEqual(bot.check_serve_concurrency(slow, slow)[0], "skip")          # main below the floor
+        self.assertEqual(bot.check_serve_concurrency(slow, {})[0], "skip")            # main unmeasured
+        self.assertEqual(bot.check_serve_concurrency(
+            {"serveconc_unavailable": "the server build hit a box-side fault (oom)"},
+            bot._parse_remote(self.MAIN))[0], "skip")                                 # the box's fault
+        state, problems = bot.check_serve_concurrency(
+            {"serveconc_failed": ["server never became healthy"]}, bot._parse_remote(self.MAIN))
+        self.assertEqual(state, "unmeasured")                                         # retried, not rejected
+        self.assertIn("never became healthy", problems[0])
+
+    def test_the_comment_reports_it(self):
+        base = {"ok": True, "label": "none", "pr_decode_tps": 1.0, "main_decode_tps": 1.0,
+                "pr_prefill_pp": 1.0, "main_prefill_pp": 1.0, "pr_prefill16k_pp": 1.0,
+                "main_prefill16k_pp": 1.0, "serveconc_state": "ok",
+                "serveconc_pr": {"default": 11.6}, "serveconc_main": {"default": 11.7}}
+        self.assertIn("| server concurrency guard | ✅ PR default 11.6×", bot.format_comment("a" * 40, base))
+        failed = dict(base, serveconc_state="fail", serveconc_problems=["default: 1.04x"])
+        self.assertIn("| server concurrency guard | ❌ **FAILED** — default: 1.04x", bot.format_comment("a" * 40, failed))
+
+
 class MergeOntoBaselineTests(unittest.TestCase):
     """#1145 (2026-09-24): a stale GitHub pull/<n>/merge measured a PR against an older main than
     the round's baseline. The PR is now merged on the box onto the baseline's own commit."""
