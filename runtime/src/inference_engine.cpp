@@ -1149,9 +1149,38 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
         // starts past zero continues KV and recurrent state already in place -- a restored prefix,
         // an earlier checkpoint segment, or an earlier chunk -- so it may take the batched path.
         int pos = job.prefill_pos;
+        int seed = -1;
+        bool ingested = false;
         if (prefix_cache_ && job.req.prefix_cache && !has_vision && job.req.forced_tokens.empty()) {
-            for (int ckpt : job.req.cache_checkpoints) {
-                if (ckpt <= pos || ckpt >= n || ckpt % kv_->block_size() != 0) continue;
+            std::vector<int> ckpts;
+            for (int ckpt : job.req.cache_checkpoints)
+                if (ckpt > pos && ckpt < n && ckpt % kv_->block_size() == 0) ckpts.push_back(ckpt);
+            std::sort(ckpts.begin(), ckpts.end());
+            ckpts.erase(std::unique(ckpts.begin(), ckpts.end()), ckpts.end());
+            // One pass that snapshots the recurrent state at each checkpoint as it goes by, where the
+            // model can take the range that way (Qwen35Model::ingest_prompt_checkpointed). A pass per
+            // segment with a snapshot between cost a chat request a second, eager pass over its last
+            // 10-25 tokens and a device-wide sync. Only from where a pass starts anyway -- position 0
+            // or a restored prefix -- never from a token-loop chunk's continuation.
+            if (!ckpts.empty() && (pos == 0 || pos == job.cached_tokens)) {
+                std::vector<Qwen35Model::RecurrentStateSnapshot> snaps(ckpts.size());
+                int done = pos;
+                seed = model_->ingest_prompt_checkpointed(job.req.prompt.data(), pos, n, ckpts.data(),
+                                                          (int)ckpts.size(), snaps.data(), &done,
+                                                          want_seed_logprob);
+                if (seed >= 0 && done == n) {
+                    for (size_t i = 0; i < ckpts.size(); ++i) {
+                        Job::Checkpoint cp;
+                        cp.pos = ckpts[i];
+                        cp.state = std::move(snaps[i]);
+                        job.checkpoints.push_back(std::move(cp));
+                    }
+                    out_pos = n;
+                    ingested = true;
+                }
+            }
+            for (size_t i = 0; !ingested && i < ckpts.size(); ++i) {
+                const int ckpt = ckpts[i];
                 int mid = pos;
                 model_->ingest_prompt_range(job.req.prompt.data(), pos, ckpt, 0, &mid, false,
                                             /*allow_batched_resume=*/pos > 0);
@@ -1163,12 +1192,13 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
                     job.checkpoints.push_back(std::move(cp));
             }
         }
-        out_pos = pos;
-        const int seed = model_->ingest_prompt_range(job.req.prompt.data(), pos, n, chunk_limit,
-                                                      &out_pos, want_seed_logprob,
-                                                      /*allow_batched_resume=*/pos > 0 &&
-                                                          (pos != job.prefill_pos ||
-                                                           job.cached_tokens > 0));
+        if (!ingested) {
+            out_pos = pos;
+            seed = model_->ingest_prompt_range(job.req.prompt.data(), pos, n, chunk_limit, &out_pos,
+                                               want_seed_logprob,
+                                               /*allow_batched_resume=*/pos > 0 &&
+                                                   (pos != job.prefill_pos || job.cached_tokens > 0));
+        }
         if (has_vision) model_->clear_pending_vision();
         // Positions are consumed by the prefill they were staged for; the offset is not cleared
         // here, by design.

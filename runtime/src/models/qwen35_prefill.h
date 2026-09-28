@@ -180,6 +180,18 @@ struct Qwen35PrefillCtx {
     int                (*multi_sample)(void* user, int i) = nullptr;
     void*                multi_sample_user = nullptr;
 
+    // PREFIX-CACHE CHECKPOINTS TAKEN INSIDE THE PASS (one prompt, never a pack). After row
+    // ckpt_rows[i] - 1 of this pass (ascending, 0 < row < N), every Gated-DeltaNet layer's scan
+    // state and conv window are copied to ckpt_host[i]: pinned host memory in
+    // Qwen35Model::snapshot_recurrent_state's layout -- the scan states, then from
+    // ckpt_state_bytes on the conv windows. Each layer's conv and scan then run once per segment,
+    // carrying the state across, instead of the prompt being prefilled in one pass per segment
+    // with a snapshot between. See Qwen35Model::ingest_prompt_checkpointed.
+    int                  ckpt_n           = 0;
+    const int*           ckpt_rows        = nullptr;
+    void* const*         ckpt_host        = nullptr;
+    size_t               ckpt_state_bytes = 0;
+
     // Set to true (never back to false) when this call declines because a scratch allocation
     // could not get its VRAM -- as opposed to every other reason prefill_batched_run returns -1,
     // which is an unsupported model/config that retrying cannot fix. Left however the caller set

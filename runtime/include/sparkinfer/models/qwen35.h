@@ -579,6 +579,19 @@ public:
     // Overwrite seq_id's recurrent state with `snap`, in the fp32 form prefill resumes from. False
     // when the session is unknown or the snapshot was taken from a differently shaped model.
     bool restore_recurrent_state(uint64_t seq_id, const RecurrentStateSnapshot& snap);
+    // Prefill prompt tokens [start, end) of the active session in ONE batched pass that snapshots
+    // the recurrent state at each of ckpts[0..n_ckpts) as it goes by (ascending, strictly inside the
+    // range): snaps[i] is what snapshot_recurrent_state would have returned there. It replaces a
+    // pass per segment with a snapshot between -- for a chat prompt, a second, eager pass over the
+    // last 10-25 tokens and a device-wide sync. start > 0 continues the state already in place (a
+    // prefix-cache hit), as ingest_prompt_range's allow_batched_resume does.
+    // Returns the seed, as ingest_prompt_range does, with *out_pos = end. Returns -1 having done
+    // nothing -- a model with no recurrent state, a range the batched path cannot take in one pass,
+    // a segment shorter than 16 tokens, a pinned allocation or a pass that declined before its first
+    // kernel -- so the caller can take the per-segment route instead.
+    int ingest_prompt_checkpointed(const int* ids, int start, int end, const int* ckpts, int n_ckpts,
+                                   RecurrentStateSnapshot* snaps, int* out_pos,
+                                   bool want_seed_logprob = false);
 
     // PACKED CONTINUOUS-BATCH DECODE: advance `n` INDEPENDENT sequences by one token each in ONE
     // forward, instead of one full forward per sequence.

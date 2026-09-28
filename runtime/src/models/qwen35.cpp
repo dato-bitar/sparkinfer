@@ -684,6 +684,12 @@ struct Qwen35Model::Impl {
     // Pinned staging for set_logit_bias_dense (cfg.vocab floats), allocated on first use: only
     // constrained requests ever need it.
     float* h_dense_bias = nullptr;
+    // Prefix-cache checkpoints the next prefill_batched() takes inside its pass, set only for the
+    // span of one ingest_prompt_checkpointed() call (Qwen35PrefillCtx::ckpt_*).
+    int pending_ckpt_n = 0;
+    const int* pending_ckpt_rows = nullptr;
+    void* const* pending_ckpt_host = nullptr;
+    size_t pending_ckpt_state_bytes = 0;
     float* logits;
     int *d_scalars, *d_tok, *d_out_id, *d_pos, *d_seqlen, *d_writepos, *d_shared_ids;
     int *d_cap_row = nullptr;   // dflash capture row, packed into d_scalars[4]
@@ -3949,6 +3955,10 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
                           s.d_vision_emb, s.d_vision_pos, s.vision_n,
                           // MRoPE rotary positions, null unless set_pending_mrope ran for this prompt.
                           s.d_mrope_pos };
+    ctx.ckpt_n = s.pending_ckpt_n;
+    ctx.ckpt_rows = s.pending_ckpt_rows;
+    ctx.ckpt_host = s.pending_ckpt_host;
+    ctx.ckpt_state_bytes = s.pending_ckpt_state_bytes;
     // The shadow's ternary legs for batched prefill, while it holds them (see prefill_batched_run).
     if (!s.bonsai_dec_layers.empty() && s.bonsai_dec_rs.size() == s.bonsai_dec_layers.size()) {
         ctx.bonsai_pf_layers = s.bonsai_dec_layers.data();
@@ -4414,6 +4424,70 @@ bool Qwen35Model::snapshot_recurrent_state(uint64_t seq_id, RecurrentStateSnapsh
     out.state_bytes = st_bytes;
     out.conv_bytes = cv_bytes;
     return true;
+}
+
+int Qwen35Model::ingest_prompt_checkpointed(const int* ids, int start, int end, const int* ckpts,
+                                            int n_ckpts, RecurrentStateSnapshot* snaps, int* out_pos,
+                                            bool want_seed_logprob) {
+    std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
+    Impl& s = *p_;
+    if (out_pos) *out_pos = start;
+    const int n = end - start;
+    if (!ids || start < 0 || n <= 0 || !ckpts || !snaps || n_ckpts <= 0 || n_ckpts > 8) return -1;
+    // A model with no recurrent state has nothing to capture; its caller keeps the per-segment
+    // route, which costs it nothing but the extra pass.
+    if (!needs_linear_state(s.cfg)) return -1;
+    // Ascending and strictly inside, every segment long enough that its conv window is its own rows.
+    constexpr int kMinSegment = 16;
+    for (int i = 0, prev = start; i <= n_ckpts; ++i) {
+        const int at = i < n_ckpts ? ckpts[i] : end;
+        if (at - prev < kMinSegment) return -1;
+        prev = at;
+    }
+    auto it = s.sessions.find(s.active_seq_id);
+    if (s.active_seq_id == 0 || it == s.sessions.end() || !it->second.lin_state ||
+        !it->second.lin_conv_state)
+        return -1;
+    // Exactly the one pass ingest_prompt_range would run for this range, or nothing.
+    if (s.d_vision_emb || s.d_mrope_pos || !batched_prefill_windowed_enabled(s.gguf, s.cfg, n, s.kv) ||
+        n > prefill_single_pass_max_tokens(s.kv))
+        return -1;
+    const size_t st_bytes = (size_t)gdn_state_slots(s.cfg) * s.cfg.linear_v_heads * s.cfg.linear_head_dim *
+                            s.cfg.linear_head_dim * sizeof(float);
+    const size_t cv_bytes = (size_t)s.cfg.n_layers * (s.cfg.linear_conv_kernel - 1) * s.linear_qkvdim *
+                            sizeof(bf16);
+    std::vector<std::shared_ptr<void>> bufs((size_t)n_ckpts);
+    std::vector<void*> host((size_t)n_ckpts);
+    std::vector<int> rows((size_t)n_ckpts);
+    for (int i = 0; i < n_ckpts; ++i) {
+        bufs[(size_t)i] = pinned_snapshot_buffer(st_bytes + cv_bytes);
+        if (!bufs[(size_t)i]) return -1;
+        host[(size_t)i] = bufs[(size_t)i].get();
+        // The pass writes the GDN layers' windows; the attention layers' slots, which nothing
+        // reads, are zero rather than whatever a reused buffer held.
+        memset(static_cast<char*>(host[(size_t)i]) + st_bytes, 0, cv_bytes);
+        rows[(size_t)i] = ckpts[i] - start;
+    }
+    s.pending_ckpt_n = n_ckpts;
+    s.pending_ckpt_rows = rows.data();
+    s.pending_ckpt_host = host.data();
+    s.pending_ckpt_state_bytes = st_bytes;
+    // prefill_batched's tail synchronizes the stream to read the seed back, so the snapshot
+    // copies the pass queued behind each checkpoint's segment have landed when it returns.
+    const int seed = prefill_batched(ids + start, n, want_seed_logprob, start);
+    s.pending_ckpt_n = 0;
+    s.pending_ckpt_rows = nullptr;
+    s.pending_ckpt_host = nullptr;
+    s.pending_ckpt_state_bytes = 0;
+    // A pass declines before its first kernel runs (see prefill_batched_resume), so nothing landed.
+    if (seed < 0) return -1;
+    for (int i = 0; i < n_ckpts; ++i) {
+        snaps[i].host = std::move(bufs[(size_t)i]);
+        snaps[i].state_bytes = st_bytes;
+        snaps[i].conv_bytes = cv_bytes;
+    }
+    if (out_pos) *out_pos = end;
+    return seed;
 }
 
 bool Qwen35Model::restore_recurrent_state(uint64_t seq_id, const RecurrentStateSnapshot& snap) {

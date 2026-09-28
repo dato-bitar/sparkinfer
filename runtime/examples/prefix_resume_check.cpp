@@ -11,6 +11,10 @@
 //   split   batched [0, c), then batched resume [c, P)       -- a cache miss that takes a checkpoint
 //   cached  [0, c) in one session and snapshot its recurrent state; a second session shares those
 //           KV blocks, restores the snapshot, then batched resume [c, P)   -- a cache hit
+//   inpass  ONE pass over [0, P) that snapshots the recurrent state at c as it goes by
+//           (Qwen35Model::ingest_prompt_checkpointed)          -- a cache miss that takes a checkpoint
+//   hit     a session on inpass's blocks restores inpass's snapshot, then batched resume [c, P)
+//           -- a cache hit on a checkpoint the one-pass route took
 //
 // `loop` is the reference: every decode step already runs it. If split sits as close to loop as
 // single does, resuming is as sound as the production pass.
@@ -233,6 +237,43 @@ int main(int argc, char** argv) {
         printf("%6d %6d | %-40s | %-40s | %-40s | %-40s\n", P - c, c, fmt(compare(loop, split)).c_str(),
                same ? "bit-identical" : fmt(compare(split, cached)).c_str(),
                fmt(compare(single[0], split)).c_str(), fmt(compare(loop, single[0])).c_str());
+
+        // inpass: one pass over [0, P) snapshotting at c, then a hit from that snapshot.
+        const uint64_t x = open(nullptr);
+        sparkinfer::Qwen35Model::RecurrentStateSnapshot snapx;
+        int outx = 0;
+        const int ck = c;
+        if (!x || model.ingest_prompt_checkpointed(ids.data(), 0, P, &ck, 1, &snapx, &outx, true) < 0 ||
+            outx != P) {
+            printf("       %6s   inpass declined at c=%d (a segment under 16 tokens?)\n", "", c);
+            if (x) model.close_session(x);
+            continue;
+        }
+        const std::vector<TL> inpass = follow(P);
+        std::vector<int> sharedx = kv.retain_prefix_blocks(x, c / 16);
+        model.close_session(x);
+        const uint64_t hx = open(&sharedx);
+        if (!hx || !model.restore_recurrent_state(hx, snapx) || ingest(c, P, true, true) < 0) { printf("[FAIL] hit c=%d\n", c); return 1; }
+        const std::vector<TL> hit = follow(P);
+        model.close_session(hx);
+        kv.release_blocks(sharedx);
+        // The two snapshots of the same prefix: a pass over [0, c) against a segment of a pass over [0, P).
+        double dmax = 0, ref = 0, cmax = 0;
+        if (snap.bytes() == snapx.bytes() && snap.host && snapx.host) {
+            const float* a = static_cast<const float*>(snap.host.get());
+            const float* b = static_cast<const float*>(snapx.host.get());
+            for (size_t i = 0; i < snap.state_bytes / sizeof(float); i++) {
+                dmax = std::max(dmax, (double)std::fabs(a[i] - b[i]));
+                ref = std::max(ref, (double)std::fabs(a[i]));
+            }
+            const uint16_t* ca = reinterpret_cast<const uint16_t*>(static_cast<const char*>(snap.host.get()) + snap.state_bytes);
+            const uint16_t* cb = reinterpret_cast<const uint16_t*>(static_cast<const char*>(snapx.host.get()) + snap.state_bytes);
+            auto f = [](uint16_t h) { uint32_t u = (uint32_t)h << 16; float v; __builtin_memcpy(&v, &u, 4); return v; };
+            for (size_t i = 0; i < snap.conv_bytes / 2; i++) cmax = std::max(cmax, (double)std::fabs(f(ca[i]) - f(cb[i])));
+        }
+        printf("%6s %6s   inpass vs single: %s | hit vs cached: %s | hit vs loop: %s | snapshot state max|d| %.2e (max|x| %.2e), conv max|d| %.2e\n",
+               "", "", fmt(compare(single[0], inpass)).c_str(), fmt(compare(cached, hit)).c_str(),
+               fmt(compare(loop, hit)).c_str(), dmax, ref, cmax);
     }
     printf("free blocks at exit: %d of %d\n", kv.num_free_blocks(), kv.num_total_blocks());
     if (!sparkinfer::deterministic_mode())

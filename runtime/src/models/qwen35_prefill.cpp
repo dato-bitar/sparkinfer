@@ -392,7 +392,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         // Muse's attention branch loops its prompts itself, on either cache dtype; every other
         // stack takes the int8 per-prompt loop further down.
         if (pos0 != 0 || moe || (!c.muse_glimmer && !s.kv->int8_kv())) return -1;
-        if (s.capture_dst || s.vision_emb || s.mrope_pos || s.packed_rows) return -1;
+        if (s.capture_dst || s.vision_emb || s.mrope_pos || s.packed_rows || s.ckpt_n > 0) return -1;
         if (!s.multi_off || !s.multi_len || !s.multi_seq_ids || !s.multi_seed) return -1;
         // Recurrent state only where the stack has Gated-DeltaNet layers to carry it.
         const bool linear = c.hybrid && !c.muse_glimmer;
@@ -638,8 +638,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // A packed pass carries several sessions' state and block tables and is shaped by its pack, so
     // it never captures; and since it may grow the arena under a graph an earlier single-prompt
     // pass captured, it drops that graph too (below) rather than leave it pointing at freed scratch.
+    // A pass that takes prefix-cache checkpoints copies state out mid-pass, into buffers that are
+    // the request's own: it runs eager too.
     const bool graph_on = graph_env && arena_reuse && c.dense_ffn && !capture_dflash && pos0 == 0 &&
-                          !multi;
+                          !multi && s.ckpt_n == 0;
     const void* const pfb_btable = s.kv->block_table(s.seq_id);
     // A whole-prefill graph embeds every pointer passed to its kernel nodes. The arena addresses
     // are deliberately stable, but recurrent state and the paged-KV block table are session-owned:
@@ -2451,6 +2453,43 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         la + o * vh, lb + o * vh, w.ssm_dt, w.ssm_a,
                         s.multi_lin_state[i] + state_at, att + o * lvdim, len, c.linear_q_heads,
                         vh, c.linear_head_dim, c.gdn_qh_block, st, /*carry_in=*/false);
+                }
+            } else if (s.ckpt_n > 0) {
+                // Prefix-cache checkpoints inside the pass: conv and scan once per segment, each
+                // carrying the last one's conv window and recurrence, and after every segment but the
+                // last this layer's state goes to that checkpoint's snapshot. Everything else in the
+                // layer is per row or causal over the whole pass, so it is untouched.
+                const size_t conv_elems = (size_t)(c.linear_conv_kernel - 1) * lqkv;
+                const size_t state_elems = (size_t)vh * c.linear_head_dim * c.linear_head_dim;
+                bf16* conv_state = lin_conv_state + (size_t)L * conv_elems;
+                float* layer_state = s.lin_state + (size_t)gdn_state_slot(c, L) * state_elems;
+                const int lq = s.linear_qdim;
+                for (int seg = 0, r0 = 0; seg <= s.ckpt_n; ++seg) {
+                    const int r1 = seg < s.ckpt_n ? s.ckpt_rows[seg] : N;
+                    const size_t o = (size_t)r0;
+                    // The first segment carries in exactly what a whole pass would; a later one
+                    // carries the window the segment before it just left in conv_state.
+                    const bf16* prev = seg == 0 ? cconv : cprev;
+                    if (prev)
+                        pf_cu(cudaMemcpyAsync(cprev, conv_state, conv_elems * sizeof(bf16),
+                                              cudaMemcpyDeviceToDevice, st), "gdn conv carry-in");
+                    kernels::launch_prefill_gdn_conv(b8 + o * lqkv, w.ssm_conv, conv_state,
+                        gq + o * lq, gk + o * lq, gv + o * lvdim, r1 - r0, c.linear_q_heads, vh,
+                        c.linear_head_dim, c.linear_conv_kernel, eps, st, prev);
+                    kernels::launch_prefill_gdn_scan(gq + o * lq, gk + o * lq, gv + o * lvdim,
+                        la + o * vh, lb + o * vh, w.ssm_dt, w.ssm_a, layer_state, att + o * lvdim,
+                        r1 - r0, c.linear_q_heads, vh, c.linear_head_dim, c.gdn_qh_block, st,
+                        /*carry_in=*/seg > 0 || pos0 != 0);
+                    if (seg < s.ckpt_n) {
+                        char* host = static_cast<char*>(s.ckpt_host[seg]);
+                        pf_cu(cudaMemcpyAsync(host + (size_t)gdn_state_slot(c, L) * state_elems * sizeof(float),
+                                              layer_state, state_elems * sizeof(float),
+                                              cudaMemcpyDeviceToHost, st), "checkpoint state");
+                        pf_cu(cudaMemcpyAsync(host + s.ckpt_state_bytes + (size_t)L * conv_elems * sizeof(bf16),
+                                              conv_state, conv_elems * sizeof(bf16),
+                                              cudaMemcpyDeviceToHost, st), "checkpoint conv");
+                    }
+                    r0 = r1;
                 }
             } else {
                 bf16* conv_state = lin_conv_state + (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
