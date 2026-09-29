@@ -3900,6 +3900,14 @@ int Qwen35Model::sample_seed_token(float temperature, unsigned long long seed,
 
 int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_logprob,
                                  int pos0) {
+    // The pass may capture a CUDA graph on s.stream (prefill_batched_run's whole-prefill graph),
+    // and the HTTP thread's device calls -- a new session's penalty-count and logit-bias resets are
+    // memsets on that same stream -- are kept out of captures by this lock (see device_mutex()).
+    // forward_token and the packed paths took it; this pass did not. A request admitted while it
+    // was capturing had its memset recorded into, and invalidating, the capture: seen under load as
+    // "penalty_counts zero: operation failed due to a previous error during capture" and wrong
+    // output until the stream recovered.
+    std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
     Impl& s = *p_;
     // The block-scaled NVFP4 GEMMs take a row count that is a multiple of 8
     // (prefill_nvfp4_supported), and a pass whose length is not one runs EVERY layer on the
