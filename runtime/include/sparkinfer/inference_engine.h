@@ -282,6 +282,7 @@ private:
     // pass each (Qwen35Model::ingest_prompts_packed). Packed jobs move to DECODE and are removed
     // from `prefill_ids`; everything else is left for step_job exactly as before.
     void step_prefills_packed(std::vector<uint64_t>& prefill_ids);
+    int pack_checkpoint(const Job& j) const;
     // Constrained decoding: rebuild the job's dense logit bias from its constraint's next-token mask
     // (on top of its own logit_bias) and upload it for the next sample. False when the constraint
     // allows no token at all.

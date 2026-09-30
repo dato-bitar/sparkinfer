@@ -954,6 +954,29 @@ bool ContinuousBatchEngine::step_jobs_packed(const std::vector<uint64_t>& ids, b
 // logit_bias, a constraint, forced tokens, an image, prefix-cache work, or an exactly-512-token
 // prompt (which the batched pass keeps on bf16 GDN) -- takes step_job unchanged, and so does
 // every job in a pack the model declines.
+// The prefix-cache checkpoint a packed prefill takes for `j`: 0 for none, the row for exactly one,
+// -1 when the job's checkpoints need the one-prompt path (several of them, or one the pack cannot
+// place: it needs 16 tokens each side, and a block-aligned row strictly inside the prompt).
+int ContinuousBatchEngine::pack_checkpoint(const Job& j) const {
+    if (!(prefix_cache_ && j.req.prefix_cache) || j.req.cache_checkpoints.empty()) return 0;
+    static const bool pack_ckpt = [] {
+        const char* e = getenv("SPARKINFER_PACK_CHECKPOINTS");
+        return !(e && e[0] == '0');
+    }();
+    if (!pack_ckpt) return -1;
+    const int n = (int)j.req.prompt.size();
+    int row = 0, count = 0;
+    for (int ckpt : j.req.cache_checkpoints) {
+        if (ckpt <= 0 || ckpt >= n || ckpt % kv_->block_size() != 0) continue;
+        if (ckpt == row) continue;
+        row = ckpt;
+        ++count;
+    }
+    if (count == 0) return 0;
+    if (count > 1 || row < 16 || n - row < 16) return -1;
+    return row;
+}
+
 void ContinuousBatchEngine::step_prefills_packed(std::vector<uint64_t>& prefill_ids) {
     static const int pack_tokens = [] {
         const char* e = getenv("SPARKINFER_PREFILL_PACK_TOKENS");
@@ -974,7 +997,7 @@ void ContinuousBatchEngine::step_prefills_packed(std::vector<uint64_t>& prefill_
                 j.cached_tokens == 0 && j.seq_id != 0 && !j.req.use_prefix_session &&
                 j.req.vision_pos.empty() && j.req.mrope_pos.empty() && j.req.forced_tokens.empty() &&
                 !j.req.logprobs && j.req.logit_bias.empty() && !j.req.constraint &&
-                !(prefix_cache_ && j.req.prefix_cache && !j.req.cache_checkpoints.empty());
+                pack_checkpoint(j) >= 0;
             if (plain && n >= 2 && n <= pack_tokens && n != 512) eligible.push_back(&j);
         }
     }
@@ -998,8 +1021,11 @@ void ContinuousBatchEngine::step_prefills_packed(std::vector<uint64_t>& prefill_
         std::vector<int> lens, seeds(pk.size(), -1), top_k;
         std::vector<float> temp, top_p;
         std::vector<unsigned long long> seed, step;
-        bool any_sampled = false;
+        std::vector<int> ckpt_rows;
+        bool any_sampled = false, any_ckpt = false;
         for (Job* j : pk) {
+            ckpt_rows.push_back(pack_checkpoint(*j));
+            any_ckpt = any_ckpt || ckpt_rows.back() > 0;
             sids.push_back(j->seq_id);
             prompts.push_back(j->req.prompt.data());
             lens.push_back((int)j->req.prompt.size());
@@ -1019,11 +1045,20 @@ void ContinuousBatchEngine::step_prefills_packed(std::vector<uint64_t>& prefill_
         samp.top_p = top_p.data();
         // Text-only prompts: clear the rotary decode offset, exactly as step_job does before each.
         model_->reset_mrope_offset();
+        std::vector<Qwen35Model::RecurrentStateSnapshot> snaps(pk.size());
         if (!model_->ingest_prompts_packed(sids.data(), prompts.data(), lens.data(),
                                            (int)pk.size(), seeds.data(),
-                                           any_sampled ? &samp : nullptr))
+                                           any_sampled ? &samp : nullptr,
+                                           any_ckpt ? ckpt_rows.data() : nullptr,
+                                           any_ckpt ? snaps.data() : nullptr))
             continue;
         for (size_t k = 0; k < pk.size(); ++k) {
+            if (ckpt_rows[k] > 0 && snaps[k].host) {
+                Job::Checkpoint cp;
+                cp.pos = ckpt_rows[k];
+                cp.state = std::move(snaps[k]);
+                pk[k]->checkpoints.push_back(std::move(cp));
+            }
             pk[k]->prefill_pos = lens[k];
             pk[k]->next_token = seeds[k];
             pk[k]->phase = SeqPhase::DECODE;

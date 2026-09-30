@@ -7,6 +7,21 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Performance
 
+- **Chat prompts that arrive together are prefilled together** (chat c16 TTFT p50 2.04 -> 1.08 s,
+  696 -> 765 tok/s on Qwen3.8-27B).
+  - **Before:** packed prompt prefill refused any prompt with a prefix-cache checkpoint, and a
+    chat request past the checkpoint minimum always has one. So a wave of chat prompts -- up to
+    11 at once at c16 -- went through one pass each, ~131 ms apiece, while every decoding
+    request waited.
+  - **Now:** a pack takes prompts with one checkpoint each. Such a prompt's Gated-DeltaNet conv
+    and scan run in two parts, and the state goes to its snapshot between them, exactly as the
+    one-prompt pass does it. A pack whose length is not a multiple of 8 would lose the NVFP4
+    GEMMs for every layer, so one prompt's last 1-7 tokens run as decode steps after the pass.
+    `SPARKINFER_PACK_CHECKPOINTS=0` keeps checkpointed prompts on the one-prompt path.
+  - **Tested:** `pack_ckpt_check` prefills three chat-length prompts alone and packed: under
+    `SPARKINFER_DETERMINISTIC=1` the seeds and the snapshots are bit-identical, the trimmed
+    prompt included.
+
 - **A chat request no longer pins 205 MB on its prefill's critical path** (1.19x chat
   throughput at 16 concurrent requests; a lone 1K-token chat prompt's time to first token
   208 -> 137 ms, on Qwen3.8-27B).

@@ -2615,6 +2615,42 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 for (int i = 0; i < nseg; ++i) {
                     const size_t o = (size_t)s.multi_off[i];
                     const int len = s.multi_len[i];
+                    const int ck = s.multi_ckpt_row ? s.multi_ckpt_row[i] : 0;
+                    if (ck > 0 && ck < len && s.multi_ckpt_host && s.multi_ckpt_host[i]) {
+                        // This prompt's checkpoint: its conv and scan in two parts on the pass's
+                        // stream -- the staging buffer the second part's conv reads its window
+                        // from is shared -- with this layer's state and window copied to the
+                        // snapshot between them, as the one-prompt path does.
+                        const size_t conv_elems = (size_t)(c.linear_conv_kernel - 1) * lqkv;
+                        const size_t state_elems = (size_t)vh * c.linear_head_dim * c.linear_head_dim;
+                        bf16* conv_state = static_cast<bf16*>(s.multi_lin_conv[i]) + conv_at;
+                        float* layer_state = s.multi_lin_state[i] + state_at;
+                        for (int part = 0; part < 2; ++part) {
+                            const size_t po = o + (part ? (size_t)ck : 0);
+                            const int plen = part ? len - ck : ck;
+                            if (part)
+                                pf_cu(cudaMemcpyAsync(cprev, conv_state, conv_elems * sizeof(bf16),
+                                                      cudaMemcpyDeviceToDevice, st), "gdn conv carry-in");
+                            kernels::launch_prefill_gdn_conv(b8 + po * lqkv, w.ssm_conv, conv_state,
+                                gq + po * lq, gk + po * lq, gv + po * lvdim, plen, c.linear_q_heads, vh,
+                                c.linear_head_dim, c.linear_conv_kernel, eps, st,
+                                part ? cprev : nullptr);
+                            kernels::launch_prefill_gdn_scan(gq + po * lq, gk + po * lq, gv + po * lvdim,
+                                la + po * vh, lb + po * vh, w.ssm_dt, w.ssm_a, layer_state,
+                                att + po * lvdim, plen, c.linear_q_heads, vh, c.linear_head_dim,
+                                c.gdn_qh_block, st, /*carry_in=*/part != 0, 0);
+                            if (!part) {
+                                char* host = static_cast<char*>(s.multi_ckpt_host[i]);
+                                pf_cu(cudaMemcpyAsync(host + (size_t)gdn_state_slot(c, L) * state_elems * sizeof(float),
+                                                      layer_state, state_elems * sizeof(float),
+                                                      cudaMemcpyDeviceToHost, st), "checkpoint state");
+                                pf_cu(cudaMemcpyAsync(host + s.ckpt_state_bytes + (size_t)L * conv_elems * sizeof(bf16),
+                                                      conv_state, conv_elems * sizeof(bf16),
+                                                      cudaMemcpyDeviceToHost, st), "checkpoint conv");
+                            }
+                        }
+                        continue;
+                    }
                     const int j = i % ns;
                     cudaStream_t ss = j ? seg_st[j] : st;
                     kernels::launch_prefill_gdn_conv(b8 + o * lqkv, w.ssm_conv,

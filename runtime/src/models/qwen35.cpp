@@ -4229,13 +4229,33 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
     return seed;
 }
 
+// A snapshot's bytes; see the snapshot pool below (pinned_snapshot_buffer) for why they move.
+struct Qwen35Model::SnapshotBuffer {
+    std::mutex mu;
+    void* data = nullptr;
+    size_t bytes = 0;
+    bool pinned = false;
+    ~SnapshotBuffer();
+};
+
+namespace {
+// Defined with the snapshot pool below.
+std::shared_ptr<Qwen35Model::SnapshotBuffer> pinned_snapshot_buffer(size_t bytes);
+void snapshot_filled(const std::shared_ptr<Qwen35Model::SnapshotBuffer>& b);
+}  // namespace
+
 bool Qwen35Model::ingest_prompts_packed(const uint64_t* seq_ids, const int* const* prompts,
-                                        const int* lens, int n_prompts, int* seeds,
-                                        const PackedSampling* sampling) {
+                                        const int* lens_in, int n_prompts, int* seeds,
+                                        const PackedSampling* sampling, const int* ckpt_rows,
+                                        RecurrentStateSnapshot* snaps) {
     std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
     Impl& s = *p_;
-    if (!seq_ids || !prompts || !lens || !seeds || n_prompts < 2) return false;
+    if (!seq_ids || !prompts || !lens_in || !seeds || n_prompts < 2) return false;
     if (!s.gguf || !s.cfg.hybrid || !s.cfg.dense_ffn) return false;
+    if (ckpt_rows && !snaps) return false;
+    // lens: what the pass itself ingests; one prompt may be trimmed below (see `trimmed`).
+    std::vector<int> lens_v(lens_in, lens_in + n_prompts);
+    const int* lens = lens_v.data();
     // Muse Glimmer carries no recurrent state; its pack is attention and FFN only.
     // SPARKINFER_MUSE_PACKED_INGEST=0 keeps it on one prefill per prompt (A/B in one binary).
     static const bool muse_pack = [] {
@@ -4262,6 +4282,37 @@ bool Qwen35Model::ingest_prompts_packed(const uint64_t* seq_ids, const int* cons
         lin_state[(size_t)i] = it->second.lin_state;
         lin_conv[(size_t)i] = it->second.lin_conv_state;
     }
+    // The block-scaled NVFP4 GEMMs take a multiple of 8 rows, and a pass of any other length runs
+    // every layer on the fallback (see prefill_batched): a pack of 1,076-token chat prompts lost
+    // FP4 for all of them. Run one prompt's last total % 8 tokens as decode steps after the pass
+    // instead, as prefill_batched does for one prompt -- a prompt that keeps 16 rows past its
+    // checkpoint, so the checkpoint's second part is still its own.
+    constexpr int kMinSegment = 16;
+    int trimmed = -1, trim_r = 0;
+    static const int align8_min = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ALIGN8_MIN");
+        const int v = e ? atoi(e) : 128;
+        return v < 0 ? 0 : v;
+    }();
+    if (align8_min > 0 && !s.cfg.muse_glimmer && (total & 7) && !s.w.layers.empty() &&
+        s.w.layers[0].gate_fp4) {
+        const int r = total & 7;
+        for (int i = n_prompts - 1; i >= 0 && trimmed < 0; --i) {
+            const int keep = lens_v[(size_t)i] - r;
+            const int ck = ckpt_rows ? ckpt_rows[i] : 0;
+            if (keep >= kMinSegment && (ck <= 0 || keep - ck >= kMinSegment)) trimmed = i;
+        }
+        if (trimmed >= 0) {
+            trim_r = r;
+            lens_v[(size_t)trimmed] -= r;
+            total -= r;
+            for (int i = trimmed + 1; i < n_prompts; ++i) off[(size_t)i] -= r;
+        }
+    }
+    for (int i = 0; ckpt_rows && i < n_prompts; ++i) {
+        const int ck = ckpt_rows[i];
+        if (ck > 0 && (ck < kMinSegment || lens[i] - ck < kMinSegment)) return false;
+    }
     // Each prompt is its own pass as far as a windowed ring is concerned (prefill_batched_run
     // checks the longest one); the pack as a whole only has to fit the single-pass arena.
     if (s.kv->windowed()) {
@@ -4277,6 +4328,26 @@ bool Qwen35Model::ingest_prompts_packed(const uint64_t* seq_ids, const int* cons
     std::vector<int> ids;
     ids.reserve((size_t)total);
     for (int i = 0; i < n_prompts; ++i) ids.insert(ids.end(), prompts[i], prompts[i] + lens[i]);
+    // Snapshot buffers for the prompts that take a checkpoint.
+    const size_t ck_st_bytes = (size_t)gdn_state_slots(s.cfg) * s.cfg.linear_v_heads *
+                               s.cfg.linear_head_dim * s.cfg.linear_head_dim * sizeof(float);
+    const size_t ck_cv_bytes = (size_t)s.cfg.n_layers * (s.cfg.linear_conv_kernel - 1) *
+                               s.linear_qkvdim * sizeof(bf16);
+    std::vector<std::shared_ptr<SnapshotBuffer>> ck_bufs((size_t)n_prompts);
+    std::vector<void*> ck_host((size_t)n_prompts, nullptr);
+    std::vector<int> ck_row((size_t)n_prompts, 0);
+    bool any_ckpt = false;
+    for (int i = 0; ckpt_rows && i < n_prompts; ++i) {
+        if (ckpt_rows[i] <= 0) continue;
+        if (!linear) return false;
+        ck_bufs[(size_t)i] = pinned_snapshot_buffer(ck_st_bytes + ck_cv_bytes);
+        if (!ck_bufs[(size_t)i]) return false;
+        ck_host[(size_t)i] = ck_bufs[(size_t)i]->data;
+        // The pass writes the GDN layers' windows; the attention layers' slots stay zero.
+        memset(static_cast<char*>(ck_host[(size_t)i]) + ck_st_bytes, 0, ck_cv_bytes);
+        ck_row[(size_t)i] = ckpt_rows[i];
+        any_ckpt = true;
+    }
     for (int i = 0; i < n_prompts; ++i) {
         // Position-0 batched prefill writes the whole recurrent state as fp32 (see prefill_batched).
         s.sessions[seq_ids[i]].lin_state_b16 = false;
@@ -4352,12 +4423,58 @@ bool Qwen35Model::ingest_prompts_packed(const uint64_t* seq_ids, const int* cons
         ctx.multi_lin_state = lin_state.data() + b;
         ctx.multi_lin_conv = lin_conv.data() + b;
         ctx.multi_seed = seeds + b;
+        if (any_ckpt) {
+            ctx.multi_ckpt_row = ck_row.data() + b;
+            ctx.multi_ckpt_host = ck_host.data() + b;
+            ctx.ckpt_state_bytes = ck_st_bytes;
+        }
         sampler.base = b;
         if (prefill_batched_run(ctx, ids.data() + off[(size_t)b], rows, 0) < 0) return false;
         b = e;
     }
+    // The trimmed prompt's last tokens, one decode step each on its own session; its seed is the
+    // last step's pick, redrawn with its sampler as the pass would have redrawn it.
+    if (trimmed >= 0) {
+        const uint64_t sid = seq_ids[trimmed];
+        activate_session(sid);
+        const int full = lens_in[trimmed];
+        int seed = -1;
+        for (int t = full - trim_r; t < full; ++t) {
+            seed = forward_token(prompts[trimmed][t], t, t + 1 == full);
+            if (seed < 0) return false;
+        }
+        // The last step counted its pick toward presence/frequency penalties, which a batched
+        // prefill's seed never is (see prefill_batched): take that count back.
+        if (seed < s.cfg.vocab && s.penalty_counts) {
+            int count = 0;
+            cu(cudaMemcpyAsync(&count, s.penalty_counts + seed, sizeof(int), cudaMemcpyDeviceToHost,
+                               s.stream), "pack tail count read");
+            cu(cudaStreamSynchronize(s.stream), "pack tail count sync");
+            if (count > 0) {
+                --count;
+                cu(cudaMemcpyAsync(s.penalty_counts + seed, &count, sizeof(int), cudaMemcpyHostToDevice,
+                                   s.stream), "pack tail count write");
+                cu(cudaStreamSynchronize(s.stream), "pack tail count write sync");
+            }
+        }
+        if (sampling && sampling->temperature && sampling->temperature[trimmed] > 0.f) {
+            const int drawn = sample_logits_row(s, sampling->temperature[trimmed], sampling->seed[trimmed],
+                                                sampling->step[trimmed], sampling->top_k[trimmed],
+                                                sampling->top_p[trimmed]);
+            if (drawn >= 0) seed = drawn;
+        }
+        seeds[trimmed] = seed;
+    }
     for (int i = 0; i < n_prompts; ++i)
         if (seeds[i] < 0 || seeds[i] >= s.cfg.vocab) return false;
+    // The pass synchronized its stream to read the seeds back, so every snapshot has landed.
+    for (int i = 0; any_ckpt && i < n_prompts; ++i) {
+        if (!ck_bufs[(size_t)i]) continue;
+        snapshot_filled(ck_bufs[(size_t)i]);
+        snaps[i].host = std::move(ck_bufs[(size_t)i]);
+        snaps[i].state_bytes = ck_st_bytes;
+        snaps[i].conv_bytes = ck_cv_bytes;
+    }
     return true;
 }
 
@@ -4566,14 +4683,6 @@ int Qwen35Model::prefill_batched_resume(const int* prompt_ids, int start, int en
 // SPARKINFER_SNAPSHOT_MIGRATE=0 keeps every snapshot in its pinned buffer (the buffers still come
 // back to the free list when the snapshot goes); SPARKINFER_SNAPSHOT_POOL=0 also stops reusing
 // them. Nothing here is ever destroyed: a snapshot can outlive every other static at exit.
-struct Qwen35Model::SnapshotBuffer {
-    std::mutex mu;
-    void* data = nullptr;
-    size_t bytes = 0;
-    bool pinned = false;
-    ~SnapshotBuffer();
-};
-
 namespace {
 constexpr size_t kSnapshotPoolMax = 8;
 struct SnapshotPool {

@@ -177,6 +177,13 @@ struct Qwen35PrefillCtx {
     // Optional: redraws prompt i's seed with its request's sampler. Called after prompt i's
     // argmax is read back, with its last-position logits still in `logits`; returns the token to
     // keep, or -1 to keep the argmax. Null keeps every argmax.
+    // Packed prompts' prefix-cache checkpoints, at most one per prompt. multi_ckpt_row[i] > 0 is
+    // the row inside prompt i after which every Gated-DeltaNet layer's scan state and conv window
+    // go to multi_ckpt_host[i] -- pinned host memory in ckpt_host's layout, with ckpt_state_bytes
+    // as for ckpt_host. That prompt's conv and scan run in two parts carrying the state across,
+    // on the pass's own stream. Null, or a row of 0, takes no checkpoint for that prompt.
+    const int*           multi_ckpt_row   = nullptr;
+    void* const*         multi_ckpt_host  = nullptr;
     int                (*multi_sample)(void* user, int i) = nullptr;
     void*                multi_sample_user = nullptr;
     // dflash_verify_short_run (not packed): when set, it replaces the verify rows' argmax with the

@@ -486,6 +486,7 @@ public:
         const int* top_k = nullptr;                    // [n]; <= 0 or >= vocab is off
         const float* top_p = nullptr;                  // [n]; >= 1 is off
     };
+    struct RecurrentStateSnapshot;   // defined below, with snapshot_recurrent_state
     // Prefill several FRESH sessions' prompts in ONE batched pass (Qwen35PrefillCtx::multi_n):
     // each session opened with nothing ingested yet, text only, no logit_bias. On success writes
     // each prompt's seed to seeds[i] and returns true: the argmax -- the token
@@ -493,8 +494,15 @@ public:
     // temperature above 0, the token sample_seed_token() draws from the same logits. Returns false
     // when the pack is not eligible or a stage declines; the caller then ingests the prompts one
     // at a time from position 0, which resets whatever this pass had written.
+    //
+    // ckpt_rows (optional, n_prompts entries): a prompt with ckpt_rows[i] > 0 has its recurrent
+    // state snapshotted after that many tokens, as ingest_prompt_checkpointed does for one prompt,
+    // into snaps[i] (same layout as snapshot_recurrent_state). The row must leave at least 16
+    // tokens on each side. A pack whose total is not a multiple of 8 -- which would take every
+    // layer off the NVFP4 GEMMs -- runs one prompt's last 1-7 tokens as decode steps after it.
     bool ingest_prompts_packed(const uint64_t* seq_ids, const int* const* prompts, const int* lens,
-                               int n_prompts, int* seeds, const PackedSampling* sampling = nullptr);
+                               int n_prompts, int* seeds, const PackedSampling* sampling = nullptr,
+                               const int* ckpt_rows = nullptr, RecurrentStateSnapshot* snaps = nullptr);
     // The response's FIRST token for a sampled request. Prefill's seed is the argmax of the last
     // prompt position; this redraws it from those same logits the way forward_token draws every
     // later token -- top_k/top_p mask, Gumbel-max noise from Philox(seed, vocab index, step), then
