@@ -784,14 +784,37 @@ void ContinuousBatchEngine::worker_loop() {
         // prefills wait for the next steps (running them now would stall the decode batch again);
         // the mixed prompt itself continues here only once what is left is small.
         if (mixed > 0) {
-            static constexpr int kMixFinish = 64;
+            Job& J = *mix_job;
+            const int n = (int)J.req.prompt.size();
+            auto next_checkpoint = [&] {
+                int nc = 0;
+                if (prefix_cache_ && J.req.prefix_cache)
+                    for (int ck : J.req.cache_checkpoints)
+                        if (ck > J.prefill_pos && ck < n) nc = nc ? std::min(nc, ck) : ck;
+                return nc;
+            };
+            // Checkpoint hop: the chunk stopped short of a prefix-cache checkpoint. Take the few
+            // tokens up to it in one verify forward, snapshot there as step_job would, and let
+            // the next steps keep mixing past it.
+            const int ck = next_checkpoint();
+            if (ck && ck - J.prefill_pos <= 32) {
+                int mid = J.prefill_pos;
+                model_->activate_session(J.seq_id);
+                model_->ingest_prompt_range(J.req.prompt.data(), J.prefill_pos, ck, 0, &mid, false,
+                                            /*allow_batched_resume=*/true);
+                if (mid == ck) {
+                    Job::Checkpoint cp;
+                    cp.pos = ck;
+                    if (model_->snapshot_recurrent_state(J.seq_id, cp.state))
+                        J.checkpoints.push_back(std::move(cp));
+                    J.prefill_pos = ck;
+                }
+            }
+            // The prompt's own end within 32 tokens and no checkpoint before it: step_job finishes
+            // it now (one verify forward) and emits the first token. Otherwise it waits for the
+            // next mixed step, as do the other prefills.
             std::vector<uint64_t> keep;
-            const int left = (int)mix_job->req.prompt.size() - mix_job->prefill_pos;
-            int next_ck = 0;
-            for (int ck : mix_job->req.cache_checkpoints)
-                if (ck > mix_job->prefill_pos) next_ck = next_ck ? std::min(next_ck, ck) : ck;
-            const int to_boundary = next_ck ? next_ck - mix_job->prefill_pos : left;
-            if (left <= kMixFinish || to_boundary < 128) keep.push_back(mix_job->request_id);
+            if (n - J.prefill_pos <= 32 && !next_checkpoint()) keep.push_back(J.request_id);
             prefill_ids.swap(keep);
         }
         step_prefills_packed(prefill_ids);
@@ -908,8 +931,13 @@ ContinuousBatchEngine::Job* ContinuousBatchEngine::pick_mixed_chunk(const std::v
             for (int ck : r.cache_checkpoints)
                 if (ck > j->prefill_pos && ck < limit) limit = ck;
         const int avail = limit - j->prefill_pos;
-        if (avail < kMinChunk) continue;
-        *chunk_max = std::min(avail, budget);
+        // Within 32 tokens of the checkpoint or the end, the verify path's one forward finishes it
+        // (the worker's checkpoint hop, or step_job); a fresh prompt needs a chunk worth a pass.
+        if (avail <= 32 || (j->mixed_tokens == 0 && avail < kMinChunk)) continue;
+        // Equal chunks: the last one then ends within 7 tokens of the boundary (the row alignment
+        // takes the rest), where a budget-sized split left a stub a whole pass had to take.
+        const int nch = (avail + budget - 1) / budget;
+        *chunk_max = std::min(avail, (avail + nch - 1) / nch + 7);
         return j;
     }
     return nullptr;
@@ -1033,7 +1061,7 @@ bool ContinuousBatchEngine::step_jobs_packed(const std::vector<uint64_t>& ids, b
         // row granule), else the pass would take the slow unaligned arm on every layer.
         if (off == 0 && chunk_job && chunk_done) {
             int len = chunk_max - (int)((m + (size_t)chunk_max) % 8);
-            if (len >= 64) {
+            if (len >= 16) {
                 int seed = -1;
                 ok = model_->mixed_step(toks.data(), pos.data(), seqs.data(), (int)m, out.data(),
                                         any_sampled ? &samp : nullptr, chunk_job->seq_id,

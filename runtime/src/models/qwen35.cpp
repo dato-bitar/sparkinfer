@@ -4697,7 +4697,10 @@ int Qwen35Model::prefill_batched_resume(const int* prompt_ids, int start, int en
     // for a handful of rows and was ~70 ms of each chat request's prefill under load.
     // Scoped like the aligned pass's own tail (prefill_batched): NVFP4 checkpoints, whose verify
     // path this is measured on; the other stacks keep the pass.
-    if (n <= 8 && !want_seed_logprob && !s.w.layers.empty() && s.w.layers[0].gate_fp4) {
+    // Up to 32 tokens: the verify arena's width (kVerifyMaxRows). A chat prompt's two checkpoints
+    // (end of the system prompt, start of the assistant turn) leave segments of 16-ish tokens
+    // between them, and a resume pass for 16 rows cost ~50 ms against one verify forward's ~15.
+    if (n <= 32 && !want_seed_logprob && !s.w.layers.empty() && s.w.layers[0].gate_fp4) {
         const int seed = ingest_tail_rows(prompt_ids + start, n, start);
         if (seed >= 0 && seed < s.cfg.vocab) {
             if (out_done) *out_done = n;
@@ -5988,7 +5991,7 @@ int Qwen35Model::ingest_tail_rows(const int* token_ids, int n, int pos0) {
     }();
     std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
     Impl& s = *p_;
-    if (!on || !token_ids || n < 1 || n > 8 || s.d_vision_emb || s.d_mrope_pos)
+    if (!on || !token_ids || n < 1 || n > 32 || s.d_vision_emb || s.d_mrope_pos)
         return -1;
     // A speculative prefill captures the target's hidden states for the draft: the rows go straight
     // into the context buffer at their positions (the verify capture writes the same row layout).

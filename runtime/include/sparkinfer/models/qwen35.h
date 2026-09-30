@@ -498,8 +498,8 @@ public:
         const int* top_k = nullptr;                    // [n]; <= 0 or >= vocab is off
         const float* top_p = nullptr;                  // [n]; >= 1 is off
     };
-    // Ingest the 1-8 tokens a prompt's aligned prefill leaves over in ONE forward of the verify
-    // path (see qwen35.cpp). Returns the last row's argmax with its logits left in place, or -1 if
+    // Ingest up to 32 tokens -- the 1-7 an aligned prefill leaves over, or a short resumed range --
+    // in ONE forward of the verify path (see qwen35.cpp). Returns the last row's argmax with its logits left in place, or -1 if
     // the path declined, in which case nothing was committed.
     int ingest_tail_rows(const int* token_ids, int n, int pos0);
     // Prefill several FRESH sessions' prompts in ONE batched pass (Qwen35PrefillCtx::multi_n):
