@@ -7,6 +7,29 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Performance
 
+- **A prompt's last 1-7 tokens take one forward instead of one decode step each** (a 1,076-token
+  chat prompt prefills in 96 ms instead of 131, on Qwen3.8-27B).
+  - **Before:** the NVFP4 prefill takes a multiple of 8 rows, so the aligned body ran as one
+    pass and the 1-7 tokens left over ran as decode steps (#1207), each a full weight read: ~40
+    ms for a 4-token tail. A small prefill pass for the tail was slower still, because it
+    displaced the cached whole-prefill graph.
+  - **Now:** the tail runs through the verify path -- the path greedy speculation relies on to
+    reproduce decode exactly -- in one forward, eagerly and outside the verify graph cache so the
+    packed decode's graphs are never evicted, committing every row
+    (`Qwen35Model::ingest_tail_rows`). A seed whose logprob is wanted, or a session with a logit
+    bias, keeps the decode steps. `SPARKINFER_PREFILL_TAIL_VERIFY=0` restores them.
+  - **Tested:** through `sparkinfer_server` under `SPARKINFER_DETERMINISTIC=1`, 18/18 completions
+    (T=0, 0.7, 1.0) identical with the tail on and off; `pack_ckpt_check` gives the same seeds and
+    snapshots either way.
+
+### Fixed
+
+- **A verify pass that did not record a CUDA graph began one anyway.** `dflash_verify_short_run`'s
+  `if (recording)` guarded the FP8 memset loop instead of `cudaStreamBeginCapture`, so a
+  non-recording pass left the stream capturing and every later call on it failed ("operation not
+  permitted when stream is capturing"). DSpark never reached it because it warms every width
+  first; the eager tail above is the first caller that does not record.
+
 - **Chat prompts that arrive together are prefilled together** (chat c16 TTFT p50 2.04 -> 1.08 s,
   696 -> 765 tok/s on Qwen3.8-27B).
   - **Before:** packed prompt prefill refused any prompt with a prefix-cache checkpoint, and a

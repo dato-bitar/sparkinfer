@@ -139,6 +139,14 @@ struct Qwen35PrefillCtx {
     // run: the buffer is carved from the verify arena, whose layout is fixed across passes, so it
     // holds this pass's logits until the next verify pass.
     float**              packed_logits_out = nullptr;
+    // dflash_verify_short_run as a PREFILL of n known tokens (Qwen35Model::ingest_tail_rows):
+    // verify_eager runs it without the verify graph cache -- no flush, no replay, no recording --
+    // so a call for a session other than the cached one leaves packed decode's graphs alone;
+    // verify_commit_all commits every row, where a speculative verify keeps only the accepted
+    // prefix; verify_logits_out receives the address of the rows' logits ([n, vocab] fp32).
+    bool                 verify_eager = false;
+    bool                 verify_commit_all = false;
+    float**              verify_logits_out = nullptr;
     // The Bonsai decode shadow's layers (n_layers entries), or null. A packed step reads its FFN
     // and its attention q/k/v and output projections from their ternary legs through the
     // arithmetic single-row decode runs on them, so every row decodes bit-identically batched or

@@ -80,7 +80,12 @@ int main(int argc, char** argv) {
     Snap snap_a[3];
     for (int i = 0; i < 3; i++) {
         const uint64_t sid = model.open_session(lens[i] + 64);
-        if (!sid) { printf("[FAIL] open\n"); return 1; }
+        if (!sid) {
+            size_t f = 0, t = 0;
+            cudaMemGetInfo(&f, &t);
+            printf("[FAIL] open alone %d (free %.2f GB, free KV blocks %d)\n", i, f / 1e9, kv.num_free_blocks());
+            return 1;
+        }
         model.activate_session(sid);
         model.reset_mrope_offset();
         int done = 0;
@@ -94,7 +99,12 @@ int main(int argc, char** argv) {
     const int* prompts[3];
     for (int i = 0; i < 3; i++) {
         sids[i] = model.open_session(lens[i] + 64);
-        if (!sids[i]) { printf("[FAIL] open\n"); return 1; }
+        if (!sids[i]) {
+            size_t f = 0, t = 0;
+            cudaMemGetInfo(&f, &t);
+            printf("[FAIL] open packed %d (free %.2f GB, free KV blocks %d)\n", i, f / 1e9, kv.num_free_blocks());
+            return 1;
+        }
         prompts[i] = ids.data() + offs[i];
     }
     model.reset_mrope_offset();

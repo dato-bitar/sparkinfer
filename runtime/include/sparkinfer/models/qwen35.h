@@ -486,6 +486,10 @@ public:
         const int* top_k = nullptr;                    // [n]; <= 0 or >= vocab is off
         const float* top_p = nullptr;                  // [n]; >= 1 is off
     };
+    // Ingest the 1-8 tokens a prompt's aligned prefill leaves over in ONE forward of the verify
+    // path (see qwen35.cpp). Returns the last row's argmax with its logits left in place, or -1 if
+    // the path declined, in which case nothing was committed.
+    int ingest_tail_rows(const int* token_ids, int n, int pos0);
     struct RecurrentStateSnapshot;   // defined below, with snapshot_recurrent_state
     // Prefill several FRESH sessions' prompts in ONE batched pass (Qwen35PrefillCtx::multi_n):
     // each session opened with nothing ingested yet, text only, no logit_bias. On success writes

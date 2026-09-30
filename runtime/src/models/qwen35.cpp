@@ -4068,6 +4068,12 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
     if (align8_min > 0 && body >= align8_min && body < n && !s.w.layers.empty() &&
         s.w.layers[0].gate_fp4 && !s.d_vision_emb && !s.d_mrope_pos && !s.dflash_capture) {
         if (prefill_batched(prompt_ids, body, false, pos0) < 0) return -1;   // nothing landed
+        // One forward for the whole tail where the verify path takes it (ingest_tail_rows);
+        // decode steps otherwise. A seed whose logprob is wanted keeps the decode steps.
+        if (!want_seed_logprob) {
+            const int tail_seed = ingest_tail_rows(prompt_ids + body, n - body, pos0 + body);
+            if (tail_seed >= 0 && tail_seed < s.cfg.vocab) return tail_seed;
+        }
         int seed = -1;
         for (int i = body; i < n; ++i) seed = forward_token(prompt_ids[i], pos0 + i, i + 1 == n);
         // The last step counted its pick toward presence/frequency penalties, which a batched
@@ -4438,14 +4444,15 @@ bool Qwen35Model::ingest_prompts_packed(const uint64_t* seq_ids, const int* cons
         const uint64_t sid = seq_ids[trimmed];
         activate_session(sid);
         const int full = lens_in[trimmed];
-        int seed = -1;
-        for (int t = full - trim_r; t < full; ++t) {
+        int seed = ingest_tail_rows(prompts[trimmed] + full - trim_r, trim_r, full - trim_r);
+        const bool stepped = !(seed >= 0 && seed < s.cfg.vocab);
+        for (int t = full - trim_r; stepped && t < full; ++t) {
             seed = forward_token(prompts[trimmed][t], t, t + 1 == full);
             if (seed < 0) return false;
         }
         // The last step counted its pick toward presence/frequency penalties, which a batched
         // prefill's seed never is (see prefill_batched): take that count back.
-        if (seed < s.cfg.vocab && s.penalty_counts) {
+        if (stepped && seed < s.cfg.vocab && s.penalty_counts) {
             int count = 0;
             cu(cudaMemcpyAsync(&count, s.penalty_counts + seed, sizeof(int), cudaMemcpyDeviceToHost,
                                s.stream), "pack tail count read");
@@ -5717,6 +5724,57 @@ bool Qwen35Model::batched_forward(const int* token_ids, int n, int start_pos, bo
                                                   s.dflash_layer_ids.data(), s.dflash_n_cap,
                                                   const_cast<void*>(dflash_capture_dst), out_argmax);
     return consumed > 0;
+}
+
+// The 1-7 tokens a prompt's aligned prefill leaves over (see prefill_batched), ingested in ONE
+// forward of the verify path instead of one decode step each. The verify path is the one greedy
+// speculation relies on to reproduce decode exactly, so its KV, recurrent state and last-row
+// logits are the ones the decode steps would have produced -- at about one weight read where n
+// steps cost n. It runs eagerly, outside the verify graph cache, so it never evicts the packed
+// decode's graphs, and it commits every row. Leaves the last row's logits in s.logits, as a
+// decode step does, and returns its argmax, or -1 if the path declined (nothing committed; the
+// caller runs the decode steps). Not for a session with a logit bias or a seed that needs its
+// logprob: those are applied on forward_token's tail. SPARKINFER_PREFILL_TAIL_VERIFY=0 disables.
+int Qwen35Model::ingest_tail_rows(const int* token_ids, int n, int pos0) {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_TAIL_VERIFY");
+        return !(e && e[0] == '0');
+    }();
+    std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
+    Impl& s = *p_;
+    if (!on || !token_ids || n < 1 || n > 8 || s.dflash_capture || s.d_vision_emb || s.d_mrope_pos)
+        return -1;
+    auto it = s.sessions.find(s.active_seq_id);
+    if (s.active_seq_id == 0 || it == s.sessions.end() || it->second.logit_bias_set ||
+        it->second.lin_state_b16)
+        return -1;
+    float* lin_state = it->second.lin_state;
+    bf16* lin_conv = it->second.lin_conv_state;
+    Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.stream_k, s.stream_v, s.active_seq_id,
+                          lin_state, lin_conv, s.logits, s.d_out_id, s.h_out_id, s.gguf,
+                          s.emb_norm_ones,
+                          s.bonsai_embed_native,
+                          s.bonsai_sign_dev.count(s.cfg.hidden)
+                              ? s.bonsai_sign_dev.at(s.cfg.hidden) : nullptr,
+                          s.bonsai_sign_ffn,
+                          (int)s.bonsai_block,
+                          s.bonsai_rot,
+                          s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
+                          s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
+                          nullptr, 0, nullptr, 0 };
+    float* rows_logits = nullptr;
+    ctx.verify_eager = true;
+    ctx.verify_commit_all = true;
+    ctx.verify_logits_out = &rows_logits;
+    std::vector<int> out((size_t)n, -1);
+    const int consumed = dflash_verify_short_run(ctx, token_ids, n, pos0, nullptr, 0, nullptr,
+                                                  out.data());
+    if (consumed != n || !rows_logits) return consumed == n ? out[(size_t)n - 1] : -1;
+    cu(cudaMemcpyAsync(s.logits, rows_logits + (size_t)(n - 1) * s.cfg.vocab,
+                       (size_t)s.cfg.vocab * sizeof(float), cudaMemcpyDeviceToDevice, s.stream),
+       "tail rows logits");
+    cu(cudaStreamSynchronize(s.stream), "tail rows sync");
+    return out[(size_t)n - 1];
 }
 
 std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, int max_new,

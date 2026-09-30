@@ -5303,6 +5303,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     float* shared_h = a.alloc<float>((size_t)NA * ffn);
     float* logits = a.alloc<float>((size_t)NA * c.vocab);
     if (packed && s.packed_logits_out) *s.packed_logits_out = logits;
+    if (!packed && s.verify_logits_out) *s.verify_logits_out = logits;
     int* out_ids = a.alloc<int>(NA);
     const size_t q81_stride_max = kernels::llama_q8_1_bytes(std::max(H, lvdim));
     void* q81 = a.alloc<unsigned char>((size_t)NA * q81_stride_max);
@@ -5798,10 +5799,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     const void* conv_key    = packed ? (const void*)s.packed_lin_conv  : (const void*)s.lin_conv_state;
     const void* btable_key  = packed ? (const void*)s.packed_rows      : (const void*)btable;
     const uint64_t seq_key  = packed ? UINT64_MAX - 1 : s.seq_id;
-    if (graph_model_key != s.w.lm_head || graph_state_key != state_key ||
+    if (!s.verify_eager && (graph_model_key != s.w.lm_head || graph_state_key != state_key ||
         graph_conv_key != conv_key || graph_capture_key != capture_dst ||
         graph_btable_key != btable_key || graph_seq_key != seq_key || graph_ns_key != ns ||
-        graph_shadow_key != (const void*)s.bonsai_dec_layers) {
+        graph_shadow_key != (const void*)s.bonsai_dec_layers)) {
         for (int t = 1; t <= kVerifyMaxRows; t++) {
             if (verify_exec[t]) cudaGraphExecDestroy(verify_exec[t]);
             if (verify_graph[t]) cudaGraphDestroy(verify_graph[t]);
@@ -5818,8 +5819,8 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         graph_ns_key = ns;
         graph_shadow_key = s.bonsai_dec_layers;
     }
-    if (graph_ready_t[N] && capture_only) return 0;   // this tier is already built
-    if (graph_ready_t[N]) {
+    if (!s.verify_eager && graph_ready_t[N] && capture_only) return 0;   // this tier is already built
+    if (!s.verify_eager && graph_ready_t[N]) {
         pf_cu(cudaGraphLaunch(verify_exec[N], st), "verify graph launch");
         pf_cu(cudaStreamSynchronize(st), "verify graph sync");
         std::memcpy(out_argmax, ph_out, (size_t)N * sizeof(int));
@@ -5871,14 +5872,15 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     q4k_f16 = !muse && packed && c.head_dim == 256 && dense && !s.bonsai_sign_hidden &&
               q4k_f16_min > 0 && N >= q4k_f16_min && kernels::q4k_f16_rows_enabled() &&
               kernels::q4k_f16_rows_reserve(st) && kernels::q4k_f16_rows_reserve(s.stream_k);
-    // Packed decode always records. `recording` gates the EndCapture/instantiate/launch trio at
-    // the bottom, while BeginCapture below is unconditional on this path (we only get here when
-    // this tier's graph is NOT ready), so a false `recording` begins a capture that is never
-    // ended and strands the stream -- every later call then fails with "operation not permitted
-    // when stream is capturing". DSpark never sees that because dflash_generate warms each tier
-    // with a capture_only call during session setup; packed decode has no such warmup.
-    recording = graph_warm || capture_only || packed;
-    if (recording)
+    // Packed decode always records. `recording` gates both the BeginCapture below and the
+    // EndCapture/instantiate/launch trio at the bottom; a pass that does not record runs its
+    // kernels eagerly. (BeginCapture used to be unconditional here -- a stray `if (recording)`
+    // guarded the FP8 memset loop below instead -- so a pass that did not record began a capture
+    // it never ended and stranded the stream: every later call failed with "operation not
+    // permitted when stream is capturing". DSpark never hit it because dflash_generate warms each
+    // tier with a capture_only call first; an eager pass (verify_eager) is the first caller that
+    // does not record.)
+    recording = !s.verify_eager && (graph_warm || capture_only || packed);
     // Dense FFN seeds: expert 0, weight 1.0 -- the same constants AR uses. Written ONCE, here,
     // SYNCHRONOUSLY, and deliberately BEFORE the capture begins.
     //
@@ -5901,6 +5903,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         pf_cu(cudaMemcpy(expert_w, ones.data(), ones.size() * sizeof(float),
                          cudaMemcpyHostToDevice), "dense expert w seed");
     }
+    if (recording)
         pf_cu(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), "verify graph begin");
     pf_cu(cudaMemcpyAsync(ids, ph_ids, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, st), "verify ids");
     pf_cu(cudaMemcpyAsync(pos, ph_pos, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, st), "verify pos");
@@ -7456,7 +7459,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     }
     pf_cu(cudaStreamSynchronize(st), "verify sync");
     std::memcpy(out_argmax, ph_out, (size_t)N * sizeof(int));
-    graph_warm = true;
+    if (!s.verify_eager) graph_warm = true;
     if (vdbg_dump_now) {
         std::vector<bf16> host((size_t)(c.n_layers + 1) * H);
         pf_cu(cudaMemcpy(host.data(), verify_dbg_buf, host.size() * sizeof(bf16), cudaMemcpyDeviceToHost),
@@ -7490,6 +7493,7 @@ verify_forward_done:
         return -1;
     }
     int keep = 1;
+    if (s.verify_commit_all) keep = N;
     while (keep < N && token_ids[keep] == out_argmax[keep - 1]) ++keep;
     if (getenv("SPARKINFER_DFLASH_VERIFY_DUMP_ROW")) {
         fprintf(stderr, "[dflash-verify-debug] start_pos=%d N=%d keep=%d out_argmax=[", start_pos, N, keep);
