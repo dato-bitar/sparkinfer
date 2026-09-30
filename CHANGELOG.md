@@ -7,6 +7,27 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Added
 
+- **Mixed prefill + decode steps, opt-in** (`SPARKINFER_MIXED_CHUNK=<tokens>`): a latency mode.
+  At 32 concurrent chats, TTFT p50 1,240 -> 332 ms for 1,113 -> 948 tok/s, on Qwen3.8-27B.
+  - **What it does:** while requests decode and a prompt waits, the decode step carries the next
+    chunk of that prompt in the same forward (`Qwen35Model::mixed_step`). The norms, projections,
+    FFN and LM head run once over rows + chunk; the decode rows take packed decode's own GDN
+    step, per-row KV append and split-KV attention, and the chunk the prefill's. A prompt is
+    split into equal chunks of at most the budget, a prefix-cache checkpoint is reached with one
+    verify forward and snapshotted as the ordinary prefill does, and the last <= 32 tokens take
+    that forward too (`ingest_tail_rows` now takes up to 32 rows).
+  - **The trade, measured** (AIPerf, RTX 5090, ModelOpt NVFP4, budget 2048), off -> on:
+    - chat 1024/256 c32: 1,113 -> 948 tok/s, TTFT p50 1,240 -> 332 ms, ITL p50 21.4 -> 31.3 ms;
+    - chat c16: TTFT p50 299 ms at 714 tok/s;
+    - 8K prompts c4: 128 -> 118 tok/s, TTFT p50 1,528 -> 1,078 ms.
+
+    Decode no longer stalls behind a prompt's whole prefill, and arrivals stop coming in
+    synchronized waves. But one prompt per mixed pass does not amortize its weight reads the
+    way a packed prefill of many prompts does, so it is off by default.
+  - **Tested:** `mixed_step_check` (two decoding sessions plus a chunk, against `decode_packed` and
+    a separate prefill): the decode rows agree for every token at 254-, 1022- and 2046-token
+    chunks, and the chunk's continuation diverges only at late near-ties.
+
 - **A multi-turn chat speculates on every turn and reuses its cached prefix** (time to first
   token 487 -> 120 ms on ~7K-token conversations, Qwen3.8-27B with DSpark).
   - **Before:** a speculated prompt took no prefix-cache checkpoints, so the next turn of the
