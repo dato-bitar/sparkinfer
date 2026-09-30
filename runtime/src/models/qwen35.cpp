@@ -4632,6 +4632,18 @@ int Qwen35Model::prefill_batched_resume(const int* prompt_ids, int start, int en
     if (!prompt_ids || start <= 0 || end <= start) return -1;
     Impl& s = *p_;
     const int n = end - start;
+    // A resume of 8 tokens or fewer -- the stretch after a prompt's last prefix-cache checkpoint,
+    // which a chat prompt's final checkpoint (the start of its assistant turn) leaves at 1-7 tokens
+    // -- takes the verify path's one forward (ingest_tail_rows), as the tail of an aligned pass
+    // does, instead of a whole prefill pass of its own: that pass ran every layer's batched arms
+    // for a handful of rows and was ~70 ms of each chat request's prefill under load.
+    if (n <= 8 && !want_seed_logprob) {
+        const int seed = ingest_tail_rows(prompt_ids + start, n, start);
+        if (seed >= 0 && seed < s.cfg.vocab) {
+            if (out_done) *out_done = n;
+            return seed;
+        }
+    }
     const int window = prefill_window_tokens(s.kv);
     int done = 0;
     auto run = [&](int step) -> int {

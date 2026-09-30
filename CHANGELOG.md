@@ -30,6 +30,18 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Performance
 
+- **A chat prompt's last few tokens after its prefix-cache checkpoint take one forward** (chat c32
+  TTFT p50 1,527 -> 875 ms, 1,082 -> 1,111 tok/s on Qwen3.8-27B).
+  - **Before:** a chat prompt's final checkpoint sits at the start of its assistant turn, 1-7
+    tokens before the end -- under the in-pass split's 16-token segment minimum -- so its
+    prefill ran a pass per segment, and those last tokens got a whole prefill pass of their own:
+    169 ms per 1K-token chat prompt under load instead of ~96.
+  - **Now:** a resumed range of 8 tokens or fewer goes through the verify path's single forward
+    (`ingest_tail_rows`), as the tail of an aligned pass does.
+  - **Measured** (AIPerf chat 1024/256, RTX 5090, ModelOpt NVFP4): c32 per-prompt prefill p50
+    169 -> 99 ms; c1 unchanged (TTFT 103 ms). `prefix_resume_check`: a hit still reproduces the
+    uncached split exactly.
+
 - **A prompt's last 1-7 tokens take one forward instead of one decode step each** (a 1,076-token
   chat prompt prefills in 96 ms instead of 131, on Qwen3.8-27B).
   - **Before:** the NVFP4 prefill takes a multiple of 8 rows, so the aligned body ran as one
