@@ -7,6 +7,24 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Performance
 
+- **A chat request no longer pins 205 MB on its prefill's critical path** (1.19x chat
+  throughput at 16 concurrent requests; a lone 1K-token chat prompt's time to first token
+  208 -> 137 ms, on Qwen3.8-27B).
+  - **Before:** a prompt past the prefix-cache checkpoint minimum snapshots its recurrent state
+    (~205 MB) into pinned memory. Pinned buffers came back only when the cache evicted an entry,
+    and it keeps up to 32, so until then every chat request pinned a fresh buffer: 72-83 ms of a
+    204 ms prefill on an RTX 5090 box. Pinning ahead on another thread does not hide it -- the
+    driver stalls the other thread's CUDA calls for the duration.
+  - **Now:** a snapshot is filled in a pinned buffer from a small free list, then a background
+    thread moves it to reused pageable memory (a plain memcpy) and hands the pinned buffer back.
+    After the first snapshot of a process nothing pins on the request path. A cache hit restores
+    from pageable memory (~19 ms instead of ~8 ms). `SPARKINFER_SNAPSHOT_MIGRATE=0` keeps
+    snapshots pinned.
+  - **Measured** (AIPerf chat 1024/256, RTX 5090, ModelOpt NVFP4): c16 583 -> 696 tok/s, TTFT
+    p50 2.78 -> 2.04 s; one request at a time, prefill p50 204 -> 134 ms.
+    `prefix_resume_check` under `SPARKINFER_DETERMINISTIC=1`: a hit still reproduces the uncached
+    split exactly.
+
 - **Sampled requests decode speculatively** with DSpark (1.5x at T=0.7 and T=1.0 on Qwen3.8-27B).
   - **Before:** only greedy requests speculated, and a request that sets no temperature takes
     generation_config's T=1.0, so almost no chat traffic did.

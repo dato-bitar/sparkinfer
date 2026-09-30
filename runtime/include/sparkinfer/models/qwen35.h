@@ -575,8 +575,12 @@ public:
     // (fp32) then lin_conv_state (bf16) -- in pinned host memory, so a cached prefix costs host RAM
     // (~205 MB on Qwen3.8-27B) rather than VRAM. A model with no linear layers has nothing
     // recurrent to carry: its snapshot is empty and both calls succeed.
+    // A snapshot's bytes (qwen35.cpp): filled in pinned memory, where the device copy that fills
+    // it can run asynchronously, then moved to pageable memory off the request path so the pinned
+    // buffer serves the next snapshot. Read only through restore_recurrent_state.
+    struct SnapshotBuffer;
     struct RecurrentStateSnapshot {
-        std::shared_ptr<void> host;   // pinned; state_bytes of lin_state, then conv_bytes
+        std::shared_ptr<SnapshotBuffer> host;   // state_bytes of lin_state, then conv_bytes
         size_t state_bytes = 0;
         size_t conv_bytes = 0;
         size_t bytes() const { return state_bytes + conv_bytes; }
@@ -588,6 +592,8 @@ public:
     // Overwrite seq_id's recurrent state with `snap`, in the fp32 form prefill resumes from. False
     // when the session is unknown or the snapshot was taken from a differently shaped model.
     bool restore_recurrent_state(uint64_t seq_id, const RecurrentStateSnapshot& snap);
+    // A copy of a snapshot's bytes (state, then conv), for diagnostics. Empty if it has none.
+    static std::vector<char> snapshot_bytes(const RecurrentStateSnapshot& snap);
     // Prefill prompt tokens [start, end) of the active session in ONE batched pass that snapshots
     // the recurrent state at each of ckpts[0..n_ckpts) as it goes by (ascending, strictly inside the
     // range): snaps[i] is what snapshot_recurrent_state would have returned there. It replaces a

@@ -23,6 +23,8 @@
 #include <atomic>
 
 #include <mutex>
+#include <condition_variable>
+#include <deque>
 #include <thread>
 #include "sparkinfer/models/dflash_draft.h"
 #include "sparkinfer/models/dflash_kernels.h"
@@ -4544,55 +4546,166 @@ int Qwen35Model::prefill_batched_resume(const int* prompt_ids, int start, int en
     return seed;
 }
 
-// Pinned host buffers for recurrent-state snapshots, reused instead of allocated per snapshot.
-// cudaHostAlloc pins every page of a snapshot (~205 MB on Qwen3.8-27B) and cudaFreeHost unpins
-// them again, and a chat request past the checkpoint minimum takes one snapshot per checkpoint
-// while its prefill waits on it: under load that showed up as ~90 ms of prefill per request that
-// the same server without the prefix cache did not pay. A buffer comes back here when the last
-// snapshot holding it goes -- the cache evicting its entry, or a job retiring without offering
-// it -- and at most kSnapshotPoolMax wait unused. Never destroyed: a snapshot can outlive every
-// other static at exit. SPARKINFER_SNAPSHOT_POOL=0 allocates and frees per snapshot as before.
+// Host memory for recurrent-state snapshots (~205 MB each on Qwen3.8-27B).
+//
+// The device copy that fills a snapshot runs asynchronously -- in the middle of a checkpointed
+// prefill pass -- so the destination has to be pinned. Pinning is the expensive part: on an RTX
+// 5090 box cudaHostAlloc of 205 MB takes ~97 ms, and pinning on another thread does not hide it,
+// because the driver stalls every other CUDA call for the duration (a background
+// cudaHostAlloc/cudaHostRegister held a foreground kernel+sync up for 98/66 ms). A chat request
+// past the checkpoint minimum takes a snapshot while its prefill waits, and the prefix cache keeps
+// up to 32 of them, so returning buffers on eviction only helped once the cache was full: before
+// that every request pinned a fresh buffer on its critical path (72-83 ms of a 204 ms prefill for
+// a 1,076-token chat prompt).
+//
+// So a snapshot is filled in a pinned buffer from a small free list, and once the copy has landed
+// a background thread moves its bytes into pageable memory (plain memcpy, no CUDA call, so nothing
+// to stall) and hands the pinned buffer back. After the first request or two no request pins
+// anything. A restore from pageable memory costs ~19 ms instead of ~8 ms, on a cache hit only.
+// Pageable buffers are reused too: first-touching 205 MB costs as much as pinning it.
+// SPARKINFER_SNAPSHOT_MIGRATE=0 keeps every snapshot in its pinned buffer (the buffers still come
+// back to the free list when the snapshot goes); SPARKINFER_SNAPSHOT_POOL=0 also stops reusing
+// them. Nothing here is ever destroyed: a snapshot can outlive every other static at exit.
+struct Qwen35Model::SnapshotBuffer {
+    std::mutex mu;
+    void* data = nullptr;
+    size_t bytes = 0;
+    bool pinned = false;
+    ~SnapshotBuffer();
+};
+
 namespace {
 constexpr size_t kSnapshotPoolMax = 8;
 struct SnapshotPool {
     std::mutex mu;
     size_t bytes = 0;
-    std::vector<void*> free;
+    std::vector<void*> pinned, pageable;   // free buffers of `bytes` each
+    // The migration thread's queue.
+    std::condition_variable cv;
+    std::deque<std::shared_ptr<Qwen35Model::SnapshotBuffer>> todo;
+    bool worker_started = false;
 };
 SnapshotPool& snapshot_pool() {
     static SnapshotPool* p = new SnapshotPool;
     return *p;
 }
-std::shared_ptr<void> pinned_snapshot_buffer(size_t bytes) {
-    static const bool pooled = [] {
+bool snapshot_pool_on() {
+    static const bool v = [] {
         const char* e = getenv("SPARKINFER_SNAPSHOT_POOL");
         return !(e && e[0] == '0');
     }();
-    void* host = nullptr;
-    if (pooled) {
+    return v;
+}
+bool snapshot_migrate_on() {
+    static const bool v = [] {
+        const char* e = getenv("SPARKINFER_SNAPSHOT_MIGRATE");
+        return snapshot_pool_on() && !(e && e[0] == '0');
+    }();
+    return v;
+}
+// Called with p.mu held: a different model's snapshot size empties the free lists.
+void snapshot_pool_resize(SnapshotPool& p, size_t bytes) {
+    if (p.bytes == bytes) return;
+    for (void* f : p.pinned) cudaFreeHost(f);
+    for (void* f : p.pageable) free(f);
+    p.pinned.clear();
+    p.pageable.clear();
+    p.bytes = bytes;
+}
+void snapshot_release(void* data, size_t bytes, bool pinned) {
+    if (!data) return;
+    if (snapshot_pool_on()) {
         SnapshotPool& p = snapshot_pool();
         std::lock_guard<std::mutex> lock(p.mu);
-        if (p.bytes == bytes && !p.free.empty()) {
-            host = p.free.back();
-            p.free.pop_back();
+        std::vector<void*>& list = pinned ? p.pinned : p.pageable;
+        if (p.bytes == bytes && list.size() < kSnapshotPoolMax) {
+            list.push_back(data);
+            return;
         }
     }
-    if (!host && (cudaHostAlloc(&host, bytes, cudaHostAllocDefault) != cudaSuccess || !host))
-        return nullptr;
-    if (!pooled) return std::shared_ptr<void>(host, [](void* h) { cudaFreeHost(h); });
-    return std::shared_ptr<void>(host, [bytes](void* h) {
+    if (pinned) cudaFreeHost(data);
+    else free(data);
+}
+// A pinned buffer for a snapshot about to be filled by a device copy.
+std::shared_ptr<Qwen35Model::SnapshotBuffer> pinned_snapshot_buffer(size_t bytes) {
+    void* host = nullptr;
+    if (snapshot_pool_on()) {
         SnapshotPool& p = snapshot_pool();
         std::lock_guard<std::mutex> lock(p.mu);
-        if (p.bytes != bytes) {
-            for (void* f : p.free) cudaFreeHost(f);
-            p.free.clear();
-            p.bytes = bytes;
+        snapshot_pool_resize(p, bytes);
+        if (!p.pinned.empty()) {
+            host = p.pinned.back();
+            p.pinned.pop_back();
         }
-        if (p.free.size() < kSnapshotPoolMax) p.free.push_back(h);
-        else cudaFreeHost(h);
-    });
+    }
+    if (!host && (cudaHostAlloc(&host, bytes, cudaHostAllocPortable) != cudaSuccess || !host))
+        return nullptr;
+    auto b = std::make_shared<Qwen35Model::SnapshotBuffer>();
+    b->data = host;
+    b->bytes = bytes;
+    b->pinned = true;
+    return b;
+}
+void snapshot_migrate_worker() {
+    SnapshotPool& p = snapshot_pool();
+    for (;;) {
+        std::shared_ptr<Qwen35Model::SnapshotBuffer> b;
+        void* dst = nullptr;
+        {
+            std::unique_lock<std::mutex> lock(p.mu);
+            p.cv.wait(lock, [&] { return !p.todo.empty(); });
+            b = std::move(p.todo.front());
+            p.todo.pop_front();
+            if (p.bytes == b->bytes && !p.pageable.empty()) {
+                dst = p.pageable.back();
+                p.pageable.pop_back();
+            }
+        }
+        // The last holder may already be gone (the job failed, the cache refused it).
+        if (b.use_count() == 1) continue;
+        if (!dst) {
+            dst = malloc(b->bytes);
+            if (!dst) continue;
+        }
+        // Read without the buffer's lock: nothing writes a filled snapshot, and a concurrent
+        // restore only reads it too. Swap under the lock, so a restore never sees a buffer that
+        // is being handed back.
+        std::memcpy(dst, b->data, b->bytes);
+        void* old = nullptr;
+        {
+            std::lock_guard<std::mutex> g(b->mu);
+            old = b->data;
+            b->data = dst;
+            b->pinned = false;
+        }
+        snapshot_release(old, b->bytes, true);
+    }
+}
+// Called once a snapshot's device copy has landed.
+void snapshot_filled(const std::shared_ptr<Qwen35Model::SnapshotBuffer>& b) {
+    if (!b || !b->pinned || !snapshot_migrate_on()) return;
+    SnapshotPool& p = snapshot_pool();
+    std::lock_guard<std::mutex> lock(p.mu);
+    if (!p.worker_started) {
+        std::thread(snapshot_migrate_worker).detach();
+        p.worker_started = true;
+    }
+    p.todo.push_back(b);
+    p.cv.notify_one();
 }
 }  // namespace
+
+Qwen35Model::SnapshotBuffer::~SnapshotBuffer() { snapshot_release(data, bytes, pinned); }
+
+std::vector<char> Qwen35Model::snapshot_bytes(const RecurrentStateSnapshot& snap) {
+    std::vector<char> out;
+    if (!snap.host) return out;
+    std::lock_guard<std::mutex> g(snap.host->mu);
+    if (!snap.host->data) return out;
+    const char* d = static_cast<const char*>(snap.host->data);
+    out.assign(d, d + snap.host->bytes);
+    return out;
+}
 
 bool Qwen35Model::snapshot_recurrent_state(uint64_t seq_id, RecurrentStateSnapshot& out) {
     std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
@@ -4609,9 +4722,9 @@ bool Qwen35Model::snapshot_recurrent_state(uint64_t seq_id, RecurrentStateSnapsh
                             s.cfg.linear_head_dim * sizeof(float);
     const size_t cv_bytes = (size_t)s.cfg.n_layers * (s.cfg.linear_conv_kernel - 1) *
                             s.linear_qkvdim * sizeof(bf16);
-    std::shared_ptr<void> owned = pinned_snapshot_buffer(st_bytes + cv_bytes);
+    std::shared_ptr<SnapshotBuffer> owned = pinned_snapshot_buffer(st_bytes + cv_bytes);
     if (!owned) return false;
-    void* host = owned.get();
+    void* host = owned->data;
     // Prefill may still have work queued on any of the model's streams; the state is final only
     // once all of it has run.
     cudaDeviceSynchronize();
@@ -4620,6 +4733,7 @@ bool Qwen35Model::snapshot_recurrent_state(uint64_t seq_id, RecurrentStateSnapsh
     cu(cudaMemcpyAsync(static_cast<char*>(host) + st_bytes, b.lin_conv_state, cv_bytes,
                        cudaMemcpyDeviceToHost, s.stream), "prefix-cache conv snapshot");
     if (cudaStreamSynchronize(s.stream) != cudaSuccess) return false;
+    snapshot_filled(owned);
     out.host = std::move(owned);
     out.state_bytes = st_bytes;
     out.conv_bytes = cv_bytes;
@@ -4656,13 +4770,13 @@ int Qwen35Model::ingest_prompt_checkpointed(const int* ids, int start, int end, 
                             s.cfg.linear_head_dim * sizeof(float);
     const size_t cv_bytes = (size_t)s.cfg.n_layers * (s.cfg.linear_conv_kernel - 1) * s.linear_qkvdim *
                             sizeof(bf16);
-    std::vector<std::shared_ptr<void>> bufs((size_t)n_ckpts);
+    std::vector<std::shared_ptr<SnapshotBuffer>> bufs((size_t)n_ckpts);
     std::vector<void*> host((size_t)n_ckpts);
     std::vector<int> rows((size_t)n_ckpts);
     for (int i = 0; i < n_ckpts; ++i) {
         bufs[(size_t)i] = pinned_snapshot_buffer(st_bytes + cv_bytes);
         if (!bufs[(size_t)i]) return -1;
-        host[(size_t)i] = bufs[(size_t)i].get();
+        host[(size_t)i] = bufs[(size_t)i]->data;
         // The pass writes the GDN layers' windows; the attention layers' slots, which nothing
         // reads, are zero rather than whatever a reused buffer held.
         memset(static_cast<char*>(host[(size_t)i]) + st_bytes, 0, cv_bytes);
@@ -4682,6 +4796,7 @@ int Qwen35Model::ingest_prompt_checkpointed(const int* ids, int start, int end, 
     // A pass declines before its first kernel runs (see prefill_batched_resume), so nothing landed.
     if (seed < 0) return -1;
     for (int i = 0; i < n_ckpts; ++i) {
+        snapshot_filled(bufs[(size_t)i]);
         snaps[i].host = std::move(bufs[(size_t)i]);
         snaps[i].state_bytes = st_bytes;
         snaps[i].conv_bytes = cv_bytes;
@@ -4704,11 +4819,16 @@ bool Qwen35Model::restore_recurrent_state(uint64_t seq_id, const RecurrentStateS
     if (!snap.host || snap.state_bytes != st_bytes || snap.conv_bytes != cv_bytes ||
         !b.lin_state || !b.lin_conv_state)
         return false;
-    cu(cudaMemcpyAsync(b.lin_state, snap.host.get(), st_bytes, cudaMemcpyHostToDevice, s.stream),
-       "prefix-cache state restore");
-    cu(cudaMemcpyAsync(b.lin_conv_state, static_cast<char*>(snap.host.get()) + st_bytes, cv_bytes,
-                       cudaMemcpyHostToDevice, s.stream), "prefix-cache conv restore");
-    if (cudaStreamSynchronize(s.stream) != cudaSuccess) return false;
+    {
+        // Held until the copies have run: the snapshot may be moving to pageable memory, and its
+        // pinned buffer is handed back only under this lock.
+        std::lock_guard<std::mutex> g(snap.host->mu);
+        cu(cudaMemcpyAsync(b.lin_state, snap.host->data, st_bytes, cudaMemcpyHostToDevice, s.stream),
+           "prefix-cache state restore");
+        cu(cudaMemcpyAsync(b.lin_conv_state, static_cast<char*>(snap.host->data) + st_bytes, cv_bytes,
+                           cudaMemcpyHostToDevice, s.stream), "prefix-cache conv restore");
+        if (cudaStreamSynchronize(s.stream) != cudaSuccess) return false;
+    }
     // The snapshot is the fp32 form a prefill writes, whatever this session's buffer held before.
     b.lin_state_b16 = false;
     if (s.active_seq_id == seq_id) s.active_lin_state_b16 = false;

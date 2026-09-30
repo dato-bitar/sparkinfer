@@ -259,15 +259,17 @@ int main(int argc, char** argv) {
         kv.release_blocks(sharedx);
         // The two snapshots of the same prefix: a pass over [0, c) against a segment of a pass over [0, P).
         double dmax = 0, ref = 0, cmax = 0;
-        if (snap.bytes() == snapx.bytes() && snap.host && snapx.host) {
-            const float* a = static_cast<const float*>(snap.host.get());
-            const float* b = static_cast<const float*>(snapx.host.get());
+        const std::vector<char> sa = sparkinfer::Qwen35Model::snapshot_bytes(snap);
+        const std::vector<char> sb = sparkinfer::Qwen35Model::snapshot_bytes(snapx);
+        if (snap.bytes() == snapx.bytes() && !sa.empty() && sa.size() == sb.size()) {
+            const float* a = reinterpret_cast<const float*>(sa.data());
+            const float* b = reinterpret_cast<const float*>(sb.data());
             for (size_t i = 0; i < snap.state_bytes / sizeof(float); i++) {
                 dmax = std::max(dmax, (double)std::fabs(a[i] - b[i]));
                 ref = std::max(ref, (double)std::fabs(a[i]));
             }
-            const uint16_t* ca = reinterpret_cast<const uint16_t*>(static_cast<const char*>(snap.host.get()) + snap.state_bytes);
-            const uint16_t* cb = reinterpret_cast<const uint16_t*>(static_cast<const char*>(snapx.host.get()) + snap.state_bytes);
+            const uint16_t* ca = reinterpret_cast<const uint16_t*>(sa.data() + snap.state_bytes);
+            const uint16_t* cb = reinterpret_cast<const uint16_t*>(sb.data() + snap.state_bytes);
             auto f = [](uint16_t h) { uint32_t u = (uint32_t)h << 16; float v; __builtin_memcpy(&v, &u, 4); return v; };
             for (size_t i = 0; i < snap.conv_bytes / 2; i++) cmax = std::max(cmax, (double)std::fabs(f(ca[i]) - f(cb[i])));
         }
