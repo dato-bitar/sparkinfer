@@ -418,6 +418,19 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         }
         if (rows != n) return -1;
     }
+    // A mixed step: mix_n packed decode rows ahead of the chunk (Qwen35PrefillCtx::mix_n). The
+    // decode rows' kernels are packed decode's Qwen3.8 ones, so refuse anything else here, before
+    // the first kernel runs.
+    const int R = s.mix_n;
+    if (R < 0) return -1;
+    if (R > 0) {
+        if (multi || moe || c.muse_glimmer || !s.kv->int8_kv() || s.kv->windowed() ||
+            s.capture_dst || s.vision_emb || s.mrope_pos || s.packed_rows || s.ckpt_n > 0 ||
+            R >= n || !s.mix_rows || !s.mix_btab || !s.mix_pos || !s.mix_seq ||
+            !s.mix_lin_state || !s.mix_lin_conv || s.mix_splits < 1 || !s.mix_fa ||
+            !s.mix_q81 || !s.mix_logits || !s.mix_d_out || !s.mix_out || s.w.lm_head_type != 12)
+            return -1;
+    }
 
     const int H = c.hidden;
     const int N = n;
@@ -650,7 +663,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // A pass that takes prefix-cache checkpoints copies state out mid-pass, into buffers that are
     // the request's own: it runs eager too.
     const bool graph_on = graph_env && arena_reuse && c.dense_ffn && !capture_dflash && pos0 == 0 &&
-                          !multi && s.ckpt_n == 0;
+                          !multi && s.ckpt_n == 0 && R == 0;
     const void* const pfb_btable = s.kv->block_table(s.seq_id);
     // A whole-prefill graph embeds every pointer passed to its kernel nodes. The arena addresses
     // are deliberately stable, but recurrent state and the paged-KV block table are session-owned:
@@ -2391,6 +2404,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         (s.mrope_pos && c.mrope()) ? s.mrope_pos + (size_t)3 * pos0 : nullptr;
     const float attn_scale = 1.f / sqrtf((float)c.head_dim);
 
+    // The decode rows' block tables, gathered into one [R, mbs] array the per-row attention reads.
+    if (R > 0) dflash_kernels::launch_gather_rows_i32(s.mix_rows, s.mix_btab, mbs, R, st);
     // embed -> x, prime xn = RMSNorm(x, layer0.input_norm)
     if (s.bonsai_embed_native) {
         // Ternary table: decode the row, then take off the rotation it was stored in.
@@ -2584,6 +2599,19 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     proj(xn, w.ssm_beta,  w.ssm_beta_type,  lb, vh,    H);
                 }
             }
+            if (R > 0) {
+                // The decode rows: packed decode's GDN step, each row against its own conv window
+                // and recurrent state (in place), on rows [0, R) of the pass's buffers.
+                const size_t conv_off = (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
+                const size_t state_off =
+                    (size_t)gdn_state_slot(c, L) * vh * c.linear_head_dim * c.linear_head_dim;
+                kernels::launch_qwen36_conv_split_l2norm_fused_batched(
+                    b8, w.ssm_conv, s.mix_lin_conv, conv_off, gq, gk, gv, R, c.linear_q_heads, vh,
+                    c.linear_head_dim, c.linear_conv_kernel, c.rms_eps, st);
+                kernels::launch_qwen36_gdn_ar_batched(
+                    gq, gk, gv, la, lb, w.ssm_dt, w.ssm_a, s.mix_lin_state, state_off, att, R,
+                    c.linear_q_heads, vh, c.linear_head_dim, c.gdn_qh_block, st, s.mix_state_b16);
+            }
             if (multi) {
                 // Each prompt's conv window and recurrence are its own: run both on its slice of the
                 // rows against its session's state -- the same two calls a lone prompt of that
@@ -2717,14 +2745,18 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     pf_cu(cudaMemcpyAsync(cprev, conv_state,
                                           (size_t)(c.linear_conv_kernel - 1) * lqkv * sizeof(bf16),
                                           cudaMemcpyDeviceToDevice, st), "gdn conv carry-in");
-                kernels::launch_prefill_gdn_conv(b8, w.ssm_conv, conv_state, gq, gk, gv,
-                    N, c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel, eps, st, cconv);
+                // The chunk is rows [R, N) (R = 0 unless this is a mixed step).
+                const size_t lqr = (size_t)R * s.linear_qdim;
+                kernels::launch_prefill_gdn_conv(b8 + (size_t)R * lqkv, w.ssm_conv, conv_state,
+                    gq + lqr, gk + lqr, gv + (size_t)R * lvdim,
+                    N - R, c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel, eps, st, cconv);
                 float* layer_state = s.lin_state + (size_t)gdn_state_slot(c, L) * vh * c.linear_head_dim * c.linear_head_dim;
                 // A pass that does not start at position 0 continues the recurrence already in `state`
                 // (the state reset above runs only for pos0 == 0); the scan must load it, not zero it.
-                kernels::launch_prefill_gdn_scan(gq, gk, gv, la, lb, w.ssm_dt, w.ssm_a,
-                    layer_state, att, N, c.linear_q_heads, vh, c.linear_head_dim,
-                    c.gdn_qh_block, st, /*carry_in=*/pos0 != 0);
+                kernels::launch_prefill_gdn_scan(gq + lqr, gk + lqr, gv + (size_t)R * lvdim,
+                    la + (size_t)R * vh, lb + (size_t)R * vh, w.ssm_dt, w.ssm_a,
+                    layer_state, att + (size_t)R * lvdim, N - R, c.linear_q_heads, vh,
+                    c.linear_head_dim, c.gdn_qh_block, st, /*carry_in=*/pos0 != 0);
             }
             if (z_pending) pf_cu(cudaStreamWaitEvent(st, gdn_ev[3], 0), "gdn z join");
             // Qwen3.8's out_proj is a checkpoint FP8 weight, and proj_fp8_native reads the gated
@@ -3109,10 +3141,25 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     // A packed pass writes and attends one prompt at a time: its own block table,
                     // its own positions from zero, attending only to itself. Its q/k/v rows are
                     // already contiguous, so the per-prompt calls just take the slice.
+                    if (R > 0) {
+                        // The decode rows: packed decode's per-row QK-norm/RoPE/KV append (it
+                        // re-splits [q|gate] from the raw projection into qb/qg), then split-KV
+                        // decode attention over each row's own table.
+                        kernels::launch_qknorm_rope_kv_partial_int8_gated(
+                            b8, qb, qg, kf, vf, w.q_norm, w.k_norm, kpool, vpool, kscale, vscale,
+                            s.mix_btab, s.mix_pos, R, c.n_q_heads, c.n_kv_heads, c.head_dim,
+                            rope_dim, rope_theta, eps, bs, mbs, st);
+                        const size_t fa_n = (size_t)R * c.n_q_heads * s.mix_splits;
+                        kernels::launch_flash_decode_split(
+                            qb, kpool, vpool, s.mix_btab, s.mix_seq, att,
+                            s.mix_fa, s.mix_fa + fa_n, s.mix_fa + 2 * fa_n,
+                            R, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, s.mix_splits,
+                            attn_scale, st, nullptr, s.mix_seq_hint, kscale, vscale, 1, nullptr);
+                    }
                     const int segs = multi ? nseg : 1;
                     for (int i = 0; i < segs; ++i) {
-                        const size_t o = multi ? (size_t)s.multi_off[i] : 0;
-                        const int len = multi ? s.multi_len[i] : N;
+                        const size_t o = multi ? (size_t)s.multi_off[i] : (size_t)R;
+                        const int len = multi ? s.multi_len[i] : N - R;
                         const int* bt = multi ? (w.swa ? s.kv->block_table_win(s.multi_seq_ids[i])
                                                        : s.kv->block_table(s.multi_seq_ids[i]))
                                               : ltab;
@@ -4615,6 +4662,25 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     if (moe_hide_sg)
         cudaEventDestroy(moe_ev_sg);
 
+    // A mixed step's decode rows: their logits off the final-normed rows [0, R), with packed
+    // decode's Q4_K head -- one read of the head for all of them -- and their argmax, read back
+    // with the seed below.
+    if (R > 0) {
+        kernels::launch_quantize_q8_1_rows(xn, s.mix_q81, H, R, H, st);
+        if (!kernels::launch_mmvq_q4k_mma_head_f32(s.mix_q81, s.w.lm_head, s.mix_logits, R, c.vocab,
+                                                   H, st) &&
+            !kernels::launch_mmvq_rows_f32(s.w.lm_head_type, s.mix_q81, s.w.lm_head, s.mix_logits,
+                                           R, c.vocab, H, st)) {
+            const size_t q81_row = kernels::llama_q8_1_bytes(H);
+            for (int r = 0; r < R; ++r)
+                kernels::launch_mmvq_q4k_f32(static_cast<const unsigned char*>(s.mix_q81) + r * q81_row,
+                                             s.w.lm_head, s.mix_logits + (size_t)r * c.vocab,
+                                             c.vocab, H, st);
+        }
+        kernels::launch_argmax(s.mix_logits, s.mix_d_out, R, c.vocab, st);
+        pf_cu(cudaMemcpyAsync(s.mix_out, s.mix_d_out, (size_t)R * sizeof(int),
+                              cudaMemcpyDeviceToHost, st), "mixed rows argmax");
+    }
     // Seed for the first decode step: argmax at the last prompt position (xn already = final norm).
     // A packed pass has one per prompt, each read back as it is produced (it never captures).
     for (int si = 0; si < (multi ? nseg : 1); ++si) {

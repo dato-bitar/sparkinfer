@@ -655,6 +655,17 @@ public:
     // Every sequence must have an open session and live KV. n is capped by the packed graph tiers.
     bool decode_packed(const int* tokens, const int* positions, const uint64_t* seq_ids, int n,
                        int* out_sampled, const PackedSampling* sampling = nullptr);
+    // MIXED STEP: ONE forward that decodes n_dec packed rows (what decode_packed does for them) and
+    // prefills the next `len` tokens of chunk_seq's prompt at positions pos0.. (what a prefill
+    // pass or resume does for them), every row-wise weight read shared (Qwen35PrefillCtx::mix_n).
+    // out_sampled gets the decode rows' tokens, sampled as decode_packed samples them;
+    // *chunk_seed the argmax at the chunk's last position (the prompt's first token when this is
+    // its last chunk). Returns false having run nothing when the model or batch cannot take it
+    // (Qwen3.8 dense hybrid, int8 KV, no vision/MRoPE/DSpark capture, a chunk session with fp32
+    // state and no logit bias); the caller then runs the decode step and the prefill apart.
+    bool mixed_step(const int* tokens, const int* positions, const uint64_t* seq_ids, int n_dec,
+                    int* out_sampled, const PackedSampling* sampling, uint64_t chunk_seq,
+                    const int* chunk_ids, int pos0, int len, int* chunk_seed);
     // Largest n decode_packed() accepts. Matches the packed graph tiers.
     static int max_packed_rows();
     uint64_t active_session() const;

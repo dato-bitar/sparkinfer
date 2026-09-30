@@ -220,6 +220,31 @@ struct Qwen35PrefillCtx {
     // it otherwise, so a caller that can free something (the Bonsai decode shadow, see #1154's
     // rejection) can tell "worth retrying" from "give up now". Null is fine; nothing is recorded.
     bool*                scratch_oom_out  = nullptr;
+
+    // MIXED STEP (Qwen35Model::mixed_step). mix_n > 0 puts mix_n packed DECODE rows at rows
+    // [0, mix_n) of prefill_batched_run's pass, ahead of the prompt chunk it was called for, which
+    // then occupies rows [mix_n, n) at positions pos0.. of seq_id. Everything row-wise -- the
+    // norms, the projections, the FFN -- runs once over all n rows, so the decode rows ride the
+    // chunk's weight reads. What belongs to a sequence runs apart: the decode rows take packed
+    // decode's kernels (the batched GDN step on their own conv windows and states, the per-row
+    // QK-norm/RoPE/KV append, split-KV decode attention over their own block tables), the chunk
+    // takes the prefill's. Qwen3.8 (dense hybrid, int8 KV, no windowed slices) only; a pass that
+    // cannot take it declines before its first kernel.
+    int                  mix_n            = 0;
+    const int* const*    mix_rows         = nullptr;   // [mix_n] device: block-table pointers
+    int*                 mix_btab         = nullptr;   // [mix_n, max_blocks] device scratch
+    const int*           mix_pos          = nullptr;   // [mix_n] device: each row's position
+    const int*           mix_seq          = nullptr;   // [mix_n] device: each row's length (pos+1)
+    int                  mix_seq_hint     = 0;         // host: the longest row's length
+    float* const*        mix_lin_state    = nullptr;   // [mix_n] device: GDN state bases
+    void* const*         mix_lin_conv     = nullptr;   // [mix_n] device: GDN conv-window bases
+    bool                 mix_state_b16    = false;     // the rows' state is the compacted bf16 form
+    int                  mix_splits       = 0;         // split-KV count for the decode attention
+    float*               mix_fa           = nullptr;   // split scratch: m, l [mix_n*q_heads*splits], acc [.. *head_dim]
+    void*                mix_q81          = nullptr;   // [mix_n] Q8_1 rows for the LM head
+    float*               mix_logits       = nullptr;   // [mix_n, vocab] fp32: the decode rows' logits
+    int*                 mix_d_out        = nullptr;   // [mix_n] device argmax
+    int*                 mix_out          = nullptr;   // [mix_n] host argmax, filled when the pass returns
 };
 
 // Fill the paged KV cache + Gated-DeltaNet state for positions 0..n-1 in one batched pass.

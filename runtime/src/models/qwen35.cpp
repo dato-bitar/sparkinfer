@@ -609,6 +609,18 @@ struct Qwen35Model::Impl {
         int out[kQwen35MaxPackedRows];
     };
     PackedSampleRows* packed_samp_host = nullptr;
+    // mixed_step's scratch, allocated on first use for kQwen35MaxPackedRows decode rows: the
+    // gathered block tables, device positions/lengths, the split-KV attention partials, the Q8_1
+    // rows and logits of the LM head, and the argmax (device + pinned host).
+    int* mix_btab = nullptr;
+    int* mix_pos_d = nullptr;
+    int* mix_seq_d = nullptr;
+    int* mix_host = nullptr;          // pinned: pos [32], seq [32], out [32]
+    float* mix_fa = nullptr;
+    void* mix_q81 = nullptr;
+    float* mix_logits = nullptr;
+    int* mix_d_out = nullptr;
+    int mix_btab_mbs = 0;
     PackedSampleRows* packed_samp_dev = nullptr;
     // A sampled request's sampler while dflash_generate speculates it (see SpecHooks): each verify
     // row i draws its token at sampler step step0 + i instead of taking the argmax.
@@ -1265,6 +1277,14 @@ Qwen35Model::~Qwen35Model() {
     if (p_->packed_dev_tables_win) cudaFree(p_->packed_dev_tables_win);
     if (p_->packed_host_tables_win) cudaFreeHost(p_->packed_host_tables_win);
     if (p_->packed_samp_host) cudaFreeHost(p_->packed_samp_host);
+    if (p_->mix_btab) cudaFree(p_->mix_btab);
+    if (p_->mix_pos_d) cudaFree(p_->mix_pos_d);
+    if (p_->mix_seq_d) cudaFree(p_->mix_seq_d);
+    if (p_->mix_host) cudaFreeHost(p_->mix_host);
+    if (p_->mix_fa) cudaFree(p_->mix_fa);
+    if (p_->mix_q81) cudaFree(p_->mix_q81);
+    if (p_->mix_logits) cudaFree(p_->mix_logits);
+    if (p_->mix_d_out) cudaFree(p_->mix_d_out);
     if (p_->packed_samp_dev) cudaFree(p_->packed_samp_dev);
     for (auto& kv : p_->parked_graphs) {
         if (kv.second.exec) cudaGraphExecDestroy(kv.second.exec);
@@ -5154,15 +5174,12 @@ static bool sample_rows_packed(Impl& s, float* logits, int n) {
     return true;
 }
 
-bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
-                                const uint64_t* seq_ids, int n, int* out_sampled,
-                                const PackedSampling* sampling) {
-    Impl& s = *p_;
-    if (!tokens || !positions || !seq_ids || !out_sampled) return false;
-    if (n < 1 || n > kQwen35MaxPackedRows) return false;
-    if (!s.cfg.hybrid || !s.gguf) return false;
-    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
-
+// decode_packed's and mixed_step's per-row setup: each row's session buffers into the pinned
+// staging and, when the row set moved, onto the device (packed_dev_*); every row's recurrent
+// state compacted to bf16 once (see decode_packed). False -- having launched nothing that
+// changes a row's arithmetic -- when a row cannot be packed.
+template <class Impl>
+static bool packed_rows_prepare(Impl& s, const uint64_t* seq_ids, int n, bool* state_b16_out) {
     // Resolve each row's per-session buffers. A row whose session is missing (or never got its
     // hybrid state) cannot be packed -- decline the whole batch rather than silently decode it
     // against another request's state.
@@ -5187,15 +5204,6 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
         if (cudaHostAlloc(&s.packed_host_seqs, np * sizeof(uint64_t), cudaHostAllocDefault)
             != cudaSuccess) return false;
     }
-    // Only a temperature above 0 can move a row off the argmax: top_k/top_p always keep rank 0,
-    // so a truncating row at temperature 0 is still its argmax (forward_token behaves the same).
-    bool any_sampled = false;
-    if (sampling) {
-        if (!sampling->temperature || !sampling->seed || !sampling->step || !sampling->top_k ||
-            !sampling->top_p) return false;
-        for (int i = 0; i < n && !any_sampled; i++) any_sampled = sampling->temperature[i] > 0.f;
-    }
-    if (any_sampled && !ensure_packed_samp(s)) return false;
     float** h_states = static_cast<float**>(s.packed_host_states);
     void**  h_convs  = static_cast<void**>(s.packed_host_convs);
     const int** h_tables = static_cast<const int**>(s.packed_host_tables);
@@ -5252,7 +5260,8 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
         const char* e = getenv("SPARKINFER_CB_GDN_STATE_B16");
         return !(e && e[0] == '0');
     }();
-    bool packed_state_b16 = false;
+    bool& packed_state_b16 = *state_b16_out;
+    packed_state_b16 = false;
     if (kGdnStateB16 && needs_linear_state(s.cfg)) {
         const size_t st_n = (size_t)gdn_state_slots(s.cfg) * s.cfg.linear_v_heads *
                             s.cfg.linear_head_dim * s.cfg.linear_head_dim;
@@ -5290,6 +5299,32 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
             if (sit != s.sessions.end() && sit->second.lin_state_b16) return false;
         }
     }
+
+    return true;
+}
+
+bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
+                                const uint64_t* seq_ids, int n, int* out_sampled,
+                                const PackedSampling* sampling) {
+    Impl& s = *p_;
+    if (!tokens || !positions || !seq_ids || !out_sampled) return false;
+    if (n < 1 || n > kQwen35MaxPackedRows) return false;
+    if (!s.cfg.hybrid || !s.gguf) return false;
+    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+
+    // Only a temperature above 0 can move a row off the argmax: top_k/top_p always keep rank 0,
+    // so a truncating row at temperature 0 is still its argmax (forward_token behaves the same).
+    bool any_sampled = false;
+    if (sampling) {
+        if (!sampling->temperature || !sampling->seed || !sampling->step || !sampling->top_k ||
+            !sampling->top_p) return false;
+        for (int i = 0; i < n && !any_sampled; i++) any_sampled = sampling->temperature[i] > 0.f;
+    }
+    if (any_sampled && !ensure_packed_samp(s)) return false;
+    bool packed_state_b16 = false;
+    if (!packed_rows_prepare(s, seq_ids, n, &packed_state_b16)) return false;
+    float** h_states = static_cast<float**>(s.packed_host_states);
+    void**  h_convs  = static_cast<void**>(s.packed_host_convs);
 
     Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.stream_k, s.stream_v, seq_ids[0],
                           h_states[0], h_convs[0], s.logits, s.d_out_id, s.h_out_id, s.gguf,
@@ -5339,6 +5374,161 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
         }
         sample_rows_packed(s, packed_logits, n);
         for (int i = 0; i < n; i++)
+            if (h->temp[i] > 0.f) out_sampled[i] = h->out[i];
+    }
+    return true;
+}
+
+bool Qwen35Model::mixed_step(const int* tokens, const int* positions, const uint64_t* seq_ids,
+                             int n_dec, int* out_sampled, const PackedSampling* sampling,
+                             uint64_t chunk_seq, const int* chunk_ids, int pos0, int len,
+                             int* chunk_seed) {
+    Impl& s = *p_;
+    if (!tokens || !positions || !seq_ids || !out_sampled || !chunk_ids || !chunk_seed) return false;
+    if (n_dec < 1 || n_dec > kQwen35MaxPackedRows || len < 1 || pos0 < 0) return false;
+    if (!s.cfg.hybrid || !s.gguf || !s.cfg.dense_ffn || s.cfg.muse_glimmer || s.w.lm_head_type != 12)
+        return false;
+    if (!s.kv->int8_kv() || s.kv->windowed() || s.d_vision_emb || s.d_mrope_pos || s.dflash_capture)
+        return false;
+    for (int i = 0; i < n_dec; ++i)
+        if (seq_ids[i] == chunk_seq || seq_ids[i] == 0) return false;
+    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+    // The chunk's session: its own fp32 recurrent state (a prompt being prefilled was never
+    // compacted), no logit bias (the seed below is the raw argmax, as a pass's own is).
+    {
+        auto cit = s.sessions.find(chunk_seq);
+        if (chunk_seq == 0 || cit == s.sessions.end() || !cit->second.lin_state ||
+            !cit->second.lin_conv_state || cit->second.lin_state_b16 || cit->second.logit_bias_set)
+            return false;
+    }
+    bool any_sampled = false;
+    if (sampling) {
+        if (!sampling->temperature || !sampling->seed || !sampling->step || !sampling->top_k ||
+            !sampling->top_p) return false;
+        for (int i = 0; i < n_dec && !any_sampled; i++) any_sampled = sampling->temperature[i] > 0.f;
+    }
+    if (any_sampled && !ensure_packed_samp(s)) return false;
+
+    // Scratch, once (the tables grow with the pool's max blocks per sequence).
+    constexpr int kRows = kQwen35MaxPackedRows;
+    constexpr int kMixSplitsMax = 32;
+    const int mbs = s.kv->max_blocks_per_seq();
+    if (!s.mix_btab || s.mix_btab_mbs < mbs) {
+        if (s.mix_btab) cudaFree(s.mix_btab);
+        s.mix_btab = nullptr;
+        s.mix_btab_mbs = 0;
+        if (cudaMalloc(&s.mix_btab, (size_t)kRows * mbs * sizeof(int)) != cudaSuccess) {
+            s.mix_btab = nullptr;
+            return false;
+        }
+        s.mix_btab_mbs = mbs;
+    }
+    if (!s.mix_pos_d) {
+        const size_t fa_n = (size_t)kRows * s.cfg.n_q_heads * kMixSplitsMax;
+        bool ok = cudaMalloc(&s.mix_pos_d, kRows * sizeof(int)) == cudaSuccess &&
+                  cudaMalloc(&s.mix_seq_d, kRows * sizeof(int)) == cudaSuccess &&
+                  cudaMalloc(&s.mix_d_out, kRows * sizeof(int)) == cudaSuccess &&
+                  cudaMalloc(&s.mix_fa, fa_n * (2 + s.cfg.head_dim) * sizeof(float)) == cudaSuccess &&
+                  cudaMalloc(&s.mix_q81, kRows * kernels::llama_q8_1_bytes(s.cfg.hidden)) == cudaSuccess &&
+                  cudaMalloc(&s.mix_logits, (size_t)kRows * s.cfg.vocab * sizeof(float)) == cudaSuccess &&
+                  cudaHostAlloc(&s.mix_host, 3 * kRows * sizeof(int), cudaHostAllocDefault) == cudaSuccess;
+        if (!ok) {
+            for (void* p : {(void*)s.mix_pos_d, (void*)s.mix_seq_d, (void*)s.mix_d_out, (void*)s.mix_fa,
+                            s.mix_q81, (void*)s.mix_logits})
+                if (p) cudaFree(p);
+            if (s.mix_host) cudaFreeHost(s.mix_host);
+            s.mix_pos_d = s.mix_seq_d = s.mix_d_out = nullptr;
+            s.mix_fa = nullptr; s.mix_q81 = nullptr; s.mix_logits = nullptr; s.mix_host = nullptr;
+            return false;
+        }
+    }
+
+    // The decode rows, exactly as decode_packed resolves them.
+    bool state_b16 = false;
+    if (!packed_rows_prepare(s, seq_ids, n_dec, &state_b16)) return false;
+    int* h_pos = s.mix_host;
+    int* h_seq = s.mix_host + kRows;
+    int* h_out = s.mix_host + 2 * kRows;
+    int hint = 0;
+    for (int i = 0; i < n_dec; ++i) {
+        h_pos[i] = positions[i];
+        h_seq[i] = positions[i] + 1;
+        hint = std::max(hint, h_seq[i]);
+    }
+    cu(cudaMemcpyAsync(s.mix_pos_d, h_pos, n_dec * sizeof(int), cudaMemcpyHostToDevice, s.stream),
+       "mixed positions");
+    cu(cudaMemcpyAsync(s.mix_seq_d, h_seq, n_dec * sizeof(int), cudaMemcpyHostToDevice, s.stream),
+       "mixed lengths");
+    // Packed decode's split count for its wide steps, capped at what the scratch holds.
+    const int splits = std::max(1, std::min(n_dec >= 24 ? 16 : s.n_splits, kMixSplitsMax));
+
+    // The chunk's session is the pass's own, as it is for any prefill.
+    activate_session(chunk_seq);
+    // Same rule as prefill_batched: a pass this long needs the arena more than wide decode needs
+    // the NVFP4 head (the decode rows here read the Q4_K head).
+    static const int kHeadFp4YieldTokens = [] {
+        const char* e = getenv("SPARKINFER_Q38_HEAD_NVFP4_YIELD_TOKENS");
+        const int v = e ? atoi(e) : 1024;
+        return v < 1 ? 1 : v;
+    }();
+    if (n_dec + len >= kHeadFp4YieldTokens && (s.lm_head_fp4_payload || s.lm_head_fp4_sf_buf))
+        release_lm_head_fp4();
+    auto it = s.sessions.find(chunk_seq);
+    std::vector<int> ids((size_t)n_dec + len);
+    std::copy(tokens, tokens + n_dec, ids.begin());
+    std::copy(chunk_ids, chunk_ids + len, ids.begin() + n_dec);
+    Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.stream_k, s.stream_v, chunk_seq,
+                          it->second.lin_state, it->second.lin_conv_state,
+                          s.logits, s.d_out_id, s.h_out_id, s.gguf,
+                          s.emb_norm_ones,
+                          s.bonsai_embed_native,
+                          s.bonsai_sign_dev.count(s.cfg.hidden)
+                              ? s.bonsai_sign_dev.at(s.cfg.hidden) : nullptr,
+                          s.bonsai_sign_ffn,
+                          (int)s.bonsai_block,
+                          s.bonsai_rot,
+                          s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
+                          s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
+                          nullptr, 0, nullptr, 0,
+                          nullptr, nullptr, 0,
+                          nullptr };
+    ctx.mix_n = n_dec;
+    ctx.mix_rows = reinterpret_cast<const int* const*>(s.packed_dev_tables);
+    ctx.mix_btab = s.mix_btab;
+    ctx.mix_pos = s.mix_pos_d;
+    ctx.mix_seq = s.mix_seq_d;
+    ctx.mix_seq_hint = hint;
+    ctx.mix_lin_state = reinterpret_cast<float* const*>(s.packed_dev_states);
+    ctx.mix_lin_conv = reinterpret_cast<void* const*>(s.packed_dev_convs);
+    ctx.mix_state_b16 = state_b16;
+    ctx.mix_splits = splits;
+    ctx.mix_fa = s.mix_fa;
+    ctx.mix_q81 = s.mix_q81;
+    ctx.mix_logits = s.mix_logits;
+    ctx.mix_d_out = s.mix_d_out;
+    ctx.mix_out = h_out;
+    bool scratch_oom = false;
+    ctx.scratch_oom_out = &scratch_oom;
+    const int seed = prefill_batched_run(ctx, ids.data(), n_dec + len, pos0);
+    // A pass that declines does so before its first kernel: nothing moved, the caller runs the
+    // two steps apart.
+    if (seed < 0 || seed >= s.cfg.vocab) return false;
+    *chunk_seed = seed;
+    // Batched prefill writes the chunk session's state as fp32; the decode rows keep theirs.
+    it->second.lin_state_b16 = false;
+    s.active_lin_state_b16 = false;
+    for (int i = 0; i < n_dec; ++i) out_sampled[i] = h_out[i];
+    if (any_sampled) {
+        Impl::PackedSampleRows* h = s.packed_samp_host;
+        for (int i = 0; i < n_dec; i++) {
+            h->temp[i] = sampling->temperature[i];
+            h->seed[i] = sampling->seed[i];
+            h->step[i] = sampling->step[i];
+            h->top_k[i] = sampling->top_k[i];
+            h->top_p[i] = sampling->top_p[i];
+        }
+        sample_rows_packed(s, s.mix_logits, n_dec);
+        for (int i = 0; i < n_dec; i++)
             if (h->temp[i] > 0.f) out_sampled[i] = h->out[i];
     }
     return true;
