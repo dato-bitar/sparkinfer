@@ -5794,7 +5794,9 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     if (!s.dflash_draft || prompt.empty() || max_new <= 0) return out;
     DFlashDraftModel& draft = *s.dflash_draft;
     const DFlashDraftConfig& dc = draft.config();
-    const int B = dc.block_size;
+    // The most proposals a block carries: DFlash2 reads them from rows 1..block_size-1 (row 0 is
+    // the anchor), DSpark's row-shifted mapping from all block_size rows.
+    const int B = dc.dflash2 ? dc.block_size - 1 : dc.block_size;
     const int mask_id = dc.mask_token_id;
 
     // The sequence length below which this path keeps the original short-context behaviour: the

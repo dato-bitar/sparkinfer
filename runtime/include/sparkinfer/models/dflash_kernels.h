@@ -235,5 +235,22 @@ void launch_confidence_head_rows(const void* hidden, int hidden_stride,
                                  const void* w, float bias, int H, int rank,
                                  int row0, int rows, float* out_confidence, cudaStream_t stream);
 
+// DFlash2's grouped dynamic causal conv over the block rows (z-lab GroupedDynamicCausalConv):
+// out[t,c] = sum_tap (base_side[tap][c] + dyn[t][side][tap][c / group]) * x[t - tap][c], with
+// x before the block's first row taken as 0. base_side = base_kernel[side] ([taps][H]); dyn rows
+// are the kernel projection's output, dyn_stride elements apart. x and out must not alias.
+void launch_grouped_conv(const void* x, const void* base_side, const void* dyn, int side, void* out,
+                         int rows, int H, int taps, int group, int dyn_stride, cudaStream_t stream);
+// DFlash2's candidate selector (z-lab CandidateSelector.select), one path of `depth` slots:
+// slot e scores its k candidates cand[e][.] as unary + <pred_cb[pred] * hproj[e], succ_cb[cand]>
+// and keeps the best (greedy), or with temp[e] > 0 the best of score / T plus the target sampler's
+// Gumbel noise at step[e] (coupled). pred is anchor[0] for slot 0, then the previous pick.
+// Writes out[0..depth). temp/seed/step may be null (greedy). k <= kSelectorTopkMax.
+inline constexpr int kSelectorTopkMax = 64;
+void launch_selector_walk(const float* unary, const int* cand, const void* hproj,
+                          const void* pred_cb, const void* succ_cb, const int* anchor,
+                          int depth, int k, int R, const float* temp, const unsigned long long* seed,
+                          const unsigned long long* step, int* out, cudaStream_t stream);
+
 } // namespace dflash_kernels
 } // namespace sparkinfer

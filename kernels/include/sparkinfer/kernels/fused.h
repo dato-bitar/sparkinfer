@@ -168,6 +168,11 @@ inline constexpr int kSampleRowsTopkMax = 128;
 __host__ __device__ inline bool sample_rows_topk_eligible(float temp, int top_k, int vocab) {
     return temp > 0.f && top_k >= 1 && top_k <= kSampleRowsTopkMax && top_k < vocab;
 }
+// Each row's top k logits (1 <= k <= kSampleRowsTopkMax, k < vocab) as ids and values, in the
+// order launch_topk_topp_mask's sort gives them (value desc, id asc). A row whose candidate set
+// overflows writes ids of -1.
+void launch_topk_rows(const float* logits, int n_rows, int vocab, int k, int* out_ids,
+                      float* out_vals, cudaStream_t stream = nullptr);
 void launch_sample_rows_topk(const float* logits, int n_rows, int vocab,
                              const float* temp_f32, const unsigned long long* seed_u64,
                              const unsigned long long* step_u64, const int* top_k_i32,

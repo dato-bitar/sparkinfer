@@ -5,6 +5,29 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Added
+
+- **DFlash2 drafter** (z-lab `Qwen3.8-27B-DFlash2`), opt-in beside DSpark: sampled requests
+  1.78x plain decode against DSpark's 1.57x on Qwen3.8-27B.
+  - **What it runs:** the checkpoint is recognised by its architecture. Each attention and MLP
+    sublayer is wrapped in a grouped dynamic causal conv (2 taps, a per-16-channel kernel
+    correction projected from the block rows), attention is bidirectional within the 2048-token
+    window, and the proposals come from rows 1..7 through a candidate selector: each slot's
+    top-16 logits (`launch_topk_rows`), then one walk from the anchor scoring every candidate as
+    its logit plus a rank-256 predecessor/successor product (`launch_selector_walk`). Sampled
+    requests draw the walk with the target's Gumbel key, so the draft stays coupled.
+  - **Memory:** the draft's bf16 MLP weights are released once their quantized copies exist
+    (2.7 GB), and the successor codebook keeps only the draft vocabulary's rows. Without that a
+    32K prompt left the target's batched prefill no room, and its fallback prefill is not
+    bit-identical to plain decode's.
+  - **Measured** (RTX 5090, ModelOpt NVFP4, `dspark_tau_check`, 128 greedy tokens), DSpark ->
+    DFlash2: 1K prose 130.3 -> 133.2 tok/s, 8K 183.1 -> 181.7, 16K 216.3 -> 210.4, 32K 127.5 ->
+    128.9, every run LOSSLESS. Through the server (`spec_sampled_check.py`): T=0.7 154.2 -> 175.9,
+    T=1.0 154.8 -> 177.0 tok/s, every completion identical at T=0, 0.7 and 1.0.
+  - **Tested:** against z-lab's reference model on the same inputs (bf16 draft): final hidden rows
+    cos >= 0.9998, selector paths identical, at 1K and 8K. `sample_rows_topk_gpu_test` checks
+    `launch_topk_rows` against a sorted top-k.
+
 ### Performance
 
 - **A prompt's last 1-7 tokens take one forward instead of one decode step each** (a 1,076-token

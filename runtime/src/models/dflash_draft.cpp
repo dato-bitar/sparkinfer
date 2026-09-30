@@ -210,6 +210,22 @@ bool parse_config_json(const std::string& path, DFlashDraftConfig& cfg) {
         find_float("beta_slow", cfg.yarn_beta_slow);
     }
     find_int("mask_token_id", cfg.mask_token_id);
+    find_int("conv_kernel_size", cfg.conv_kernel);
+    find_int("conv_group_size", cfg.conv_group);
+    find_int("selector_rank", cfg.selector_rank);
+    find_int("selector_top_k", cfg.selector_top_k);
+    {
+        const size_t ic = j.find("\"is_causal\"");
+        if (ic != std::string::npos) {
+            const size_t c = j.find(':', ic);
+            if (c != std::string::npos) {
+                size_t v = j.find_first_not_of(" \t\n\r", c + 1);
+                if (v != std::string::npos) cfg.is_causal = j.compare(v, 4, "true") == 0 ? 1 : 0;
+            }
+        }
+    }
+    cfg.dflash2 = j.find("\"DFlash2DraftModel\"") != std::string::npos ||
+                  (cfg.selector_rank > 0 && cfg.conv_kernel > 0);
 
     // DSpark (RadixArk/Qwen3.8-27B-DSpark) nests the draft-specific settings under
     // "dflash_config", and its target_layer_ids differ from this struct's Qwen3.6 default both in
@@ -295,6 +311,14 @@ bool parse_config_json(const std::string& path, DFlashDraftConfig& cfg) {
 struct Q8W { signed char* q = nullptr; float* s = nullptr;
               unsigned char* q4 = nullptr; void* dm = nullptr; };
 
+// SPARKINFER_DFLASH_DRAFT_VOCAB: how many leading vocab ids the draft scores (0 = all). See
+// forward_block, where the choice is explained; the loader reads it too, to size what only those
+// ids index.
+int draft_vocab_env() {
+    const char* e = getenv("SPARKINFER_DFLASH_DRAFT_VOCAB");
+    return e ? atoi(e) : 65536;
+}
+
 struct LayerWeights {
     bf16 *wq = nullptr, *wk = nullptr, *wv = nullptr, *wo = nullptr;
     // Q8_0 mirrors of the four batched projections (Q/K/V, O, gate/up, down).
@@ -302,6 +326,10 @@ struct LayerWeights {
     bf16 *q_norm = nullptr, *k_norm = nullptr;
     bf16 *input_norm = nullptr, *post_norm = nullptr;
     bf16 *gate = nullptr, *up = nullptr, *down = nullptr;
+    // DFlash2: base_kernel [2 sides][taps][H] and kernel_projection [2 * taps * H / group, H] of
+    // the conv around attention and around the MLP.
+    bf16 *attn_conv_base = nullptr, *attn_conv_proj = nullptr;
+    bf16 *mlp_conv_base = nullptr, *mlp_conv_proj = nullptr;
 };
 
 // Draft projection weight format: 4 = asymmetric int4, 8 = Q8_0, 0 = bf16. Default 4.
@@ -389,6 +417,18 @@ struct DFlashDraftModel::Impl {
 
     int *h_out = nullptr;
     float *d_confidence = nullptr, *h_confidence = nullptr;   // [B], confidence head output
+    // DFlash2's candidate selector: hidden_projection [rank, H] and the two [vocab, rank]
+    // codebooks, plus per-block scratch (the kernel projections' rows, the conv output, the
+    // selector's projected rows and each slot's top-k ids and logits).
+    bf16* sel_hproj = nullptr;
+    bf16* sel_pred = nullptr;
+    bf16* sel_succ = nullptr;
+    bf16* conv_dyn_a = nullptr;   // [B][2 * taps * groups], the attention conv's kernels
+    bf16* conv_dyn_m = nullptr;   // the MLP conv's
+    bf16* conv_out = nullptr;     // [B][max(H, qdim)]
+    bf16* sel_h = nullptr;        // [B][rank]
+    int* sel_ids = nullptr;       // [B][top_k]
+    float* sel_vals = nullptr;
     // set_sampling(): the request's sampler for the next forward_block, indexed by proposal
     // (entry 0, the seed row, is never sampled). Pinned so the per-block upload stays async.
     static constexpr int kSampRows = 64;
@@ -429,6 +469,24 @@ struct DFlashDraftModel::Impl {
         for (auto& pq : pending_quant) *pq.dst = make_q8(pq.w, pq.N, pq.K);
         pending_quant.clear();
         quant_ready = true;
+        // DFlash2 always runs its whole block (forward_block forces BW = block_size), and at a
+        // batched width its MLP reads only the quantized copies; the bf16 originals are dead
+        // weight -- 2.7 GB on z-lab's Qwen3.8 checkpoint (intermediate 17408), which at a 32K
+        // prompt is what the target's batched prefill needs, or it falls back to a path both far
+        // slower and not bit-identical to the one plain decode took. Other drafts keep them: their
+        // width varies per generation and may land on the per-token fallback that reads them.
+        const int bs = cfg.block_size;
+        const bool batched_width = bs == 16 || bs == 8 || bs == 7 || bs == 6 || bs == 5 ||
+                                   bs == 4 || bs == 2;
+        if (cfg.dflash2 && batched_width) {
+            for (LayerWeights& lw : layers) {
+                if (!(lw.q8_gate.q4 || lw.q8_gate.q) || !(lw.q8_up.q4 || lw.q8_up.q) ||
+                    !(lw.q8_down.q4 || lw.q8_down.q))
+                    continue;
+                release(lw.gate); release(lw.up); release(lw.down);
+                lw.gate = lw.up = lw.down = nullptr;
+            }
+        }
     }
 
     Q8W make_q8(bf16* w, int N, int K) {
@@ -491,6 +549,17 @@ struct DFlashDraftModel::Impl {
         gate = alloc<bf16>((size_t)B * I);
         up = alloc<bf16>((size_t)B * I);
         down = alloc<bf16>((size_t)B * H);
+        if (cfg.dflash2 && cfg.conv_kernel > 0 && cfg.conv_group > 0) {
+            const int dyn = 2 * cfg.conv_kernel * (H / cfg.conv_group);
+            conv_dyn_a = alloc<bf16>((size_t)B * dyn);
+            conv_dyn_m = alloc<bf16>((size_t)B * dyn);
+            conv_out = alloc<bf16>((size_t)B * std::max(H, qdim));
+        }
+        if (cfg.dflash2 && cfg.selector_rank > 0 && cfg.selector_top_k > 0) {
+            sel_h = alloc<bf16>((size_t)B * cfg.selector_rank);
+            sel_ids = alloc<int>((size_t)B * cfg.selector_top_k);
+            sel_vals = alloc<float>((size_t)B * cfg.selector_top_k);
+        }
         logits = alloc<float>((size_t)B * std::max(cfg.vocab, 1));
         head_q8 = alloc<char>((size_t)B * kernels::llama_q8_1_bytes(H));
         d_ids = alloc<int>(B);
@@ -839,6 +908,17 @@ bool DFlashDraftModel::load(const std::string& dir) {
             return false;
         lw.q_norm = s.upload(*qn); lw.k_norm = s.upload(*kn);
         lw.input_norm = s.upload(*in); lw.post_norm = s.upload(*pn);
+        if (s.cfg.dflash2) {
+            auto* ab = require(pfx + "attention_conv.base_kernel");
+            auto* ap = require(pfx + "attention_conv.kernel_projection.weight");
+            auto* mb = require(pfx + "mlp_conv.base_kernel");
+            auto* mp = require(pfx + "mlp_conv.kernel_projection.weight");
+            if (!ab || !ap || !mb || !mp) return false;
+            lw.attn_conv_base = s.upload(*ab);
+            lw.attn_conv_proj = s.upload(*ap);
+            lw.mlp_conv_base = s.upload(*mb);
+            lw.mlp_conv_proj = s.upload(*mp);
+        }
         // Q8_0 mirrors: the batched projections are DRAM-bound at the narrowed diffusion width,
         // so halving their weight bytes is the dominant remaining win. Built once, on load.
         if (q8_on()) {
@@ -851,6 +931,36 @@ bool DFlashDraftModel::load(const std::string& dir) {
             s.pending_quant.push_back({lw.up,   I,   H,  &lw.q8_up});
             s.pending_quant.push_back({lw.down, H,   I,  &lw.q8_down});
         }
+    }
+
+    if (s.cfg.dflash2) {
+        // The selector's codebooks carry no ".weight" suffix in the published checkpoints (z-lab
+        // remaps them on load); accept either spelling.
+        auto* hp = require("candidate_selector.hidden_projection.weight");
+        auto* pc = optional("candidate_selector.predecessor_codebook");
+        if (!pc) pc = optional("candidate_selector.predecessor_codebook.weight");
+        auto* sc = optional("candidate_selector.successor_codebook");
+        if (!sc) sc = optional("candidate_selector.successor_codebook.weight");
+        if (!hp || !pc || !sc || s.cfg.conv_kernel < 1 || s.cfg.conv_group < 1 ||
+            s.cfg.selector_top_k < 1 ||
+            s.cfg.selector_top_k > std::min(kernels::kSampleRowsTopkMax, dflash_kernels::kSelectorTopkMax)) {
+            fprintf(stderr, "[dflash] DFlash2 checkpoint is missing its selector or conv config\n");
+            return false;
+        }
+        s.sel_hproj = s.upload(*hp);
+        s.sel_pred = s.upload(*pc);
+        // Only candidates index the successor codebook, and they come from the draft's logits, so
+        // rows past the draft vocab are never read: keep the first Vd (94 MB less at Vd = 65536,
+        // which a 32K context on a 32 GB card needs). The predecessor codebook is also indexed by
+        // the anchor, a target token, so it stays whole.
+        TensorView succ = *sc;
+        const int dv = draft_vocab_env();
+        if (dv > 0 && succ.dtype == "BF16" && succ.shape.size() == 2 && succ.shape[0] > dv)
+            succ.nbytes = (size_t)dv * (size_t)succ.shape[1] * sizeof(bf16);
+        s.sel_succ = s.upload(succ);
+        fprintf(stderr, "[dflash] DFlash2: conv %d taps / group %d, selector rank %d top-%d, %s attention\n",
+                s.cfg.conv_kernel, s.cfg.conv_group, s.cfg.selector_rank, s.cfg.selector_top_k,
+                s.cfg.is_causal == 0 ? "bidirectional" : "causal");
     }
 
     // DSpark's Markov head: trained weights sitting in the checkpoint but unused by plain DFlash
@@ -1101,7 +1211,9 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     // Also clamped to block_size: proposal r reads block row r-1 (or r without the row shift),
     // so a block can never back more proposals than it has rows. Without this a checkpoint whose
     // block_size is below the requested depth reads uninitialised argmax rows as proposals.
-    const int kProposalDepth = std::min(c.block_size,
+    // DFlash2's proposals come from rows 1..depth of the block (row 0 is the anchor), so it has
+    // block_size - 1 of them; DSpark's row-shifted mapping gets block_size.
+    const int kProposalDepth = std::min(c.dflash2 ? c.block_size - 1 : c.block_size,
                                         proposals > 0 ? (proposals > 15 ? 15 : proposals)
                                                       : kProposalDepthDefault);
     // Active diffusion width. Only rows 0..kProposalDepth are ever consumed (row 0 is the seed,
@@ -1126,6 +1238,10 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
             // 1.662) on Qwen3.8-27B, while the full seven-row fallback costs 9.27 ms. Plain
             // DFlash checkpoints have no Markov head and retain the old depth+1 choice.
             if (s.markov_w1 && c.block_size == 7 && v < 4) v = 4;
+            // DFlash2 is trained on full blocks with bidirectional attention: every row sees the
+            // mask rows after it, so a narrower block changes what every proposal is computed from.
+            // Run the whole block (the reference's verify_size) whatever depth is consumed.
+            if (c.dflash2) v = c.block_size;
         }
         if (v < kProposalDepth + 1) v = kProposalDepth + 1;
         // Round up to a width the batched-GEMV path is instantiated for; anything else falls
@@ -1327,6 +1443,13 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         if (total_ctx >= kMidCtxMinSeq)
             kFullWindow = total_ctx < kMidCtxMaxSeq ? kMidCtxWindow : kLongCtxWindow;
     }
+    // A draft with no full-attention layer (DFlash2: every layer sliding) has nothing for this
+    // window to bound, and the fc trim below takes the widest window across layers: 3x the sliding
+    // window there reached past the rows dflash_generate captures above 12288 (the last 4096), so
+    // every long-context block failed. Its widest window is the sliding one.
+    if (kFullWindowEnv < 0 && c.sliding_window > 0 &&
+        std::all_of(c.sliding_layers.begin(), c.sliding_layers.end(), [](bool b) { return b; }))
+        kFullWindow = c.sliding_window;
     // fc trim: once the full-attn layer is windowed, NO layer reads target_proj older than the
     // largest window across layers, so project only that tail. Uses the same attn_gqa_kv_lo bound
     // the per-layer ingestion (#752) applies, at the LARGEST window -> surviving rows byte-identical,
@@ -1411,6 +1534,19 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         bf16* const vdst = s.v_cache[L] + (size_t)past * kvdim;
         if (L == 0)
             dflash_kernels::launch_rms(s.x, w.input_norm, s.xn, BW, H, c.rms_eps, st);
+        // DFlash2: the attention conv's "prepare" (z-lab GroupedDynamicCausalConv). A per-group
+        // kernel correction is projected from the normed block rows, and the conv runs along the
+        // block's rows; Q and the block's own K/V come from its output. The context rows (the
+        // target's projected features) are not convolved.
+        const int conv_dyn_n = c.dflash2 ? 2 * c.conv_kernel * (H / c.conv_group) : 0;
+        if (conv_dyn_n) {
+            dflash_kernels::launch_gemv_batched16(s.xn, w.attn_conv_proj, s.conv_dyn_a, conv_dyn_n, H, st, BW);
+            dflash_kernels::launch_grouped_conv(s.xn, w.attn_conv_base, s.conv_dyn_a, 0, s.conv_out, BW, H,
+                                                c.conv_kernel, c.conv_group, conv_dyn_n, st);
+            cu(cudaMemcpyAsync(s.xn, s.conv_out, (size_t)BW * H * sizeof(bf16), cudaMemcpyDeviceToDevice, st),
+               "dflash2 attn conv");
+            xn_ready = false;
+        }
 
         // Q from noise, K/V from cat(target, noise)
         if (fast16) {
@@ -1575,9 +1711,12 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
             const char* e = getenv("SPARKINFER_DFLASH_FORCE_CAUSAL");
             return (e && e[0] == '1') ? 1 : 0;
         }();
+        // A checkpoint that declares is_causal (DFlash2: false, on sliding layers) is taken at its
+        // word, as the reference implementations do; the per-layer default applies otherwise.
         const bool causal = kForceCausal ||
-                            (mixed_causal && L < (int)c.sliding_layers.size() &&
-                             c.sliding_layers[L]);
+                            (c.is_causal >= 0 ? c.is_causal != 0
+                                              : (mixed_causal && L < (int)c.sliding_layers.size() &&
+                                                 c.sliding_layers[L]));
         dflash_kernels::launch_attn_gqa(s.q, s.k_cache[L], s.v_cache[L], s.attn,
                                         BW, kv_len, c.n_q_heads, c.n_kv_heads, d,
                                         q_pos0, /*k_pos0_cache=*/0, window, causal, scale, st,
@@ -1603,9 +1742,24 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
             for (int t = 0; t < BW; t++)
                 kernels::launch_gemv(s.attn + (size_t)t * qdim, w.wo, s.ao + (size_t)t * H, H, qdim, st);
         }
+        if (conv_dyn_n) {   // DFlash2: the attention conv's "finish", on the output projection
+            dflash_kernels::launch_grouped_conv(s.ao, w.attn_conv_base + (size_t)c.conv_kernel * H,
+                                                s.conv_dyn_a, 1, s.conv_out, BW, H, c.conv_kernel,
+                                                c.conv_group, conv_dyn_n, st);
+            cu(cudaMemcpyAsync(s.ao, s.conv_out, (size_t)BW * H * sizeof(bf16), cudaMemcpyDeviceToDevice, st),
+               "dflash2 attn conv finish");
+        }
         dflash_kernels::launch_add_rms(s.x, s.ao, s.h, w.post_norm, s.hn, BW, H, c.rms_eps, st,
                                        dp4a_gu ? s.xq81 : nullptr);
         hn_ready = dp4a_gu;
+        if (conv_dyn_n) {   // DFlash2: the MLP conv's "prepare", on the post-attention norm
+            dflash_kernels::launch_gemv_batched16(s.hn, w.mlp_conv_proj, s.conv_dyn_m, conv_dyn_n, H, st, BW);
+            dflash_kernels::launch_grouped_conv(s.hn, w.mlp_conv_base, s.conv_dyn_m, 0, s.conv_out, BW, H,
+                                                c.conv_kernel, c.conv_group, conv_dyn_n, st);
+            cu(cudaMemcpyAsync(s.hn, s.conv_out, (size_t)BW * H * sizeof(bf16), cudaMemcpyDeviceToDevice, st),
+               "dflash2 mlp conv");
+            hn_ready = false;
+        }
         if (fast16) {
             if (w.q8_gate.q4 && dp4a_gu)
                 dflash_kernels::launch_gemv_batched_q4_dp4a_fused3(
@@ -1653,6 +1807,13 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         // Fold the second residual into the norm that always consumes it: the next layer's input
         // norm, or the final norm after the last layer. Same math, one launch instead of two, and
         // the draft is eager-launched so each saved launch is also a saved gap.
+        if (conv_dyn_n) {   // DFlash2: the MLP conv's "finish", on the down projection
+            dflash_kernels::launch_grouped_conv(s.down, w.mlp_conv_base + (size_t)c.conv_kernel * H,
+                                                s.conv_dyn_m, 1, s.conv_out, BW, H, c.conv_kernel,
+                                                c.conv_group, conv_dyn_n, st);
+            cu(cudaMemcpyAsync(s.down, s.conv_out, (size_t)BW * H * sizeof(bf16), cudaMemcpyDeviceToDevice, st),
+               "dflash2 mlp conv finish");
+        }
         const bf16* next_norm = (L + 1 < run_layers) ? s.layers[L + 1].input_norm : s.final_norm;
         dflash_kernels::launch_add_rms(s.h, s.down, s.x, next_norm, s.xn, BW, H, c.rms_eps, st,
                                        dp4a_qkv ? s.xq81 : nullptr);
@@ -1732,10 +1893,7 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     //
     // The Markov head's OTHER table, w1, is indexed by the PREVIOUS token and is not pruned: the
     // conditioning still accepts any target token, only the output side is narrowed.
-    static const int kDraftVocab = []{
-        const char* e = getenv("SPARKINFER_DFLASH_DRAFT_VOCAB");
-        return e ? atoi(e) : 65536;
-    }();
+    static const int kDraftVocab = draft_vocab_env();
     // Vd is the logits ROW STRIDE as well as the length: the multi-row head writes y[m*N + n], so
     // the stride has to travel with it or the Markov chain reads the wrong row.
     const int Vd = (kDraftVocab > 0 && kDraftVocab < V) ? kDraftVocab : V;
@@ -1754,7 +1912,9 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         const char* e = getenv("SPARKINFER_DFLASH_ROW_SHIFT");
         return (e && e[0] == '0') ? 0 : 1;
     }();
-    const int head_row0 = kRowShift ? 0 : 1;
+    // DFlash2 reads its proposals from rows 1..depth (z-lab: draft_hidden[:, 1-verify_size:]),
+    // whatever the DSpark row-shift default says.
+    const int head_row0 = (kRowShift && !c.dflash2) ? 0 : 1;
     bool head_done = false;
     // Coupled proposals (set_sampling): proposal r draws at step step0 + r - 1, the step the
     // target's verify row r - 1 samples at. Row 0 (the seed) is never sampled.
@@ -1907,6 +2067,24 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                 s.xn, H, s.markov_latent, s.markov_rank,
                 s.confidence_w, s.confidence_bias, H, s.markov_rank,
                 kRowShift ? 0 : 1, kProposalDepth, s.d_confidence, st);
+    } else if (c.dflash2 && s.sel_hproj && s.sel_ids) {
+        // DFlash2's candidate selector: each slot's top-k logits, the slot's hidden row projected to
+        // the selector rank, then one walk from the anchor that scores every candidate against the
+        // slot before's pick (unary + <A[pred] * h, B[cand]>). Rows 1..depth back proposals 1..depth,
+        // and without the multi-row head the logits start at row 0, so row 1 is one row in either way.
+        const int k = c.selector_top_k, R = c.selector_rank;
+        const float* rows_logits = s.logits + (size_t)1 * Vd;
+        kernels::launch_topk_rows(rows_logits, kProposalDepth, Vd, k, s.sel_ids, s.sel_vals, st);
+        // Project every block row: the batched GEMV has no 1- or 3-row variant and runs 16 rows for
+        // those, past the end of sel_h. BW is the checkpoint's block_size (forced above), a width
+        // it has; row 0's projection is simply unused.
+        dflash_kernels::launch_gemv_batched16(s.xn, s.sel_hproj, s.sel_h, R, H, st, BW);
+        dflash_kernels::launch_selector_walk(
+            s.sel_vals, s.sel_ids, s.sel_h + (size_t)R, s.sel_pred, s.sel_succ, s.d_ids, kProposalDepth, k, R,
+            couple ? &s.d_samp->temp[1] : nullptr, couple ? &s.d_samp->seed[1] : nullptr,
+            couple ? &s.d_samp->step[1] : nullptr, s.d_out + 1, st);
+        if (!head_done)
+            cu(cudaMemcpyAsync(s.d_out, s.d_ids, sizeof(int), cudaMemcpyDeviceToDevice, st), "dflash2 row 0");
     } else {
         kernels::launch_argmax(s.logits + (size_t)(head_done ? head_row0 : 0) * Vd,
                                s.d_out + (head_done ? 1 : 0),

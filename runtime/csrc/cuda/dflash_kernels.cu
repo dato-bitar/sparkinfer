@@ -2,6 +2,7 @@
 #include "sparkinfer/models/dflash_kernels.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <curand_kernel.h>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -2276,6 +2277,107 @@ void launch_confidence_head_rows(const void* hidden, int hidden_stride,
     k_confidence_head_rows<<<rows, threads, threads * sizeof(float), stream>>>(
         (const bf16*)hidden, hidden_stride, latent, latent_stride,
         (const bf16*)w, bias, H, rank, row0, out_confidence);
+}
+
+
+// ---- DFlash2: grouped dynamic causal conv and the candidate selector's walk ------------------
+namespace {
+// out[t,c] = sum_tap (base[tap][c] + dyn[t][side][tap][c / group]) * x[t - tap][c], x[<0] = 0.
+// dyn is the kernel projection's output row: [2 sides][taps][groups]. One thread per (t, c).
+__global__ void grouped_conv_kernel(const bf16* __restrict__ x, const bf16* __restrict__ base,
+                                    const bf16* __restrict__ dyn, int side, bf16* __restrict__ out,
+                                    int rows, int H, int taps, int group, int dyn_stride) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t = blockIdx.y;
+    if (c >= H || t >= rows) return;
+    const int groups = H / group;
+    const int g = c / group;
+    const bf16* drow = dyn + (size_t)t * dyn_stride + (size_t)side * taps * groups;
+    float acc = 0.f;
+    for (int k = 0; k < taps && k <= t; ++k) {
+        const float wk = __bfloat162float(base[(size_t)k * H + c]) + __bfloat162float(drow[(size_t)k * groups + g]);
+        acc += wk * __bfloat162float(x[(size_t)(t - k) * H + c]);
+    }
+    out[(size_t)t * H + c] = __float2bfloat16(acc);
+}
+
+// One block walks all `depth` slots in order: slot e scores its k candidates as
+// unary + <A[pred] * h_e, B[cand]> (pred = the anchor for slot 0, the slot before's pick after)
+// and keeps the argmax -- or, with a temperature, the argmax of score / T plus Gumbel noise from
+// Philox(seed, candidate id, step), the target sampler's key, so the pick couples to the target's
+// draw at that step. blockDim.x == R.
+__global__ void selector_walk_kernel(const float* __restrict__ unary, const int* __restrict__ cand,
+                                     const bf16* __restrict__ hproj, const bf16* __restrict__ pred_cb,
+                                     const bf16* __restrict__ succ_cb, const int* __restrict__ anchor,
+                                     int depth, int k, int R,
+                                     const float* __restrict__ temp, const unsigned long long* __restrict__ seed,
+                                     const unsigned long long* __restrict__ step, int* __restrict__ out) {
+    extern __shared__ float sh[];
+    float* red = sh;             // [blockDim.x]
+    __shared__ int s_pred;
+    __shared__ float s_score[kSelectorTopkMax];
+    const int r = threadIdx.x;
+    if (r == 0) s_pred = anchor[0];
+    __syncthreads();
+    for (int e = 0; e < depth; ++e) {
+        const int pred = s_pred;
+        // A row whose top-k overflowed has ids of -1 (launch_topk_rows): score it -inf, and never
+        // index a codebook with it.
+        const float w = (r < R && pred >= 0) ? __bfloat162float(pred_cb[(size_t)pred * R + r]) *
+                                                   __bfloat162float(hproj[(size_t)e * R + r]) : 0.f;
+        for (int c = 0; c < k; ++c) {
+            const int id = cand[e * k + c];
+            red[r] = (r < R && id >= 0) ? w * __bfloat162float(succ_cb[(size_t)id * R + r]) : 0.f;
+            __syncthreads();
+            for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+                if (r < off) red[r] += red[r + off];
+                __syncthreads();
+            }
+            if (r == 0) s_score[c] = id >= 0 ? unary[e * k + c] + red[0] : -INFINITY;
+            __syncthreads();
+        }
+        if (r == 0) {
+            const float T = temp ? temp[e] : 0.f;
+            float best = -INFINITY;
+            int bi = 0;
+            for (int c = 0; c < k; ++c) {
+                float sc = s_score[c];
+                const int id = cand[e * k + c];
+                if (T > 0.f) {
+                    curandStatePhilox4_32_10_t st;
+                    curand_init(seed[e], (unsigned long long)id, step[e], &st);
+                    const float u = fminf(curand_uniform(&st), 0.99999994f);
+                    sc = sc * (1.f / T) - logf(-logf(u));
+                }
+                if (sc > best) { best = sc; bi = c; }
+            }
+            s_pred = cand[e * k + bi] >= 0 ? cand[e * k + bi] : 0;
+            out[e] = s_pred;
+        }
+        __syncthreads();
+    }
+}
+}  // namespace
+
+void launch_grouped_conv(const void* x, const void* base_side, const void* dyn, int side, void* out,
+                         int rows, int H, int taps, int group, int dyn_stride, cudaStream_t stream) {
+    if (rows < 1) return;
+    dim3 grid((H + 255) / 256, rows);
+    grouped_conv_kernel<<<grid, 256, 0, stream>>>((const bf16*)x, (const bf16*)base_side,
+                                                  (const bf16*)dyn, side, (bf16*)out, rows, H, taps,
+                                                  group, dyn_stride);
+}
+
+void launch_selector_walk(const float* unary, const int* cand, const void* hproj,
+                          const void* pred_cb, const void* succ_cb, const int* anchor,
+                          int depth, int k, int R, const float* temp, const unsigned long long* seed,
+                          const unsigned long long* step, int* out, cudaStream_t stream) {
+    if (depth < 1 || k < 1 || k > kSelectorTopkMax) return;
+    int threads = 32;
+    while (threads < R) threads <<= 1;
+    selector_walk_kernel<<<1, threads, threads * sizeof(float), stream>>>(
+        unary, cand, (const bf16*)hproj, (const bf16*)pred_cb, (const bf16*)succ_cb, anchor, depth, k,
+        R, temp, seed, step, out);
 }
 
 } // namespace dflash_kernels

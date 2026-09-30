@@ -212,6 +212,55 @@ bool test_overflow_falls_back(int vocab) {
     return ok;
 }
 
+// launch_topk_rows (DFlash2's candidate selector) must return each row's top k in the sort's
+// order -- value descending, id ascending among equal values -- and -1 ids on overflow.
+bool test_topk_rows(int vocab) {
+    bool ok = true;
+    for (int k : {1, 16, K::kSampleRowsTopkMax}) {
+        const Rows r = make_rows(24, vocab, 4242u + (unsigned)k);
+        float* dl = nullptr; int* di = nullptr; float* dv = nullptr;
+        cudaMalloc(&dl, r.logits.size() * sizeof(float));
+        cudaMalloc(&di, (size_t)r.n * k * sizeof(int));
+        cudaMalloc(&dv, (size_t)r.n * k * sizeof(float));
+        cudaMemcpy(dl, r.logits.data(), r.logits.size() * sizeof(float), cudaMemcpyHostToDevice);
+        K::launch_topk_rows(dl, r.n, vocab, k, di, dv);
+        std::vector<int> ids((size_t)r.n * k);
+        std::vector<float> vals((size_t)r.n * k);
+        cudaMemcpy(ids.data(), di, ids.size() * sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(vals.data(), dv, vals.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        int bad = 0;
+        for (int i = 0; i < r.n; i++) {
+            const float* L = r.logits.data() + (size_t)i * vocab;
+            std::vector<int> order(vocab);
+            for (int v = 0; v < vocab; v++) order[v] = v;
+            std::partial_sort(order.begin(), order.begin() + k, order.end(),
+                              [&](int a, int b) { return L[a] != L[b] ? L[a] > L[b] : a < b; });
+            for (int j = 0; j < k; j++)
+                if (ids[(size_t)i * k + j] != order[j] || vals[(size_t)i * k + j] != L[order[j]]) { bad++; break; }
+        }
+        printf("[%s] topk_rows k=%d: %d/%d rows match the sorted top k\n", bad ? "FAIL" : "PASS", k,
+               r.n - bad, r.n);
+        ok = ok && bad == 0;
+        cudaFree(dl); cudaFree(di); cudaFree(dv);
+    }
+    {
+        std::vector<float> flat(vocab, 1.5f);  // every key equal: the candidate set overflows
+        float* dl = nullptr; int* di = nullptr; float* dv = nullptr;
+        cudaMalloc(&dl, vocab * sizeof(float));
+        cudaMalloc(&di, 16 * sizeof(int));
+        cudaMalloc(&dv, 16 * sizeof(float));
+        cudaMemcpy(dl, flat.data(), vocab * sizeof(float), cudaMemcpyHostToDevice);
+        K::launch_topk_rows(dl, 1, vocab, 16, di, dv);
+        int got[16];
+        cudaMemcpy(got, di, sizeof(got), cudaMemcpyDeviceToHost);
+        const bool o = std::all_of(got, got + 16, [](int v) { return v == -1; });
+        printf("[%s] topk_rows overflow reports -1 ids\n", o ? "PASS" : "FAIL");
+        ok = ok && o;
+        cudaFree(dl); cudaFree(di); cudaFree(dv);
+    }
+    return ok;
+}
+
 // The batched kernel on its own must sample softmax(logits / T) over the top_k/top_p survivors.
 bool test_distribution() {
     const int vocab = 64, draws = 40000, k = 12;
@@ -328,6 +377,8 @@ int main() {
     ok = test_leaves_ineligible_rows_alone(big_vocab) && ok;
     ok = test_overflow_falls_back(big_vocab) && ok;
     ok = test_distribution() && ok;
+    ok = test_topk_rows(big_vocab) && ok;
+    ok = test_topk_rows(5003) && ok;
     if (cudaGetLastError() != cudaSuccess) { printf("[FAIL] CUDA error\n"); ok = false; }
     if (!ok) return 1;
     printf("sample_rows_topk_gpu_test: OK\n");

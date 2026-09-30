@@ -203,6 +203,74 @@ sample_rows_topk_kernel(const float* __restrict__ logits, int vocab,
     }
 }
 
+// Each row's top k entries (k <= kSampleRowsTopkMax), in CUB's order (value desc, id asc), with
+// sample_rows_topk_kernel's bound-then-sort; a row whose candidate set overflows writes id -1.
+__global__ void __launch_bounds__(kSrThreads)
+topk_rows_kernel(const float* __restrict__ logits, int vocab, int k, int* __restrict__ out_ids,
+                 float* __restrict__ out_vals) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float* L = logits + (size_t)row * vocab;
+    __shared__ unsigned int s_max[kSrThreads];
+    __shared__ unsigned long long s_cand[kSrCap];
+    __shared__ int s_n;
+    unsigned int mk = 0u;
+    for (int v = tid; v < vocab; v += kSrThreads) mk = max(mk, sr_key(L[v]));
+    s_max[tid] = mk;
+    if (tid == 0) s_n = 0;
+    __syncthreads();
+    for (int size = 2; size <= kSrThreads; size <<= 1)
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            const int partner = tid ^ stride;
+            if (partner > tid) {
+                const bool desc = (tid & size) == 0;
+                const unsigned int a = s_max[tid], b = s_max[partner];
+                if ((a < b) == desc) { s_max[tid] = b; s_max[partner] = a; }
+            }
+            __syncthreads();
+        }
+    const unsigned int bound = s_max[k - 1];
+    for (int v = tid; v < vocab; v += kSrThreads) {
+        const unsigned int key = sr_key(L[v]);
+        if (key >= bound) {
+            const int slot = atomicAdd(&s_n, 1);
+            if (slot < kSrCap) s_cand[slot] = ((unsigned long long)key << 32) | (0xffffffffu - (unsigned int)v);
+        }
+    }
+    __syncthreads();
+    const int n = s_n;
+    if (n > kSrCap) {
+        for (int i = tid; i < k; i += kSrThreads) { out_ids[(size_t)row * k + i] = -1; out_vals[(size_t)row * k + i] = 0.f; }
+        return;
+    }
+    int p2 = 1;
+    while (p2 < n) p2 <<= 1;
+    for (int i = n + tid; i < p2; i += kSrThreads) s_cand[i] = 0ull;
+    __syncthreads();
+    for (int size = 2; size <= p2; size <<= 1)
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            for (int i = tid; i < p2; i += kSrThreads) {
+                const int partner = i ^ stride;
+                if (partner > i) {
+                    const bool desc = (i & size) == 0;
+                    const unsigned long long a = s_cand[i], b = s_cand[partner];
+                    if ((a < b) == desc) { s_cand[i] = b; s_cand[partner] = a; }
+                }
+            }
+            __syncthreads();
+        }
+    for (int i = tid; i < k; i += kSrThreads) {
+        out_ids[(size_t)row * k + i] = sr_id(s_cand[i]);
+        out_vals[(size_t)row * k + i] = sr_val((unsigned int)(s_cand[i] >> 32));
+    }
+}
+
+void launch_topk_rows(const float* logits, int n_rows, int vocab, int k, int* out_ids,
+                      float* out_vals, cudaStream_t stream) {
+    if (n_rows < 1 || k < 1 || k > kSampleRowsTopkMax || k >= vocab) return;
+    topk_rows_kernel<<<n_rows, kSrThreads, 0, stream>>>(logits, vocab, k, out_ids, out_vals);
+}
+
 void launch_sample_rows_topk(const float* logits, int n_rows, int vocab,
                              const float* temp_f32, const unsigned long long* seed_u64,
                              const unsigned long long* step_u64, const int* top_k_i32,

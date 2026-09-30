@@ -44,6 +44,16 @@ struct DFlashDraftConfig {
     int   yarn_orig_max_pos = 0;      // "original_max_position_embeddings" (8192)
     float yarn_beta_fast = 32.f;
     float yarn_beta_slow = 1.f;
+
+    // DFlash2 (z-lab DFlash2DraftModel): a grouped dynamic causal conv around each attention and
+    // MLP sublayer, and a candidate selector over the top selector_top_k logits of each slot.
+    // `is_causal` is the checkpoint's own field (-1 when absent: the per-layer default applies).
+    bool dflash2 = false;
+    int is_causal = -1;
+    int conv_kernel = 0;       // "conv_kernel_size" (taps)
+    int conv_group = 0;        // "conv_group_size" (channels per dynamic kernel group)
+    int selector_rank = 0;
+    int selector_top_k = 0;
 };
 
 class DFlashDraftModel {

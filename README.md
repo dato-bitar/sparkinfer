@@ -142,6 +142,26 @@ Speculation only pays when the verify costs less than what it replaces:
 story — a block that accepts more tokens but costs more to verify is slower, and for most of this
 feature's life DSpark ran *below* plain AR decode for exactly that reason.
 
+#### DFlash2 drafter (opt-in)
+
+z-lab's [`Qwen3.8-27B-DFlash2`](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) also loads as the
+drafter: point `--draft-model` (or, in the image, `-e DRAFT_REPO=z-lab/Qwen3.8-27B-DFlash2
+-e DRAFT_DIR=/models/qwen38-dflash2` with `serve-dspark`) at it and the checkpoint is recognised
+by its architecture. It adds a grouped dynamic convolution around every sublayer and a candidate
+selector that walks each slot's top-16 tokens with learned pairwise scores, and it is lossless in
+the same sense DSpark is. Same box and binary, `dspark_tau_check`, 128 greedy tokens:
+
+| context | AR | DSpark (τ) | DFlash2 (τ) |
+|---:|---:|---:|---:|
+| 1K prose | 98.5 | 130.3 (1.62) | **133.2** (2.10) |
+| 8K | 95.0 | **183.1** (2.58) | 181.7 (2.58) |
+| 16K | 91.4 | **216.3** (2.95) | 210.4 (3.00) |
+| 32K | 87.6 | 127.5 (2.13) | **128.9** (1.83) |
+
+Sampled requests through the server (`eval/spec_sampled_check.py`, 6 prompts × 256 tokens):
+T=0.7 175.9 tok/s against DSpark's 154.2, T=1.0 177.0 against 154.8, plain decode ~98.7. The
+8K–32K prompts are this repository's own docs and sources, so their τ is higher than prose.
+
 ### Same weights, GGUF on both sides
 
 To make the engine comparison fair, the same `Q4_K_M` GGUF
