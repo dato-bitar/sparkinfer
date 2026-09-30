@@ -17,7 +17,8 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
     reproduce decode exactly -- in one forward, eagerly and outside the verify graph cache so the
     packed decode's graphs are never evicted, committing every row
     (`Qwen35Model::ingest_tail_rows`). A seed whose logprob is wanted, or a session with a logit
-    bias, keeps the decode steps. `SPARKINFER_PREFILL_TAIL_VERIFY=0` restores them.
+    bias, keeps the decode steps. It has its own 149 MB arena, so it never re-allocates the
+    buffers the packed decode's graphs point at. `SPARKINFER_PREFILL_TAIL_VERIFY=0` restores them.
   - **Tested:** through `sparkinfer_server` under `SPARKINFER_DETERMINISTIC=1`, 18/18 completions
     (T=0, 0.7, 1.0) identical with the tail on and off; `pack_ckpt_check` gives the same seeds and
     snapshots either way.

@@ -302,9 +302,19 @@ VerifyGraphCache& verify_graph_cache() {
     static thread_local VerifyGraphCache cache;
     return cache;
 }
+// An eager pass (verify_eager) gets its own arena. The arena hands out buffers by cursor position,
+// and a non-packed pass allocates a different sequence of them than a packed one, so sharing the
+// packed decode's arena re-allocated the buffers its cached graphs point at -- and the next packed
+// step launched a graph into freed memory (a segfault in cudaGraphLaunch under load). The
+// speculative path never hit this because it flushes the graphs whenever it runs.
+VerifyGraphCache& verify_eager_cache() {
+    static thread_local VerifyGraphCache cache;
+    return cache;
+}
 } // namespace
 
 void dflash_release_verify_cache() {
+    verify_eager_cache().arena.free_all();
     VerifyGraphCache& cache = verify_graph_cache();
     for (int t = 1; t <= kVerifyMaxRows; ++t) {
         if (cache.exec[t]) cudaGraphExecDestroy(cache.exec[t]);
@@ -4991,7 +5001,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         fprintf(stderr, "]\n");
     }
     cudaStream_t st = s.stream;
-    VerifyGraphCache& graph_cache = verify_graph_cache();
+    VerifyGraphCache& graph_cache = s.verify_eager ? verify_eager_cache() : verify_graph_cache();
     graph_cache.arena.rewind();
     Arena& a = graph_cache.arena;
     bf16* x = a.alloc<bf16>((size_t)NA * H);
@@ -7460,6 +7470,13 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     pf_cu(cudaStreamSynchronize(st), "verify sync");
     std::memcpy(out_argmax, ph_out, (size_t)N * sizeof(int));
     if (!s.verify_eager) graph_warm = true;
+    if (s.verify_eager) {
+        static bool logged = false;
+        if (!logged) {
+            fprintf(stderr, "[prefill] prompt-tail verify arena: %.0f MB\n", graph_cache.arena.total() / 1e6);
+            logged = true;
+        }
+    }
     if (vdbg_dump_now) {
         std::vector<bf16> host((size_t)(c.n_layers + 1) * H);
         pf_cu(cudaMemcpy(host.data(), verify_dbg_buf, host.size() * sizeof(bf16), cudaMemcpyDeviceToHost),
