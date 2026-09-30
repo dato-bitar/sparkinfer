@@ -6130,8 +6130,10 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             ckpts_taken = true;
             for (int i = 0; i < hooks->n_ckpts; ++i) {
                 const int ck = hooks->ckpts[i];
-                prefill_range(pos, ck);
-                if (!snapshot_recurrent_state(sid, hooks->snaps[i])) ckpts_taken = false;
+                // A segment that did not complete leaves no state to snapshot at `ck` (the engine's
+                // loop stops its checkpoints there too); the rest of the prompt still prefills.
+                if (prefill_range(pos, ck) < 0 || !snapshot_recurrent_state(sid, hooks->snaps[i]))
+                    ckpts_taken = false;
                 pos = ck;
             }
             next = prefill_range(pos, n);
