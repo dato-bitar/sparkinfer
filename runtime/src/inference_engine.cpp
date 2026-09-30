@@ -336,11 +336,18 @@ ContinuousBatchEngine::SpecStats ContinuousBatchEngine::speculative_stats() cons
 }
 
 bool ContinuousBatchEngine::spec_eligible(const Request& r) {
-    // Speculation is lossless only for greedy argmax, and the verify path has none of the sampler
-    // extras. A constraint must stay on the per-token path where its mask is applied. Images need
-    // the vision splice ordinary prefill does; a prefix-cache hit starts past position 0, where the
-    // capture the draft reads would have a hole.
-    return !r.constraint && r.temperature <= 0.f && r.presence_penalty == 0.f &&
+    // A sampled request speculates too: every verify row draws its token with the request's
+    // sampler at that token's own step (SpecHooks), so the output is the one ordinary sampled
+    // decode gives. SPARKINFER_SPEC_SAMPLED=0 keeps speculation greedy-only. The verify path has
+    // none of the other sampler extras (penalties, logit bias, logprobs). A constraint must stay
+    // on the per-token path where its mask is applied. Images need the vision splice ordinary
+    // prefill does; a prefix-cache hit starts past position 0, where the capture the draft reads
+    // would have a hole.
+    static const bool sampled_on = [] {
+        const char* e = getenv("SPARKINFER_SPEC_SAMPLED");
+        return !(e && e[0] == '0');
+    }();
+    return !r.constraint && (r.temperature <= 0.f || sampled_on) && r.presence_penalty == 0.f &&
            r.frequency_penalty == 0.f && r.logit_bias.empty() && !r.logprobs &&
            r.forced_tokens.empty() && r.vision_pos.empty() && r.prefill_start == 0 &&
            !r.use_prefix_session;
@@ -360,6 +367,10 @@ void ContinuousBatchEngine::run_speculative(Job& job) {
 
     Qwen35Model::SpecHooks hooks;
     hooks.seq_id = job.seq_id;
+    hooks.temperature = job.req.temperature;
+    hooks.seed = job.req.seed;
+    hooks.top_k = job.req.top_k;
+    hooks.top_p = job.req.top_p;
     hooks.on_tokens = [&](const int* tokens, int n) -> bool {
         for (int i = 0; i < n; i++) {
             const auto t_emit = std::chrono::steady_clock::now();

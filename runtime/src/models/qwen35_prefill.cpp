@@ -7445,6 +7445,14 @@ verify_forward_done:
     // sequence, and the batched GDN block already advanced that session's conv window and
     // recurrent state in place. There is no accepted prefix to select and nothing to commit.
     if (packed) return N;
+    // A sampled request: each row's token is the one sampled decode would draw at that position.
+    // Nothing is committed yet (the KV rows past the accepted prefix are outside the sequence's
+    // length and the GDN state is only replayed below), so declining here leaves the state as it
+    // was.
+    if (s.verify_sample && !s.verify_sample(s.verify_sample_user, logits, N, out_argmax)) {
+        verify_decline("[dflash-verify] row sampling failed (N=%d) -> declined\n", N);
+        return -1;
+    }
     int keep = 1;
     while (keep < N && token_ids[keep] == out_argmax[keep - 1]) ++keep;
     if (getenv("SPARKINFER_DFLASH_VERIFY_DUMP_ROW")) {

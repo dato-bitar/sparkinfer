@@ -70,7 +70,8 @@ void launch_temperature_sample(float* logits, int n_rows, int vocab,
 // The running sum is sequential here where the old path used a CUB scan, so the top_p cut can
 // differ when a partial sum lands within float rounding of top_p * total -- a measure-zero case
 // the test counts. A row whose candidate set overflows kSrCap (a mass of identical keys above
-// the bound) writes -1 and the caller samples it the old way.
+// the bound) writes -1 and the caller samples it the old way, or, with overflow_keeps_out,
+// leaves out_id as the caller set it.
 namespace {
 constexpr int kSrThreads = 1024;
 constexpr int kSrCap = 2048;
@@ -94,7 +95,7 @@ sample_rows_topk_kernel(const float* __restrict__ logits, int vocab,
                         const unsigned long long* __restrict__ seed_u64,
                         const unsigned long long* __restrict__ step_u64,
                         const int* __restrict__ top_k_i32, const float* __restrict__ top_p_f32,
-                        int* __restrict__ out_id) {
+                        int* __restrict__ out_id, bool overflow_keeps_out) {
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
     const float T = temp_f32[row];
@@ -138,7 +139,7 @@ sample_rows_topk_kernel(const float* __restrict__ logits, int vocab,
     __syncthreads();
     const int n = s_n;
     if (n > kSrCap) {
-        if (tid == 0) out_id[row] = -1;
+        if (tid == 0 && !overflow_keeps_out) out_id[row] = -1;
         return;
     }
     int p2 = 1;
@@ -205,10 +206,12 @@ sample_rows_topk_kernel(const float* __restrict__ logits, int vocab,
 void launch_sample_rows_topk(const float* logits, int n_rows, int vocab,
                              const float* temp_f32, const unsigned long long* seed_u64,
                              const unsigned long long* step_u64, const int* top_k_i32,
-                             const float* top_p_f32, int* out_id, cudaStream_t stream) {
+                             const float* top_p_f32, int* out_id, cudaStream_t stream,
+                             bool overflow_keeps_out) {
     if (n_rows < 1) return;
     sample_rows_topk_kernel<<<n_rows, kSrThreads, 0, stream>>>(
-        logits, vocab, temp_f32, seed_u64, step_u64, top_k_i32, top_p_f32, out_id);
+        logits, vocab, temp_f32, seed_u64, step_u64, top_k_i32, top_p_f32, out_id,
+        overflow_keeps_out);
 }
 
 }  // namespace kernels

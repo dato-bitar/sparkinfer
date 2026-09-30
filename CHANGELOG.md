@@ -7,6 +7,23 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Performance
 
+- **Sampled requests decode speculatively** with DSpark (1.5x at T=0.7 and T=1.0 on Qwen3.8-27B).
+  - **Before:** only greedy requests speculated, and a request that sets no temperature takes
+    generation_config's T=1.0, so almost no chat traffic did.
+  - **Now:** the first token and every verified position are drawn with the request's own
+    sampler at that token's step -- top_k/top_p mask, temperature, Gumbel noise from Philox(seed,
+    vocab id, step), argmax -- and a proposal is kept while it equals that draw. A seeded request
+    gives the same tokens speculated or not, so this is lossless in the same sense greedy
+    speculation is. The draft proposes with the same sampler over its own logits (coupled), so its
+    proposals land on the target's draws more often. Penalties, logit bias and logprobs still
+    decode per token. `SPARKINFER_SPEC_SAMPLED=0` keeps speculation greedy-only;
+    `SPARKINFER_DFLASH_COUPLED=0` makes the draft propose argmaxes.
+  - **Measured** through `sparkinfer_server` (`eval/spec_sampled_check.py`: ModelOpt NVFP4 with
+    the DSpark draft, 6 prompts x 256 tokens, one request at a time, `SPARKINFER_DETERMINISTIC=1`),
+    against the same launch decoding sampled requests token by token: T=0.7 97.9 -> 152.9 tok/s,
+    T=1.0 98.8 -> 153.7 tok/s, every completion identical at T=0, 0.7 and 1.0. Greedy speculation
+    is unchanged (dspark_tau_check at 16K: tau 1.4713 and LOSSLESS on both).
+
 - **Packed decode samples its rows in one launch** (1.13x sampled cb-decode @c32 on Qwen3.8-27B).
   - **Before:** each sampled row ran forward_token's sampler on its own: a full-vocabulary radix
     sort for top_k/top_p, Gumbel noise over all 248K entries, then argmax, row after row. At 32

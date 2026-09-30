@@ -179,6 +179,13 @@ struct Qwen35PrefillCtx {
     // keep, or -1 to keep the argmax. Null keeps every argmax.
     int                (*multi_sample)(void* user, int i) = nullptr;
     void*                multi_sample_user = nullptr;
+    // dflash_verify_short_run (not packed): when set, it replaces the verify rows' argmax with the
+    // request's sampled tokens before the accepted prefix is chosen. `logits` is the device
+    // [n, vocab] buffer the verify head wrote (it may be masked in place); `out_ids` is the host
+    // array the argmax was read into. False on a CUDA error, which fails the verify before
+    // anything is committed.
+    bool               (*verify_sample)(void* user, float* logits, int n, int* out_ids) = nullptr;
+    void*                verify_sample_user = nullptr;
 
     // PREFIX-CACHE CHECKPOINTS TAKEN INSIDE THE PASS (one prompt, never a pack). After row
     // ckpt_rows[i] - 1 of this pass (ascending, 0 < row < N), every Gated-DeltaNet layer's scan

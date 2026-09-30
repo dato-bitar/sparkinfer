@@ -298,6 +298,15 @@ public:
     struct SpecHooks {
         uint64_t seq_id = 0;
         std::function<bool(const int* tokens, int n)> on_tokens;
+        // The request's sampler. temperature <= 0 verifies greedily. Above 0, the first token and
+        // every verified position are drawn as ordinary decode draws them -- top_k/top_p mask,
+        // Gumbel noise from Philox(seed, vocab id, step), argmax -- at step = the token's index in
+        // the response (0 for the first), and a proposal is kept while it equals that draw. A
+        // seeded request therefore produces the same tokens speculated or not.
+        float temperature = 0.f;
+        unsigned long long seed = 0;
+        int top_k = 0;
+        float top_p = 1.f;
     };
     struct SpecResume {
         bool engaged = false;   // false: nothing ran -- speculation would not pay here, or could not start

@@ -158,6 +158,7 @@ void launch_temperature_sample(float* logits, int n_rows, int vocab,
 // for every other row, so the caller samples those (greedy, top_k disabled, top_k above
 // kSampleRowsTopkMax) the old way. A handled row writes -1 in the rare case its candidate set
 // overflows (thousands of identical logits at the top_k boundary); sample it the old way too.
+// With overflow_keeps_out, such a row leaves out_id[row] as the caller set it instead.
 //
 // Only the k candidates draw noise (not the whole vocab), and no sort of the vocab is needed.
 // One exception to "the same token": the top_p cut sums the candidates' softmax numerators
@@ -170,7 +171,8 @@ __host__ __device__ inline bool sample_rows_topk_eligible(float temp, int top_k,
 void launch_sample_rows_topk(const float* logits, int n_rows, int vocab,
                              const float* temp_f32, const unsigned long long* seed_u64,
                              const unsigned long long* step_u64, const int* top_k_i32,
-                             const float* top_p_f32, int* out_id, cudaStream_t stream = nullptr);
+                             const float* top_p_f32, int* out_id, cudaStream_t stream = nullptr,
+                             bool overflow_keeps_out = false);
 
 // top_k / top_p (nucleus) truncation, applied in place BEFORE launch_temperature_sample: masks
 // logits outside the surviving set to -infinity via a full descending sort + cumulative-softmax

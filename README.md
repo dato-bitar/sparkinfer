@@ -31,8 +31,9 @@ The first run downloads both the target and
 [`gittensor-model-hub/Qwen3.8-27B-DSpark-NVFP4`](https://huggingface.co/gittensor-model-hub/Qwen3.8-27B-DSpark-NVFP4)
 into the named volume. Startup fails instead of silently serving autoregressively if the drafter
 cannot be loaded. It serves a 131,072-token context rather than 262,144: on a 32 GB card the
-full-context KV pool leaves no device memory for the drafter. Greedy, plain-text, single-active-request generations use DSpark; requests with
-vision, sampling, penalties, logprobs, or an overlapping concurrent request use the lossless
+full-context KV pool leaves no device memory for the drafter. Plain-text, single-active-request generations use DSpark, greedy or
+sampled (temperature, top_k, top_p: a seeded request gives the same tokens either way); requests with
+vision, penalties, logit bias, logprobs, or an overlapping concurrent request use the lossless
 autoregressive path. Inspect `sparkinfer_speculative_runs_total` at `/metrics` to verify use.
 
 ```bash

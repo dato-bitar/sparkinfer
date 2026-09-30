@@ -608,6 +608,17 @@ struct Qwen35Model::Impl {
     };
     PackedSampleRows* packed_samp_host = nullptr;
     PackedSampleRows* packed_samp_dev = nullptr;
+    // A sampled request's sampler while dflash_generate speculates it (see SpecHooks): each verify
+    // row i draws its token at sampler step step0 + i instead of taking the argmax.
+    struct VerifySampling {
+        bool on = false;
+        float temp = 0.f;
+        unsigned long long seed = 0;
+        int top_k = 0;
+        float top_p = 1.f;
+        unsigned long long step0 = 0;
+    };
+    VerifySampling vsamp;
 
     // Per-session parking lot for the AR decode graph.
     //
@@ -4773,6 +4784,84 @@ int Qwen35Model::max_packed_rows() {
     return cap;
 }
 
+// The per-row sampler buffers decode_packed and the speculative verify share: host and device
+// copies of every row's temperature/seed/step/top_k/top_p and its drawn id.
+template <class Impl>
+static bool ensure_packed_samp(Impl& s) {
+    if (s.packed_samp_dev) return true;
+    if (cudaHostAlloc(&s.packed_samp_host, sizeof(typename Impl::PackedSampleRows), cudaHostAllocDefault)
+        != cudaSuccess) { s.packed_samp_host = nullptr; return false; }
+    if (cudaMalloc(&s.packed_samp_dev, sizeof(typename Impl::PackedSampleRows)) != cudaSuccess) {
+        s.packed_samp_dev = nullptr;
+        return false;
+    }
+    return true;
+}
+
+// Samples rows [0, n) of `logits` ([n, vocab] on the device, left as the forward wrote them or
+// masked in place) with the parameters already in s.packed_samp_host, writing each sampled row's
+// id to packed_samp_host->out; rows with temperature <= 0 are skipped. Synchronizes the stream.
+// Returns false on a CUDA error.
+//
+// forward_token's order on each row's own logits: top_k/top_p mask, temperature noise, argmax,
+// with the Philox counter at the vocab index, so a row draws the token it would alone. Rows with
+// a top_k in range are sampled together in one launch (launch_sample_rows_topk: the same
+// survivors, key and noise, without sorting the vocab once per row -- at 32 sampled rows the
+// per-row sorts were ~3 ms of an 18.7 ms step on an RTX 5090). The rest run the per-row path on
+// forward_token's scratch, one after another. SPARKINFER_BATCHED_SAMPLER=0 samples every row alone.
+template <class Impl>
+static bool sample_rows_packed(Impl& s, float* logits, int n) {
+    const int vocab = s.cfg.vocab;
+    cudaStream_t st = s.stream;
+    auto* h = s.packed_samp_host;
+    auto* d = s.packed_samp_dev;
+    cu(cudaMemcpyAsync(d, h, sizeof(*h), cudaMemcpyHostToDevice, st), "packed sample params");
+    auto sample_row_alone = [&](int i) {
+        float* row = logits + (size_t)i * vocab;
+        if ((h->top_k[i] > 0 && h->top_k[i] < vocab) || h->top_p[i] < 1.f)
+            kernels::launch_topk_topp_mask(row, vocab, s.d_vocab_iota, s.d_sorted_logits,
+                                           s.d_sorted_idx, s.d_topk_exp, s.d_topk_cumsum,
+                                           s.d_sort_temp, s.sort_temp_bytes, s.d_scan_temp,
+                                           s.scan_temp_bytes, &d->top_k[i], &d->top_p[i],
+                                           s.d_rank_by_id, st);
+        kernels::launch_temperature_sample(row, 1, vocab, &d->temp[i], &d->seed[i], &d->step[i], st);
+        kernels::launch_argmax(row, &d->out[i], 1, vocab, st);
+    };
+    static const bool batched_on = [] {
+        const char* e = getenv("SPARKINFER_BATCHED_SAMPLER");
+        return !(e && e[0] == '0');
+    }();
+    bool any_batched = false;
+    for (int i = 0; i < n; i++) {
+        if (!(h->temp[i] > 0.f)) continue;
+        if (batched_on && kernels::sample_rows_topk_eligible(h->temp[i], h->top_k[i], vocab))
+            any_batched = true;
+        else
+            sample_row_alone(i);
+    }
+    if (any_batched)
+        kernels::launch_sample_rows_topk(logits, n, vocab, d->temp, d->seed, d->step,
+                                         d->top_k, d->top_p, d->out, st);
+    cu(cudaMemcpyAsync(h->out, d->out, (size_t)n * sizeof(int), cudaMemcpyDeviceToHost, st),
+       "packed sampled ids");
+    cudaError_t e = cudaStreamSynchronize(st);
+    cu(e, "packed sample sync");
+    if (e != cudaSuccess) return false;
+    // A batched row whose candidate set overflowed came back as -1; sample it alone. The batched
+    // kernel does not write the logits, so they are still the forward's.
+    bool redo = false;
+    for (int i = 0; i < n; i++)
+        if (h->temp[i] > 0.f && h->out[i] < 0) { sample_row_alone(i); redo = true; }
+    if (redo) {
+        cu(cudaMemcpyAsync(h->out, d->out, (size_t)n * sizeof(int), cudaMemcpyDeviceToHost, st),
+           "packed sampled ids (redo)");
+        e = cudaStreamSynchronize(st);
+        cu(e, "packed sample sync (redo)");
+        if (e != cudaSuccess) return false;
+    }
+    return true;
+}
+
 bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
                                 const uint64_t* seq_ids, int n, int* out_sampled,
                                 const PackedSampling* sampling) {
@@ -4814,14 +4903,7 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
             !sampling->top_p) return false;
         for (int i = 0; i < n && !any_sampled; i++) any_sampled = sampling->temperature[i] > 0.f;
     }
-    if (any_sampled && !s.packed_samp_dev) {
-        if (cudaHostAlloc(&s.packed_samp_host, sizeof(Impl::PackedSampleRows), cudaHostAllocDefault)
-            != cudaSuccess) { s.packed_samp_host = nullptr; return false; }
-        if (cudaMalloc(&s.packed_samp_dev, sizeof(Impl::PackedSampleRows)) != cudaSuccess) {
-            s.packed_samp_dev = nullptr;
-            return false;
-        }
-    }
+    if (any_sampled && !ensure_packed_samp(s)) return false;
     float** h_states = static_cast<float**>(s.packed_host_states);
     void**  h_convs  = static_cast<void**>(s.packed_host_convs);
     const int** h_tables = static_cast<const int**>(s.packed_host_tables);
@@ -4955,10 +5037,7 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
     // complete: returning false now would make the caller run the rows again. What is left is
     // kernel launches on buffers that already exist.
     if (any_sampled && packed_logits) {
-        const int vocab = s.cfg.vocab;
-        cudaStream_t st = s.stream;
         Impl::PackedSampleRows* h = s.packed_samp_host;
-        Impl::PackedSampleRows* d = s.packed_samp_dev;
         for (int i = 0; i < n; i++) {
             h->temp[i] = sampling->temperature[i];
             h->seed[i] = sampling->seed[i];
@@ -4966,55 +5045,7 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
             h->top_k[i] = sampling->top_k[i];
             h->top_p[i] = sampling->top_p[i];
         }
-        cu(cudaMemcpyAsync(d, h, sizeof(Impl::PackedSampleRows), cudaMemcpyHostToDevice, st),
-           "packed sample params");
-        // forward_token's order on each row's own logits: top_k/top_p mask, temperature noise,
-        // argmax. Launched with n_rows = 1 on the row, so the Philox counter is the vocab index
-        // exactly as in forward_token, and a request draws the same token packed or alone. The
-        // mask reuses forward_token's scratch; the rows run one after another on one stream.
-        auto sample_row_alone = [&](int i) {
-            float* row = packed_logits + (size_t)i * vocab;
-            if ((h->top_k[i] > 0 && h->top_k[i] < vocab) || h->top_p[i] < 1.f)
-                kernels::launch_topk_topp_mask(row, vocab, s.d_vocab_iota, s.d_sorted_logits,
-                                               s.d_sorted_idx, s.d_topk_exp, s.d_topk_cumsum,
-                                               s.d_sort_temp, s.sort_temp_bytes, s.d_scan_temp,
-                                               s.scan_temp_bytes, &d->top_k[i], &d->top_p[i],
-                                               s.d_rank_by_id, st);
-            kernels::launch_temperature_sample(row, 1, vocab, &d->temp[i], &d->seed[i], &d->step[i], st);
-            kernels::launch_argmax(row, &d->out[i], 1, vocab, st);
-        };
-        // Rows with a top_k in range are sampled together in one launch: the same survivors, the
-        // same Philox key and noise, without sorting the vocab once per row (at 32 sampled rows
-        // the per-row sorts were ~3 ms of an 18.7 ms step on an RTX 5090). The rest keep the per-
-        // row path. SPARKINFER_BATCHED_SAMPLER=0 samples every row alone.
-        static const bool batched_on = [] {
-            const char* e = getenv("SPARKINFER_BATCHED_SAMPLER");
-            return !(e && e[0] == '0');
-        }();
-        bool any_batched = false;
-        for (int i = 0; i < n; i++) {
-            if (!(h->temp[i] > 0.f)) continue;
-            if (batched_on && kernels::sample_rows_topk_eligible(h->temp[i], h->top_k[i], vocab))
-                any_batched = true;
-            else
-                sample_row_alone(i);
-        }
-        if (any_batched)
-            kernels::launch_sample_rows_topk(packed_logits, n, vocab, d->temp, d->seed, d->step,
-                                             d->top_k, d->top_p, d->out, st);
-        cu(cudaMemcpyAsync(h->out, d->out, (size_t)n * sizeof(int), cudaMemcpyDeviceToHost, st),
-           "packed sampled ids");
-        cu(cudaStreamSynchronize(st), "packed sample sync");
-        // A batched row whose candidate set overflowed came back as -1; sample it alone. The
-        // batched kernel does not write the logits, so they are still the forward's.
-        bool redo = false;
-        for (int i = 0; i < n; i++)
-            if (h->temp[i] > 0.f && h->out[i] < 0) { sample_row_alone(i); redo = true; }
-        if (redo) {
-            cu(cudaMemcpyAsync(h->out, d->out, (size_t)n * sizeof(int), cudaMemcpyDeviceToHost, st),
-               "packed sampled ids (redo)");
-            cu(cudaStreamSynchronize(st), "packed sample sync (redo)");
-        }
+        sample_rows_packed(s, packed_logits, n);
         for (int i = 0; i < n; i++)
             if (h->temp[i] > 0.f) out_sampled[i] = h->out[i];
     }
@@ -5432,6 +5463,27 @@ bool Qwen35Model::batched_forward(const int* token_ids, int n, int start_pos, bo
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
                           s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
                           nullptr, 0, nullptr, 0 };
+    if (s.vsamp.on) {
+        // Draw each verify row's token with the request's sampler at that token's own step, so
+        // the accept rule (a proposal is kept while it equals the row before's token) compares
+        // against exactly what ordinary sampled decode would emit there.
+        ctx.verify_sample = [](void* user, float* logits, int n_rows, int* out_ids) -> bool {
+            Impl& m = *static_cast<Impl*>(user);
+            if (n_rows < 1 || n_rows > kQwen35MaxPackedRows || !ensure_packed_samp(m)) return false;
+            auto* h = m.packed_samp_host;
+            for (int i = 0; i < n_rows; i++) {
+                h->temp[i] = m.vsamp.temp;
+                h->seed[i] = m.vsamp.seed;
+                h->step[i] = m.vsamp.step0 + (unsigned long long)i;
+                h->top_k[i] = m.vsamp.top_k;
+                h->top_p[i] = m.vsamp.top_p;
+            }
+            if (!sample_rows_packed(m, logits, n_rows)) return false;
+            for (int i = 0; i < n_rows; i++) out_ids[i] = h->out[i];
+            return true;
+        };
+        ctx.verify_sample_user = &s;
+    }
     const int consumed = dflash_verify_short_run(ctx, token_ids, n, start_pos,
                                                   s.dflash_layer_ids.data(), s.dflash_n_cap,
                                                   const_cast<void*>(dflash_capture_dst), out_argmax);
@@ -5684,12 +5736,26 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             if (sample) next = r;
         }
     }
+    // A sampled request's first token is drawn at step 0 from the last prompt position's logits,
+    // exactly as the engine's prefill does it (sample_seed_token), instead of the argmax.
+    const bool spec_sampled = hooks && hooks->temperature > 0.f;
+    if (spec_sampled && next >= 0 && next < s.cfg.vocab)
+        next = sample_seed_token(hooks->temperature, hooks->seed, 0, hooks->top_k, hooks->top_p);
     auto t1 = std::chrono::steady_clock::now();
     if (next < 0 || next >= s.cfg.vocab) {
         if (!hooks) close_session(sid);   // an engine session is re-prefilled by the caller
         set_dflash_capture(false, {}, 0);
         return out;
     }
+    // Every verify row samples while this is set; cleared on every way out of this function.
+    struct VerifySamplingOff {
+        Impl& m;
+        ~VerifySamplingOff() { m.vsamp.on = false; }
+    } vsamp_off{s};
+    const float sp_temp = spec_sampled ? hooks->temperature : 0.f;
+    const unsigned long long sp_seed = spec_sampled ? hooks->seed : 0ull;
+    const int sp_top_k = spec_sampled ? hooks->top_k : 0;
+    const float sp_top_p = spec_sampled ? hooks->top_p : 1.f;
 
     draft.reset();
     int start = n;
@@ -6209,6 +6275,10 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
                                 ((disarmed_run - kDraftProbeAfter) % kDraftProbePeriod) != 0;
         block[0] = next;
         for (int i = 1; i < B; i++) block[i] = mask_id;
+        // block[0] is the response's token at index out.size() (emitted below); verify row i draws
+        // the token at index out.size() + 1 + i, which ordinary decode samples at that step.
+        const unsigned long long step0 = (unsigned long long)out.size() + 1ull;
+        s.vsamp = {spec_sampled, sp_temp, sp_seed, sp_top_k, sp_top_p, step0};
 
         // The target overwrites dflash_hidden while capturing verify row zero. Preserve the
         // accepted suffix before running that target forward concurrently with the independent
@@ -6268,7 +6338,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             set_dflash_capture_row(0);
             s.defer_decode_sync = overlap_on;
             auto _tf = std::chrono::steady_clock::now();
-            p0 = forward_token(block[0], start, true);
+            p0 = forward_token(block[0], start, true, sp_temp, sp_seed, step0, sp_top_k, sp_top_p);
             if (kTiming) { t_fwd_ms += ms_since(_tf); n_fwd++; }
             s.defer_decode_sync = false;
         }
@@ -6277,6 +6347,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         // A NaN survivor means no head, and the planner falls back to the fixed depth.
         for (int i = 0; i <= active_proposal_depth; i++)
             draft_confidence[i] = std::numeric_limits<float>::quiet_NaN();
+        draft.set_sampling(sp_temp, sp_seed, step0, sp_top_k, sp_top_p);
         const bool draft_ok = draft_idle ? true : draft.forward_block(
             draft_hidden, th_len, block.data(), start, draft_ids.data(), nullptr, active_proposal_depth,
             draft_confidence.data(), th_start);
@@ -6463,7 +6534,8 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
                 if (i > 1 && confidence_gate_on && draft_confidence[i] < kConfidenceGate) break;
                 set_dflash_capture_row(i);
                 auto _tfi = std::chrono::steady_clock::now();
-                const int p = forward_token(block[i], start + i, true);
+                const int p = forward_token(block[i], start + i, true, sp_temp, sp_seed,
+                                            step0 + (unsigned long long)i, sp_top_k, sp_top_p);
                 if (kTiming) { t_fwd_ms += ms_since(_tfi); n_fwd++; }
                 if (p < 0) { vfail = true; break; }
                 posterior[i] = p;

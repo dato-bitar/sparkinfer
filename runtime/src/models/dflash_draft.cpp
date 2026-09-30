@@ -389,6 +389,23 @@ struct DFlashDraftModel::Impl {
 
     int *h_out = nullptr;
     float *d_confidence = nullptr, *h_confidence = nullptr;   // [B], confidence head output
+    // set_sampling(): the request's sampler for the next forward_block, indexed by proposal
+    // (entry 0, the seed row, is never sampled). Pinned so the per-block upload stays async.
+    static constexpr int kSampRows = 64;
+    struct DraftSampling {
+        float temp[kSampRows];
+        unsigned long long seed[kSampRows];
+        unsigned long long step[kSampRows];
+        int top_k[kSampRows];
+        float top_p[kSampRows];
+    };
+    DraftSampling* h_samp = nullptr;
+    DraftSampling* d_samp = nullptr;
+    bool samp_on = false;
+    float samp_temp = 0.f;
+    unsigned long long samp_seed = 0, samp_step0 = 0;
+    int samp_top_k = 0;
+    float samp_top_p = 1.f;
 
     // Per-layer contiguous KV cache: [max_seq, n_kv, d]
     std::vector<bf16*> k_cache, v_cache;
@@ -483,6 +500,8 @@ struct DFlashDraftModel::Impl {
         // at B: it holds the block's input ids, one per row.
         d_out = alloc<int>(B + 1);
         cu(cudaHostAlloc(&h_out, (B + 1) * sizeof(int), cudaHostAllocDefault), "h_out");
+        d_samp = reinterpret_cast<DraftSampling*>(alloc<char>(sizeof(DraftSampling)));
+        cu(cudaHostAlloc(&h_samp, sizeof(DraftSampling), cudaHostAllocDefault), "h_samp");
         // The block ids arrive in a caller-owned std::vector, i.e. PAGEABLE memory, and CUDA
         // performs a stream synchronize before a pageable H2D copy is initiated. Every other host
         // buffer on this path (h_out, h_confidence, and the verify's ph_ids/ph_pos/ph_seq) is
@@ -592,6 +611,7 @@ DFlashDraftModel::~DFlashDraftModel() {
     if (p_->h_out) cudaFreeHost(p_->h_out);
     if (p_->h_ids) cudaFreeHost(p_->h_ids);
     if (p_->h_confidence) cudaFreeHost(p_->h_confidence);
+    if (p_->h_samp) cudaFreeHost(p_->h_samp);
     if (p_->stream) cudaStreamDestroy(p_->stream);
     delete p_;
     p_ = nullptr;
@@ -1036,6 +1056,23 @@ bool ctx_gemm_enabled() {
 }  // namespace
 
 void DFlashDraftModel::ensure_quant() { if (p_) p_->ensure_quant(); }
+
+void DFlashDraftModel::set_sampling(float temperature, unsigned long long seed,
+                                    unsigned long long step0, int top_k, float top_p) {
+    static const bool coupled_on = [] {
+        const char* e = getenv("SPARKINFER_DFLASH_COUPLED");
+        return !(e && e[0] == '0');
+    }();
+    Impl& s = *p_;
+    // The vocab bound is checked per launch; here only the request's own parameters matter.
+    s.samp_on = coupled_on && s.h_samp && s.d_samp &&
+                kernels::sample_rows_topk_eligible(temperature, top_k, 1 << 30);
+    s.samp_temp = temperature;
+    s.samp_seed = seed;
+    s.samp_step0 = step0;
+    s.samp_top_k = top_k;
+    s.samp_top_p = top_p;
+}
 
 bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                                      const int* noise_ids, int pos0,
@@ -1719,6 +1756,20 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     }();
     const int head_row0 = kRowShift ? 0 : 1;
     bool head_done = false;
+    // Coupled proposals (set_sampling): proposal r draws at step step0 + r - 1, the step the
+    // target's verify row r - 1 samples at. Row 0 (the seed) is never sampled.
+    const bool couple = s.samp_on && std::max(B, kProposalDepth) < Impl::kSampRows;
+    if (couple) {
+        for (int r = 0; r <= std::max(B, kProposalDepth); r++) {
+            s.h_samp->temp[r] = r == 0 ? 0.f : s.samp_temp;
+            s.h_samp->seed[r] = s.samp_seed;
+            s.h_samp->step[r] = r == 0 ? 0ull : s.samp_step0 + (unsigned long long)(r - 1);
+            s.h_samp->top_k[r] = s.samp_top_k;
+            s.h_samp->top_p[r] = s.samp_top_p;
+        }
+        cu(cudaMemcpyAsync(s.d_samp, s.h_samp, sizeof(Impl::DraftSampling), cudaMemcpyHostToDevice, st),
+           "draft sampling params");
+    }
     if (head_mr && s.head_q8 && (s.lm_head_type == 14 || s.lm_head_type == 12)) {
         // Score only the proposal rows the verifier can consume. One row-batched quantize launch
         // instead of kProposalDepth tiny ones (8 CTAs each, so launch latency dominated them).
@@ -1839,6 +1890,13 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                     s.logits + row * Vd, Vd, s.markov_rank, st,
                     s.confidence_w ? s.markov_latent + (size_t)r * s.markov_rank : nullptr);
             kernels::launch_argmax(s.logits + row * Vd, s.d_out + r, 1, Vd, st);
+            // Coupled: the request's sampler on this row, over the argmax just written (kept if
+            // the row's candidate set overflows). The next row's bias conditions on this token.
+            if (couple)
+                kernels::launch_sample_rows_topk(s.logits + row * Vd, 1, Vd, &s.d_samp->temp[r],
+                                                 &s.d_samp->seed[r], &s.d_samp->step[r],
+                                                 &s.d_samp->top_k[r], &s.d_samp->top_p[r],
+                                                 s.d_out + r, st, /*overflow_keeps_out=*/true);
         }
         // Confidence head (optional), for every proposal row at once. It reads row r's hidden
         // state and the Markov latent that row's bias call wrote, and nothing in the chain ever
@@ -1853,6 +1911,15 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         kernels::launch_argmax(s.logits + (size_t)(head_done ? head_row0 : 0) * Vd,
                                s.d_out + (head_done ? 1 : 0),
                                head_done ? kProposalDepth : B, Vd, st);
+        if (couple) {
+            const int r0 = head_done ? 1 : 0;
+            kernels::launch_sample_rows_topk(s.logits + (size_t)(head_done ? head_row0 : 0) * Vd,
+                                             head_done ? kProposalDepth : B, Vd,
+                                             &s.d_samp->temp[r0], &s.d_samp->seed[r0],
+                                             &s.d_samp->step[r0], &s.d_samp->top_k[r0],
+                                             &s.d_samp->top_p[r0], s.d_out + r0, st,
+                                             /*overflow_keeps_out=*/true);
+        }
     }
     if (head_done)
         cu(cudaMemcpyAsync(s.h_out + 1, s.d_out + 1, kProposalDepth * sizeof(int),

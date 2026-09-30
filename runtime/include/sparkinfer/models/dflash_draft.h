@@ -100,6 +100,17 @@ public:
                        int proposals = 0, float* out_confidence = nullptr,
                        int target_hidden_start = 0);
 
+    // Couple the next forward_block's proposals to a sampled request's sampler: proposal r (1-based)
+    // becomes the token that sampler would draw from the draft's own logits -- top_k/top_p mask,
+    // temperature, Gumbel noise from Philox(seed, vocab id, step0 + r - 1) -- instead of their
+    // argmax. The target's verify draws its token at that same step with the same noise, so a
+    // draft that agrees with the target's distribution now lands on the target's sampled token.
+    // Draft-only: what is emitted is still decided by the verify, so LOSSLESS is unaffected.
+    // temperature <= 0, a top_k the batched sampler does not take (sample_rows_topk_eligible), or
+    // SPARKINFER_DFLASH_COUPLED=0 keeps the argmax.
+    void set_sampling(float temperature, unsigned long long seed, unsigned long long step0,
+                      int top_k, float top_p);
+
     // Apply target lm_head to last forward's hidden states; writes device logits [block, vocab]
     // and host argmax. Called internally by forward_block; exposed for debugging.
     const float* last_logits() const;
