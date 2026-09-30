@@ -4104,6 +4104,12 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
     // the operand is the one with MORE headroom at the moment of the decision -- the KV cache and
     // the arena are both taken afterwards. The prompt length is the signal that actually
     // separates them.
+    //
+    // Keeping it longer measured worse, not better: yielding only from 16384 tokens left the head
+    // resident through a chat workload (1,077-token prompts) and cost more in prefill than it gave
+    // back in decode -- c32 chat 1,082 -> 963 tok/s, packed prefill time +32% (its arena is carved
+    // from what the head holds), decode step 17.5 -> 17.2 ms. A shorter pass whose arena does not
+    // fit beside the head still gives it up and retries (below).
     static const int kHeadFp4YieldTokens = [] {
         const char* e = getenv("SPARKINFER_Q38_HEAD_NVFP4_YIELD_TOKENS");
         const int v = e ? atoi(e) : 1024;
@@ -4178,6 +4184,14 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
         ctx.bonsai_pf_layers = nullptr;   // freed with the shadow: the retry reads the folded legs
         ctx.bonsai_pf_rs = nullptr;
         ctx.bonsai_dec_head = nullptr;
+        seed = prefill_batched_run(ctx, prompt_ids, n, pos0);
+    }
+    // ...and the NVFP4 head, the other decode-only operand that can be given back.
+    if (seed < 0 && scratch_oom && (s.lm_head_fp4_payload || s.lm_head_fp4_sf_buf)) {
+        fprintf(stderr, "[compressed-tensors] NVFP4 lm_head released: a %d-token prefill's arena "
+                        "did not fit beside it\n", n);
+        release_lm_head_fp4();
+        scratch_oom = false;
         seed = prefill_batched_run(ctx, prompt_ids, n, pos0);
     }
     // Consume it. This is PER-REQUEST state, not model state: leaving it set would splice the
@@ -4435,7 +4449,20 @@ bool Qwen35Model::ingest_prompts_packed(const uint64_t* seq_ids, const int* cons
             ctx.ckpt_state_bytes = ck_st_bytes;
         }
         sampler.base = b;
-        if (prefill_batched_run(ctx, ids.data() + off[(size_t)b], rows, 0) < 0) return false;
+        bool oom = false;
+        ctx.scratch_oom_out = &oom;
+        int r = prefill_batched_run(ctx, ids.data() + off[(size_t)b], rows, 0);
+        // A pass whose arena did not fit ran nothing: give the NVFP4 head back and retry, as the
+        // one-prompt pass does.
+        if (r < 0 && oom && (s.lm_head_fp4_payload || s.lm_head_fp4_sf_buf)) {
+            fprintf(stderr, "[compressed-tensors] NVFP4 lm_head released: a %d-row packed "
+                            "prefill's arena did not fit beside it\n", rows);
+            release_lm_head_fp4();
+            oom = false;
+            r = prefill_batched_run(ctx, ids.data() + off[(size_t)b], rows, 0);
+        }
+        ctx.scratch_oom_out = nullptr;
+        if (r < 0) return false;
         b = e;
     }
     // The trimmed prompt's last tokens, one decode step each on its own session; its seed is the
@@ -4596,6 +4623,11 @@ uint64_t Qwen35Model::open_session(int num_tokens, bool* alloc_failed,
         // The decode shadow is a cache of weights decode can also read folded: a request that
         // cannot get its state takes the shadow's VRAM, once, rather than failing.
         if (attempt == 0 && release_bonsai_shadow(s)) continue;
+        if (attempt <= 1 && (s.lm_head_fp4_payload || s.lm_head_fp4_sf_buf)) {
+            fprintf(stderr, "[compressed-tensors] NVFP4 lm_head released for a session's state\n");
+            release_lm_head_fp4();
+            continue;
+        }
         break;
     }
     if (!alloc_ok) {

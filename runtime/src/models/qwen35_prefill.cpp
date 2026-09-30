@@ -5385,6 +5385,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // The decode shadow's weights are baked into a packed graph; release_bonsai_shadow frees
     // them, and the null this then reads as must not replay a graph that still points there.
     static thread_local const void* graph_shadow_key = nullptr;
+    // The NVFP4 LM head a wide packed pass reads (see kHeadGemmMinRows). It can be released at
+    // runtime (Qwen35Model::release_lm_head_fp4) to give a prefill its arena, and a graph
+    // recorded while it was resident would then replay against freed memory.
+    static thread_local const void* graph_head4_key = nullptr;
     static thread_local const void* verify_head_key = nullptr;
     static thread_local signed char* verify_head_i8 = nullptr;
     static thread_local float* verify_head_scale = nullptr;
@@ -5812,7 +5816,8 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     if (!s.verify_eager && (graph_model_key != s.w.lm_head || graph_state_key != state_key ||
         graph_conv_key != conv_key || graph_capture_key != capture_dst ||
         graph_btable_key != btable_key || graph_seq_key != seq_key || graph_ns_key != ns ||
-        graph_shadow_key != (const void*)s.bonsai_dec_layers)) {
+        graph_shadow_key != (const void*)s.bonsai_dec_layers ||
+        graph_head4_key != (const void*)s.w.lm_head_fp4)) {
         for (int t = 1; t <= kVerifyMaxRows; t++) {
             if (verify_exec[t]) cudaGraphExecDestroy(verify_exec[t]);
             if (verify_graph[t]) cudaGraphDestroy(verify_graph[t]);
@@ -5828,6 +5833,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         graph_seq_key = seq_key;
         graph_ns_key = ns;
         graph_shadow_key = s.bonsai_dec_layers;
+        graph_head4_key = s.w.lm_head_fp4;
     }
     if (!s.verify_eager && graph_ready_t[N] && capture_only) return 0;   // this tier is already built
     if (!s.verify_eager && graph_ready_t[N]) {

@@ -48,6 +48,13 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Fixed
 
+- **A wide packed-decode graph no longer outlives the NVFP4 LM head it reads.** A prefill of 1,024+
+  tokens gives the head back (`release_lm_head_fp4`) to fit its scratch arena, but the verify
+  graph cache was not keyed on it, so a graph recorded at 16+ rows while the head was resident
+  kept replaying against the freed buffer -- correct only while nothing reused that memory.
+  The cache now drops its graphs when the head changes. A prefill or a session whose allocation
+  fails beside the head also gives it back and retries.
+
 - **A verify pass that did not record a CUDA graph began one anyway.** `dflash_verify_short_run`'s
   `if (recording)` guarded the FP8 memset loop instead of `cudaStreamBeginCapture`, so a
   non-recording pass left the stream capturing and every later call on it failed ("operation not
