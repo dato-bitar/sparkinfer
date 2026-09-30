@@ -4637,7 +4637,9 @@ int Qwen35Model::prefill_batched_resume(const int* prompt_ids, int start, int en
     // -- takes the verify path's one forward (ingest_tail_rows), as the tail of an aligned pass
     // does, instead of a whole prefill pass of its own: that pass ran every layer's batched arms
     // for a handful of rows and was ~70 ms of each chat request's prefill under load.
-    if (n <= 8 && !want_seed_logprob) {
+    // Scoped like the aligned pass's own tail (prefill_batched): NVFP4 checkpoints, whose verify
+    // path this is measured on; the other stacks keep the pass.
+    if (n <= 8 && !want_seed_logprob && !s.w.layers.empty() && s.w.layers[0].gate_fp4) {
         const int seed = ingest_tail_rows(prompt_ids + start, n, start);
         if (seed >= 0 && seed < s.cfg.vocab) {
             if (out_done) *out_done = n;
