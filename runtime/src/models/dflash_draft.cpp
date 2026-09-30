@@ -941,6 +941,15 @@ bool DFlashDraftModel::load(const std::string& dir) {
         if (!pc) pc = optional("candidate_selector.predecessor_codebook.weight");
         auto* sc = optional("candidate_selector.successor_codebook");
         if (!sc) sc = optional("candidate_selector.successor_codebook.weight");
+        // DFlash2 always runs its whole block, and the batched GEMVs its conv and selector
+        // projections use run 16 rows for any width they are not instantiated for -- past the end
+        // of buffers sized for block_size. Only those widths load.
+        const int bs = s.cfg.block_size;
+        const bool bs_ok = bs == 16 || bs == 8 || bs == 7 || bs == 6 || bs == 5 || bs == 4 || bs == 2;
+        if (!bs_ok) {
+            fprintf(stderr, "[dflash] DFlash2 block_size %d is not a batched width (2, 4-8, 16)\n", bs);
+            return false;
+        }
         if (!hp || !pc || !sc || s.cfg.conv_kernel < 1 || s.cfg.conv_group < 1 ||
             s.cfg.selector_top_k < 1 ||
             s.cfg.selector_top_k > std::min(kernels::kSampleRowsTopkMax, dflash_kernels::kSelectorTopkMax)) {
