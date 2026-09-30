@@ -102,6 +102,7 @@ struct ContinuousBatchEngine::Job {
     // Prefix cache: tokens this job started from rather than prefilled, and the recurrent-state
     // snapshots taken at req.cache_checkpoints (offered to the cache in finish_job_impl).
     int cached_tokens = 0;
+    int mixed_tokens = 0;      // prompt tokens mixed steps have ingested (step_jobs_packed)
     struct Checkpoint {
         int pos = 0;
         Qwen35Model::RecurrentStateSnapshot state;
@@ -762,7 +763,9 @@ void ContinuousBatchEngine::worker_loop() {
         const bool mix_decode = !decode_ids.empty();
         // One packed forward for the whole decode batch when every row is eligible; otherwise the
         // original one-forward-per-sequence loop, unchanged.
-        if (!step_jobs_packed(decode_ids, any_finished)) {
+        int mix_max = 0, mixed = 0;
+        Job* mix_job = mix_decode ? pick_mixed_chunk(prefill_ids, &mix_max) : nullptr;
+        if (!step_jobs_packed(decode_ids, any_finished, mix_job, mix_max, &mixed)) {
             for (uint64_t id : decode_ids) {
                 Job* job = nullptr;
                 {
@@ -777,6 +780,20 @@ void ContinuousBatchEngine::worker_loop() {
         // filling (see Scheduler::schedule). They run back to back on this thread, which is the
         // point: each one widens the next decode step, and a decode step's cost is almost all
         // fixed weight read.
+        // A mixed step already advanced one prompt with the decode rows riding along. The other
+        // prefills wait for the next steps (running them now would stall the decode batch again);
+        // the mixed prompt itself continues here only once what is left is small.
+        if (mixed > 0) {
+            static constexpr int kMixFinish = 64;
+            std::vector<uint64_t> keep;
+            const int left = (int)mix_job->req.prompt.size() - mix_job->prefill_pos;
+            int next_ck = 0;
+            for (int ck : mix_job->req.cache_checkpoints)
+                if (ck > mix_job->prefill_pos) next_ck = next_ck ? std::min(next_ck, ck) : ck;
+            const int to_boundary = next_ck ? next_ck - mix_job->prefill_pos : left;
+            if (left <= kMixFinish || to_boundary < 128) keep.push_back(mix_job->request_id);
+            prefill_ids.swap(keep);
+        }
         step_prefills_packed(prefill_ids);
         for (uint64_t pid : prefill_ids) {
             Job* job = nullptr;
@@ -858,7 +875,49 @@ void ContinuousBatchEngine::finish_job_impl(Job& j) {
 // generation_config (temperature 1.0 on Qwen3.8), almost every server request then decoded one
 // forward per sequence: aggregate throughput stayed at single-stream speed at any concurrency.
 // A declined batch just falls back to the sequential loop.
-bool ContinuousBatchEngine::step_jobs_packed(const std::vector<uint64_t>& ids, bool& any_finished) {
+// MIXED STEPS (SPARKINFER_MIXED_CHUNK=<tokens>, 0 = off, the default for now). While requests
+// decode and a prompt waits, the decode step carries the next chunk of that prompt in the same
+// forward: the decode rows ride the chunk's weight reads instead of stalling behind a prefill
+// pass of their own. The chunk never finishes its prompt -- the last tokens, and any prefix-cache
+// checkpoint boundary, stay with step_job, which owns the seed, the checkpoints and the first
+// token's bookkeeping.
+ContinuousBatchEngine::Job* ContinuousBatchEngine::pick_mixed_chunk(const std::vector<uint64_t>& prefill_ids, int* chunk_max) {
+    static const int budget = [] {
+        const char* e = getenv("SPARKINFER_MIXED_CHUNK");
+        return e ? std::max(0, atoi(e)) : 0;
+    }();
+    // Below this much prompt a chunk is not worth a mixed pass; step_job takes it.
+    static constexpr int kMinChunk = 128;
+    *chunk_max = 0;
+    if (budget < kMinChunk || !model_) return nullptr;
+    std::lock_guard<std::mutex> lock(mu_);
+    for (uint64_t id : prefill_ids) {
+        auto it = jobs_.find(id);
+        if (it == jobs_.end() || it->second->done) continue;
+        Job* j = it->second.get();
+        const Request& r = j->req;
+        if (j->phase != SeqPhase::PREFILL || j->seq_id == 0 || r.use_prefix_session) continue;
+        if (!r.vision_pos.empty() || !r.mrope_pos.empty() || !r.forced_tokens.empty() ||
+            !r.logit_bias.empty())
+            continue;
+        const int n = (int)r.prompt.size();
+        // Up to the next prefix-cache checkpoint (step_job snapshots there), and never the last
+        // token of the prompt.
+        int limit = n - 1;
+        if (prefix_cache_ && r.prefix_cache)
+            for (int ck : r.cache_checkpoints)
+                if (ck > j->prefill_pos && ck < limit) limit = ck;
+        const int avail = limit - j->prefill_pos;
+        if (avail < kMinChunk) continue;
+        *chunk_max = std::min(avail, budget);
+        return j;
+    }
+    return nullptr;
+}
+
+bool ContinuousBatchEngine::step_jobs_packed(const std::vector<uint64_t>& ids, bool& any_finished,
+                                             Job* chunk_job, int chunk_max, int* chunk_done) {
+    if (chunk_done) *chunk_done = 0;
     static const bool enabled = [] {
         const char* e = getenv("SPARKINFER_PACKED_DECODE");
         return !(e && e[0] == '0');
@@ -869,7 +928,7 @@ bool ContinuousBatchEngine::step_jobs_packed(const std::vector<uint64_t>& ids, b
     // more than never packing at all: measured on RTX 5090 / Qwen3.8-27B-NVFP4, aggregate went
     // 334.9 tok/s at concurrency 8 to 79.0 at 12 -- a 4.2x collapse one request past the cap.
     const int cap = Qwen35Model::max_packed_rows();
-    if ((int)ids.size() < 2) return false;
+    if ((int)ids.size() < (chunk_job ? 1 : 2)) return false;
     const Qwen35Config& cfg = model_->config();
 
     std::vector<Job*> jobs;
@@ -970,7 +1029,24 @@ bool ContinuousBatchEngine::step_jobs_packed(const std::vector<uint64_t>& ids, b
         samp.top_k = top_k.data();
         samp.top_p = top_p.data();
         bool ok = false;
-        if (m >= 2)
+        // The first group carries the prompt chunk: rows + chunk a multiple of 8 (the NVFP4 GEMMs'
+        // row granule), else the pass would take the slow unaligned arm on every layer.
+        if (off == 0 && chunk_job && chunk_done) {
+            int len = chunk_max - (int)((m + (size_t)chunk_max) % 8);
+            if (len >= 64) {
+                int seed = -1;
+                ok = model_->mixed_step(toks.data(), pos.data(), seqs.data(), (int)m, out.data(),
+                                        any_sampled ? &samp : nullptr, chunk_job->seq_id,
+                                        chunk_job->req.prompt.data() + chunk_job->prefill_pos,
+                                        chunk_job->prefill_pos, len, &seed);
+                if (ok) {
+                    chunk_job->prefill_pos += len;
+                    chunk_job->mixed_tokens += len;
+                    *chunk_done = len;
+                }
+            }
+        }
+        if (!ok && m >= 2)
             ok = model_->decode_packed(toks.data(), pos.data(), seqs.data(), (int)m, out.data(),
                                        any_sampled ? &samp : nullptr);
         if (!ok) {
@@ -1286,7 +1362,8 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
             seed = model_->ingest_prompt_range(job.req.prompt.data(), pos, n, chunk_limit, &out_pos,
                                                want_seed_logprob,
                                                /*allow_batched_resume=*/pos > 0 &&
-                                                   (pos != job.prefill_pos || job.cached_tokens > 0));
+                                                   (pos != job.prefill_pos || job.cached_tokens > 0 ||
+                                                    job.mixed_tokens > 0));
         }
         if (has_vision) model_->clear_pending_vision();
         // Positions are consumed by the prefill they were staged for; the offset is not cleared
