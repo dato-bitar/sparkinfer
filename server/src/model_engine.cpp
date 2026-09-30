@@ -407,7 +407,10 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
         };
         const char* on = getenv("SPARKINFER_PREFIX_CACHE");
         const bool wanted = !(on && on[0] == '0');
-        if (wanted && sparkinfer::deterministic_mode()) {
+        // SPARKINFER_PREFIX_CACHE=1 keeps it on under SPARKINFER_DETERMINISTIC=1, for a check that
+        // replays the same request sequence on several launches and so the same cache hits.
+        const bool forced = on && on[0] == '1';
+        if (wanted && !forced && sparkinfer::deterministic_mode()) {
             fprintf(stderr, "[sparkinfer-server] prefix cache: off (SPARKINFER_DETERMINISTIC=1 -- a "
                             "request's output may not depend on what earlier requests cached)\n");
         } else if (wanted) {

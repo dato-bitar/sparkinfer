@@ -415,6 +415,10 @@ struct DFlashDraftModel::Impl {
     // the widest K any projection uses (the FFN's intermediate).
     void* xq81 = nullptr;
 
+    // The first sequence position this generation's context starts at: the first block's
+    // target_hidden_start (see forward_block). Nothing before it was ever projected into the KV
+    // cache -- a prefix-cache hit prefilled only past it -- so no layer may attend there.
+    int ctx_floor = 0;
     int *h_out = nullptr;
     float *d_confidence = nullptr, *h_confidence = nullptr;   // [B], confidence head output
     // DFlash2's candidate selector: hidden_projection [rank, H] and the two [vocab, rank]
@@ -751,7 +755,7 @@ void DFlashDraftModel::set_shared_weights(const void* embed, const void* lm_head
     }
 }
 
-void DFlashDraftModel::reset() { p_->seq_len = 0; }
+void DFlashDraftModel::reset() { p_->seq_len = 0; p_->ctx_floor = 0; }
 
 
 void DFlashDraftModel::crop(int keep) {
@@ -1309,6 +1313,9 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     auto q81 = [&](const bf16* src, int kk) { return q81n(src, kk, BW); };
     const float scale = 1.f / sqrtf((float)d);
     const int past = s.seq_len;
+    if (past == 0) s.ctx_floor = std::max(0, target_hidden_start);
+    // How many of this block's context rows sit below the floor: never produced, never attended.
+    const int floor_skip = std::max(0, std::min(ctx_len, s.ctx_floor - past));
     // The fixed-size (block_size) projections below can use a batched-GEMV kernel that reads
     // each weight row from DRAM once instead of once per token (see dflash_kernels.cu). It's
     // instantiated for the active width tiers below; an unsupported width falls back to the
@@ -1473,6 +1480,7 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                                                           c.n_kv_heads, d, pos0, 0, maxwin);
             fc_skip = lo > past ? (lo - past < ctx_len ? lo - past : ctx_len) : 0;
         }
+        fc_skip = std::max(fc_skip, floor_skip);
     }
     const int fc_rows = ctx_len - fc_skip;
     // Route the two remaining BF16 weight reads in this block -- the projector above and the
@@ -1604,7 +1612,7 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
             ? dflash_kernels::attn_gqa_kv_lo(BW, kv_len_for_block, c.n_q_heads, c.n_kv_heads, d,
                                              q_pos0_for_block, /*k_pos0=*/0, window_of_layer)
             : 0;
-        const int ctx_skip = ctx_kv_lo > past ? std::min(ctx_kv_lo - past, ctx_len) : 0;
+        const int ctx_skip = std::max(floor_skip, ctx_kv_lo > past ? std::min(ctx_kv_lo - past, ctx_len) : 0);
         const int ctx_rows = ctx_len - ctx_skip;
         const bf16* const ctx_src = s.target_proj + (size_t)ctx_skip * H;
         bf16* const kdst_ctx = kdst + (size_t)ctx_skip * kvdim;
@@ -1726,9 +1734,13 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                             (c.is_causal >= 0 ? c.is_causal != 0
                                               : (mixed_causal && L < (int)c.sliding_layers.size() &&
                                                  c.sliding_layers[L]));
-        dflash_kernels::launch_attn_gqa(s.q, s.k_cache[L], s.v_cache[L], s.attn,
-                                        BW, kv_len, c.n_q_heads, c.n_kv_heads, d,
-                                        q_pos0, /*k_pos0_cache=*/0, window, causal, scale, st,
+        // Keys start at the context floor (0 unless a prefix-cache hit left the start unprojected):
+        // the cache slice from there, with its first key at that position.
+        const int kv0 = std::min(s.ctx_floor, kv_len);
+        dflash_kernels::launch_attn_gqa(s.q, s.k_cache[L] + (size_t)kv0 * kvdim,
+                                        s.v_cache[L] + (size_t)kv0 * kvdim, s.attn,
+                                        BW, kv_len - kv0, c.n_q_heads, c.n_kv_heads, d,
+                                        q_pos0, /*k_pos0_cache=*/kv0, window, causal, scale, st,
                                         s.fa_m, s.fa_l, s.fa_acc);
 
         if (fast16) {

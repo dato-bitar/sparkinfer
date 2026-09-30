@@ -428,14 +428,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // layer loop would leave the Gated-DeltaNet state advanced for the layers already done and not
     // for the rest, and nothing downstream can tell that apart from a clean state or undo it.
     if (pos0 < 0) return -1;
-    if (pos0 != 0) {
-        // Muse used to refuse here because its rolling-window attention took the window and the
-        // causal bound from the LOCAL row index, which is only the sequence position on a pass
-        // that starts at zero. Both Muse kernels now take q_pos0 and mask on the absolute
-        // position, so a windowed ingest is exact -- and above prefill_single_pass_max_tokens()
-        // that is the difference between the batched path and the token loop for the WHOLE prompt.
-        if (s.capture_dst && s.capture_layers && s.n_capture > 0) return -1;  // DSpark capture rows
-    }
+    // Muse used to refuse pos0 != 0 here because its rolling-window attention took the window and
+    // the causal bound from the LOCAL row index, which is only the sequence position on a pass
+    // that starts at zero. Both Muse kernels now take q_pos0 and mask on the absolute position, so
+    // a windowed ingest is exact -- and above prefill_single_pass_max_tokens() that is the
+    // difference between the batched path and the token loop for the WHOLE prompt. A DSpark
+    // hidden-state capture refused it too; it now writes each row at its sequence position.
 
     // A pass that starts at position zero must start its recurrent GDN state from zero,
     // just like forward_token(position=0). Session buffers come from cudaMalloc and may reuse pages
@@ -4546,10 +4544,14 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         if (capture_dflash) {
             for (int slot = 0; slot < s.n_capture; ++slot) {
                 if (s.capture_layers[slot] != L) continue;
-                const int first = std::max(0, s.capture_start);
+                // capture_start is a sequence position and the destination's row 0 is that
+                // position; a pass that starts at pos0 (a window, or a prefix-cache resume) writes
+                // its rows at pos0 + i - capture_start.
+                const int first = std::max(0, s.capture_start - pos0);
                 if (first >= N) continue;
                 char* dst = static_cast<char*>(s.capture_dst) +
-                            (size_t)slot * H * sizeof(bf16);
+                            ((size_t)(pos0 + first - s.capture_start) * s.n_capture + slot) * H *
+                                sizeof(bf16);
                 dflash_kernels::launch_capture_rows(
                     x + (size_t)first * H, dst, N - first, H, s.n_capture * H, st);
             }

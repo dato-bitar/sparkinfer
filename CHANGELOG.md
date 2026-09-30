@@ -7,6 +7,36 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Added
 
+- **A multi-turn chat speculates on every turn and reuses its cached prefix** (time to first
+  token 487 -> 120 ms on ~7K-token conversations, Qwen3.8-27B with DSpark).
+  - **Before:** a speculated prompt took no prefix-cache checkpoints, so the next turn of the
+    same conversation missed the cache and re-prefilled everything; and a prompt that did hit the
+    cache was not speculated at all.
+  - **Now:** a cache hit speculates. Prefill resumes past the cached prefix with hidden-state
+    capture, and the draft drafts from the rows it has (its attention starts at the first
+    captured position). The speculative prefill takes the prompt's checkpoints exactly as the
+    ordinary prefill does -- one pass that snapshots at each, or a pass per segment where that
+    declines -- and the prefill's token is sent before the verify graphs are recorded.
+    `SPARKINFER_SPEC_PREFIX_HIT=0` restores the old behaviour.
+  - **Measured** (`eval/spec_multiturn_check.py`: 3 conversations x 4 turns, T=0 and 0.7, one
+    request at a time, ModelOpt NVFP4 + DSpark): ~7K-token prompts, TTFT p50 483-491 -> 120-148
+    ms, decode 134-140 -> 127-131 tok/s on a hit (the draft sees only the uncached part); ~1.6K
+    prompts, TTFT unchanged. Every completion identical to the same launch with speculation off.
+
+### Fixed
+
+- **A speculated prompt prefilled on the slow path, and not with ordinary decode's arithmetic.**
+  Hidden-state capture kept a prompt off the 8-aligned body + tail split, so a prompt of 128+
+  tokens whose length is not a multiple of 8 ran every layer on the unaligned NVFP4 fallback
+  (TTFT 282 vs 83 ms at ~1.4K tokens), and a prompt with a checkpoint segment under 16 tokens
+  skipped the per-segment split the ordinary prefill takes. Either made greedy and seeded
+  speculative output differ from ordinary decode after a few hundred tokens. Capture now takes
+  both, a pass that starts past zero records its rows at their positions, and the tail's verify
+  forward writes its rows straight into the draft's context.
+- `SPARKINFER_SPECULATIVE=0` keeps the draft loaded but decodes every request token by token (the
+  A/B reference), and `SPARKINFER_PREFIX_CACHE=1` keeps the prefix cache on under
+  `SPARKINFER_DETERMINISTIC=1`.
+
 - **DFlash2 drafter** (z-lab `Qwen3.8-27B-DFlash2`), opt-in beside DSpark: sampled requests
   1.78x plain decode against DSpark's 1.57x on Qwen3.8-27B.
   - **What it runs:** the checkpoint is recognised by its architecture. Each attention and MLP

@@ -4053,7 +4053,9 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
     // 1-7 tokens through forward_token: the decode step, ~10 ms each, and the arithmetic every
     // later token gets anyway. A prefix-cache checkpoint always falls inside the body (it is at
     // least 16 tokens short of the end). Not for a pass with image or MRoPE staging, whose rows
-    // are the whole prompt's, or a DSpark hidden-state capture, which records the pass itself.
+    // are the whole prompt's. A DSpark hidden-state capture splits the same way -- the body pass
+    // records its rows at their positions and the tail's go straight to the context buffer -- so a
+    // speculated prompt prefills with the arithmetic, and at the speed, of an ordinary one.
     // Split this way, prefill tok/s at 131 / 262 / 518 / 1030 / 2054 / 4102 / 8210 tokens went
     // 1,297 -> 2,242 / 2,372 -> 2,925 / 3,817 -> 4,886 / 5,455 -> 7,813 / 7,281 -> 10,914 /
     // 7,291 -> 13,039 / 7,574 -> 14,350; 135 (the worst tail, seven decode steps behind a 128-row
@@ -4066,7 +4068,7 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
     }();
     const int body = n & ~7;
     if (align8_min > 0 && body >= align8_min && body < n && !s.w.layers.empty() &&
-        s.w.layers[0].gate_fp4 && !s.d_vision_emb && !s.d_mrope_pos && !s.dflash_capture) {
+        s.w.layers[0].gate_fp4 && !s.d_vision_emb && !s.d_mrope_pos) {
         if (prefill_batched(prompt_ids, body, false, pos0) < 0) return -1;   // nothing landed
         // One forward for the whole tail where the verify path takes it (ingest_tail_rows);
         // decode steps otherwise. A seed whose logprob is wanted keeps the decode steps.
@@ -4075,7 +4077,11 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
             if (tail_seed >= 0 && tail_seed < s.cfg.vocab) return tail_seed;
         }
         int seed = -1;
-        for (int i = body; i < n; ++i) seed = forward_token(prompt_ids[i], pos0 + i, i + 1 == n);
+        for (int i = body; i < n; ++i) {
+            if (s.dflash_capture) set_dflash_capture_row(0);
+            seed = forward_token(prompt_ids[i], pos0 + i, i + 1 == n);
+            if (s.dflash_capture) dflash_stash_capture(pos0 + i);   // the rows a draft reads
+        }
         // The last step counted its pick toward presence/frequency penalties, which a batched
         // prefill's seed never is: take that one count back so the request sees the same counts
         // whichever way its prompt was split. forward_token has synchronized its stream.
@@ -4552,7 +4558,7 @@ int Qwen35Model::prefill_batched_chunked(const int* prompt_ids, int n, bool want
         const int seed = prefill_batched(prompt_ids + pos, len, want_seed_logprob && last, pos);
         prefill_hold_arena(false);
         // A window that declines -- a path with no start position (Muse's rolling-window
-        // attention, a DSpark capture), or a scratch allocation that failed even at window size
+        // attention), or a scratch allocation that failed even at window size
         // -- leaves [0, pos) correct in the cache and stops there: the caller finishes the rest
         // token by token rather than recomputing what already landed.
         if (seed < 0) return -1;
@@ -5792,7 +5798,13 @@ int Qwen35Model::ingest_tail_rows(const int* token_ids, int n, int pos0) {
     }();
     std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
     Impl& s = *p_;
-    if (!on || !token_ids || n < 1 || n > 8 || s.dflash_capture || s.d_vision_emb || s.d_mrope_pos)
+    if (!on || !token_ids || n < 1 || n > 8 || s.d_vision_emb || s.d_mrope_pos)
+        return -1;
+    // A speculative prefill captures the target's hidden states for the draft: the rows go straight
+    // into the context buffer at their positions (the verify capture writes the same row layout).
+    const bool cap = s.dflash_capture;
+    if (cap && (!s.dflash_context || s.dflash_n_cap <= 0 || pos0 < s.dflash_ctx_start ||
+                pos0 + n - s.dflash_ctx_start > s.dflash_ctx_cap))
         return -1;
     auto it = s.sessions.find(s.active_seq_id);
     if (s.active_seq_id == 0 || it == s.sessions.end() || it->second.logit_bias_set ||
@@ -5817,8 +5829,13 @@ int Qwen35Model::ingest_tail_rows(const int* token_ids, int n, int pos0) {
     ctx.verify_commit_all = true;
     ctx.verify_logits_out = &rows_logits;
     std::vector<int> out((size_t)n, -1);
-    const int consumed = dflash_verify_short_run(ctx, token_ids, n, pos0, nullptr, 0, nullptr,
-                                                  out.data());
+    void* cap_dst = cap ? static_cast<void*>(s.dflash_context + (size_t)(pos0 - s.dflash_ctx_start) *
+                                                                  s.dflash_n_cap * s.cfg.hidden)
+                        : nullptr;
+    const int consumed = dflash_verify_short_run(ctx, token_ids, n, pos0,
+                                                  cap ? s.dflash_layer_ids.data() : nullptr,
+                                                  cap ? s.dflash_n_cap : 0, cap_dst, out.data());
+    if (consumed == n && cap) s.dflash_ctx_len = std::max(s.dflash_ctx_len, pos0 + n);
     if (consumed != n || !rows_logits) return consumed == n ? out[(size_t)n - 1] : -1;
     cu(cudaMemcpyAsync(s.logits, rows_logits + (size_t)(n - 1) * s.cfg.vocab,
                        (size_t)s.cfg.vocab * sizeof(float), cudaMemcpyDeviceToDevice, s.stream),
@@ -6001,6 +6018,11 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     } else if ((int)prompt.size() >= 12288) {
         capture_start = (int)prompt.size() - 4096;
     }
+    // A prefix-cache hit prefills from hooks->prefill_start: nothing before it passes through the
+    // target, so there is nothing to capture there, and the draft reads context from here on.
+    const int prefill_from = hooks ? std::max(0, hooks->prefill_start) : 0;
+    if (prefill_from >= (int)prompt.size()) return out;
+    capture_start = std::max(capture_start, prefill_from);
     if (hooks) {
         // Past its max_seq the draft's forward_block fails mid-generation, so do not start what
         // cannot finish. The bound is on ABSOLUTE positions, the whole prompt plus everything
@@ -6063,17 +6085,59 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     s.final_seqlen_hint = hooks ? -1 : n + max_new;
     auto t0 = std::chrono::steady_clock::now();
     int next = -1;
-    int batched_done = 0;
-    if (batched_prefill_windowed_enabled(s.gguf, s.cfg, n, s.kv))
-        next = prefill_batched_chunked(prompt.data(), n, false, &batched_done);
-    if (next < 0) {
-        for (int i = batched_done; i < n; i++) {
-            set_dflash_capture_row(0);
-            const bool sample = (i + 1 == n);
-            int r = forward_token(prompt[i], i, sample);
-            dflash_stash_capture(i);
-            if (sample) next = r;
+    bool ckpts_taken = false;
+    // Prefill [a, b) with hidden-state capture, continuing whatever KV and state are in place at
+    // `a`: the batched pass from zero or a resumed one past it, then the token loop for anything a
+    // pass left over. Returns the last position's argmax. The same passes ingest_prompt_range runs
+    // for an ordinary request's range, so the two land on the same numbers.
+    auto prefill_range = [&](int a, int b) -> int {
+        int r = -1;
+        int done = a;
+        if (a == 0 && batched_prefill_windowed_enabled(s.gguf, s.cfg, b, s.kv)) {
+            int d = 0;
+            r = prefill_batched_chunked(prompt.data(), b, false, &d);
+            done = d;
+        } else if (a > 0 && batched_prefill_windowed_enabled(s.gguf, s.cfg, b - a, s.kv)) {
+            int d = 0;
+            r = prefill_batched_resume(prompt.data(), a, b, false, &d);
+            done = a + d;
         }
+        if (r < 0) {
+            for (int i = done; i < b; i++) {
+                set_dflash_capture_row(0);
+                const bool sample = (i + 1 == b);
+                const int t = forward_token(prompt[i], i, sample);
+                dflash_stash_capture(i);
+                if (sample) r = t;
+            }
+        }
+        return r;
+    };
+    if (hooks && hooks->n_ckpts > 0 && hooks->ckpts && hooks->snaps) {
+        // The caller's prefix-cache checkpoints, taken exactly as the engine's own prefill takes
+        // them: one pass that snapshots the recurrent state at each (ingest_prompt_checkpointed),
+        // or -- where that declines, e.g. a segment under its 16-token minimum -- a pass per
+        // segment with a snapshot between. The split changes the arithmetic, so matching the
+        // engine's choice is what keeps a speculated request's tokens those of ordinary decode.
+        int done = prefill_from;
+        next = ingest_prompt_checkpointed(prompt.data(), prefill_from, n, hooks->ckpts,
+                                          hooks->n_ckpts, hooks->snaps, &done, false);
+        if (next >= 0 && done == n) {
+            ckpts_taken = true;
+        } else {
+            // A declined pass ran nothing.
+            int pos = prefill_from;
+            ckpts_taken = true;
+            for (int i = 0; i < hooks->n_ckpts; ++i) {
+                const int ck = hooks->ckpts[i];
+                prefill_range(pos, ck);
+                if (!snapshot_recurrent_state(sid, hooks->snaps[i])) ckpts_taken = false;
+                pos = ck;
+            }
+            next = prefill_range(pos, n);
+        }
+    } else {
+        next = prefill_range(prefill_from, n);
     }
     // A sampled request's first token is drawn at step 0 from the last prompt position's logits,
     // exactly as the engine's prefill does it (sample_seed_token), instead of the argmax.
@@ -6083,9 +6147,14 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     auto t1 = std::chrono::steady_clock::now();
     if (next < 0 || next >= s.cfg.vocab) {
         if (!hooks) close_session(sid);   // an engine session is re-prefilled by the caller
+        // ...from where it started, which for a prefix-cache hit is past zero: its recurrent state
+        // is restored only there, and this prefill may have advanced it. Fail the request rather
+        // than let it be prefilled again from a state that is no longer the prefix's.
+        if (hooks && prefill_from > 0 && resume) { resume->engaged = true; resume->failed = true; }
         set_dflash_capture(false, {}, 0);
         return out;
     }
+    if (resume) resume->ckpts_taken = ckpts_taken;
     // Every verify row samples while this is set; cleared on every way out of this function.
     struct VerifySamplingOff {
         Impl& m;
@@ -6402,6 +6471,21 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         draft.reset();
         return out;
     }
+    // Engine-driven: the prefill's token is final, so hand it over now instead of after the verify
+    // graphs are recorded and the first draft and verify have run -- that was ~100 ms of every
+    // speculated request's time to first token. The first step then emits its block from row 1
+    // (pre_emitted). A run that ends before that step completes ingests the token itself below, so
+    // the caller resumes exactly where ordinary decode would.
+    int pre_emitted = 0;
+    bool early_eos = false, early_stop = false;
+    if (hooks) {
+        out.push_back(next);
+        pre_emitted = 1;
+        early_eos = !ignore_eos && (next == s.cfg.eos_id || (s.cfg.eos_id2 >= 0 && next == s.cfg.eos_id2));
+        engine_lock.unlock();
+        early_stop = !hooks->on_tokens(out.data(), 1);
+        engine_lock.lock();
+    }
     // Build the verify replay graph before the decode clock starts. Capture records kernels
     // rather than running them, so this changes no state -- it just stops decode step 2 from
     // paying for graph construction.
@@ -6552,9 +6636,9 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     long plan_rows_sum = 0, plan_steps = 0;
     bool predictable_stream = false;
     auto t_decode0 = std::chrono::steady_clock::now();
-    bool spec_finished = false, spec_failed = false, spec_stopped = false, spec_tier_stop = false;
+    bool spec_finished = early_eos, spec_failed = false, spec_stopped = early_stop, spec_tier_stop = false;
     if (hooks) engine_lock.unlock();
-    while ((int)out.size() < max_new) {
+    while (!spec_finished && !spec_stopped && (int)out.size() < max_new) {
         // Engine-driven: hold the device for the whole step -- draft pass and verify -- so a request
         // admitted concurrently allocates between steps, never inside one. Released before on_tokens.
         std::unique_lock<std::recursive_mutex> step_lock(s.device_mu, std::defer_lock);
@@ -6616,7 +6700,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         for (int i = 1; i < B; i++) block[i] = mask_id;
         // block[0] is the response's token at index out.size() (emitted below); verify row i draws
         // the token at index out.size() + 1 + i, which ordinary decode samples at that step.
-        const unsigned long long step0 = (unsigned long long)out.size() + 1ull;
+        const unsigned long long step0 = (unsigned long long)(out.size() - pre_emitted) + 1ull;
         s.vsamp = {spec_sampled, sp_temp, sp_seed, sp_top_k, sp_top_p, step0};
 
         // The target overwrites dflash_hidden while capturing verify row zero. Preserve the
@@ -6999,7 +7083,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
 
         const size_t emitted_before = out.size();
         bool stop = false;
-        for (int i = 0; i < keep && (int)out.size() < max_new; i++) {
+        for (int i = pre_emitted; i < keep && (int)out.size() < max_new; i++) {
             out.push_back(block[i]);
             if (!ignore_eos &&
                 (block[i] == s.cfg.eos_id || (s.cfg.eos_id2 >= 0 && block[i] == s.cfg.eos_id2))) {
@@ -7007,6 +7091,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
                 break;
             }
         }
+        pre_emitted = 0;
         bool eos_next = false;
         if (!stop) {
             // Bonus token becomes the next block seed (emitted on the following iteration).
@@ -7062,6 +7147,19 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     }
     if ((int)out.size() >= max_new) spec_finished = true;
     if (hooks) engine_lock.lock();   // the teardown below frees graphs and capture buffers
+    if (pre_emitted && !spec_finished && !spec_failed) {
+        // No step ran: the prefill's token went out but was never ingested. Ingest it the way the
+        // next ordinary decode step would -- position `start`, drawing the token after it at step 1
+        // -- and hand back from there.
+        set_dflash_capture_row(0);
+        const int after = forward_token(next, start, true, sp_temp, sp_seed, 1ull, sp_top_k, sp_top_p);
+        if (after >= 0 && after < s.cfg.vocab) {
+            next = after;
+            start += 1;
+        } else {
+            spec_failed = true;
+        }
+    }
     if (resume) {
         resume->engaged = true;
         resume->finished = spec_finished;

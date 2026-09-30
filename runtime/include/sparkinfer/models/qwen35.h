@@ -295,8 +295,19 @@ public:
     // returning false stops it between steps -- with the KV and the Gated-DeltaNet state exactly at
     // the committed position, so ordinary decode can take over from SpecResume::position with
     // SpecResume::next_token and produce what the speculative loop would have.
+    struct RecurrentStateSnapshot;   // defined below, with snapshot_recurrent_state
     struct SpecHooks {
         uint64_t seq_id = 0;
+        // A prefix-cache hit: the session's KV for [0, prefill_start) is shared in and its
+        // recurrent state restored there, so prefill covers only the rest. The draft then has the
+        // target's hidden states only from prefill_start on and drafts from those.
+        int prefill_start = 0;
+        // Prefix-cache checkpoints to snapshot during the prefill (ascending, block-aligned,
+        // inside (prefill_start, prompt end)): snaps[i] receives what snapshot_recurrent_state
+        // would return at ckpts[i]. SpecResume::ckpts_taken says whether they were filled.
+        const int* ckpts = nullptr;
+        int n_ckpts = 0;
+        RecurrentStateSnapshot* snaps = nullptr;
         std::function<bool(const int* tokens, int n)> on_tokens;
         // The request's sampler. temperature <= 0 verifies greedily. Above 0, the first token and
         // every verified position are drawn as ordinary decode draws them -- top_k/top_p mask,
@@ -316,6 +327,7 @@ public:
         int next_token = -1;    // the verified token at `position`, not yet emitted nor ingested
         int emitted = 0;        // tokens handed to on_tokens
         bool tier_boundary = false;  // stopped where the next step would cross a KV split tier
+        bool ckpts_taken = false;    // SpecHooks::snaps hold the prompt's checkpoints
     };
     std::vector<int> dflash_generate(const std::vector<int>& prompt_ids, int max_new_tokens,
                                      DFlashStats* stats = nullptr,
@@ -490,7 +502,6 @@ public:
     // path (see qwen35.cpp). Returns the last row's argmax with its logits left in place, or -1 if
     // the path declined, in which case nothing was committed.
     int ingest_tail_rows(const int* token_ids, int n, int pos0);
-    struct RecurrentStateSnapshot;   // defined below, with snapshot_recurrent_state
     // Prefill several FRESH sessions' prompts in ONE batched pass (Qwen35PrefillCtx::multi_n):
     // each session opened with nothing ingested yet, text only, no logit_bias. On success writes
     // each prompt's seed to seeds[i] and returns true: the argmax -- the token

@@ -335,22 +335,34 @@ ContinuousBatchEngine::SpecStats ContinuousBatchEngine::speculative_stats() cons
     return s;
 }
 
+namespace {
+// SPARKINFER_SPEC_PREFIX_HIT=0: a prefix-cache hit decodes without speculation, and a speculated
+// prompt takes no prefix-cache checkpoints (the behaviour before either did).
+bool prefix_hit_spec_on() {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_SPEC_PREFIX_HIT");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+}  // namespace
+
 bool ContinuousBatchEngine::spec_eligible(const Request& r) {
     // A sampled request speculates too: every verify row draws its token with the request's
     // sampler at that token's own step (SpecHooks), so the output is the one ordinary sampled
     // decode gives. SPARKINFER_SPEC_SAMPLED=0 keeps speculation greedy-only. The verify path has
     // none of the other sampler extras (penalties, logit bias, logprobs). A constraint must stay
     // on the per-token path where its mask is applied. Images need the vision splice ordinary
-    // prefill does; a prefix-cache hit starts past position 0, where the capture the draft reads
-    // would have a hole.
+    // prefill does. A prefix-cache hit speculates too: prefill resumes past the cached prefix and
+    // the draft reads the target's hidden states from there (SpecHooks::prefill_start).
     static const bool sampled_on = [] {
         const char* e = getenv("SPARKINFER_SPEC_SAMPLED");
         return !(e && e[0] == '0');
     }();
     return !r.constraint && (r.temperature <= 0.f || sampled_on) && r.presence_penalty == 0.f &&
            r.frequency_penalty == 0.f && r.logit_bias.empty() && !r.logprobs &&
-           r.forced_tokens.empty() && r.vision_pos.empty() && r.prefill_start == 0 &&
-           !r.use_prefix_session;
+           r.forced_tokens.empty() && r.vision_pos.empty() && !r.use_prefix_session &&
+           (r.prefill_start == 0 || prefix_hit_spec_on());
 }
 
 void ContinuousBatchEngine::run_speculative(Job& job) {
@@ -398,8 +410,32 @@ void ContinuousBatchEngine::run_speculative(Job& job) {
         }
         return !spec_interrupt_.load(std::memory_order_relaxed);
     };
+    hooks.prefill_start = job.req.prefill_start;
+    // The prompt's prefix-cache checkpoints, taken during the speculative prefill exactly as the
+    // ordinary prefill takes them, so the next turn of a conversation finds its prefix cached.
+    std::vector<int> ckpts;
+    std::vector<Qwen35Model::RecurrentStateSnapshot> snaps;
+    if (prefix_hit_spec_on() && prefix_cache_ && job.req.prefix_cache) {
+        for (int ckpt : job.req.cache_checkpoints)
+            if (ckpt > job.req.prefill_start && ckpt < prompt_len && ckpt % kv_->block_size() == 0)
+                ckpts.push_back(ckpt);
+        std::sort(ckpts.begin(), ckpts.end());
+        ckpts.erase(std::unique(ckpts.begin(), ckpts.end()), ckpts.end());
+        snaps.resize(ckpts.size());
+        hooks.ckpts = ckpts.data();
+        hooks.n_ckpts = (int)ckpts.size();
+        hooks.snaps = snaps.data();
+    }
     Qwen35Model::SpecResume r;
     model_->dflash_generate(job.req.prompt, job.req.max_new_tokens, nullptr, nullptr, &hooks, &r);
+    if (r.ckpts_taken) {
+        for (size_t i = 0; i < ckpts.size(); ++i) {
+            Job::Checkpoint cp;
+            cp.pos = ckpts[i];
+            cp.state = std::move(snaps[i]);
+            job.checkpoints.push_back(std::move(cp));
+        }
+    }
     spec_running_.store(false, std::memory_order_relaxed);
     if (!r.engaged) return;   // nothing ran: ordinary prefill picks the job up on the next iteration
     spec_runs_.fetch_add(1, std::memory_order_relaxed);
@@ -620,7 +656,14 @@ void ContinuousBatchEngine::worker_loop() {
             Job* spec_job = nullptr;
             {
                 std::lock_guard<std::mutex> lock(mu_);
-                if (speculative_ && running_) {
+                // SPARKINFER_SPECULATIVE=0 keeps the draft loaded (the same device memory, so the
+                // same prefill and decode paths) but decodes every request token by token: the
+                // reference a speculative launch must reproduce.
+                static const bool spec_env_on = [] {
+                    const char* e = getenv("SPARKINFER_SPECULATIVE");
+                    return !(e && e[0] == '0');
+                }();
+                if (speculative_ && running_ && spec_env_on) {
                     int live = 0;
                     Job* only = nullptr;
                     for (const auto& kv : jobs_) {
@@ -629,7 +672,7 @@ void ContinuousBatchEngine::worker_loop() {
                         only = kv.second.get();
                     }
                     if (live == 1 && !only->spec_tried && only->phase == SeqPhase::PREFILL &&
-                        only->prefill_pos == 0 && spec_eligible(only->req)) {
+                        only->prefill_pos == only->req.prefill_start && spec_eligible(only->req)) {
                         spec_job = only;
                         // Raised under mu_, which submit_locked also holds: a request submitted from
                         // here on sees it and interrupts; one submitted before made live == 2.
