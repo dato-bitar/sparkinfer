@@ -4777,8 +4777,12 @@ void snapshot_migrate_worker() {
                 p.pageable.pop_back();
             }
         }
-        // The last holder may already be gone (the job failed, the cache refused it).
-        if (b.use_count() == 1) continue;
+        // The last holder may already be gone (the job failed, the cache refused it). The pageable
+        // buffer taken for it goes back to the pool, not out of scope with this iteration.
+        if (b.use_count() == 1) {
+            if (dst) snapshot_release(dst, b->bytes, false);
+            continue;
+        }
         if (!dst) {
             dst = malloc(b->bytes);
             if (!dst) continue;
