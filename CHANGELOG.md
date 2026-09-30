@@ -3,6 +3,26 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
+## [Unreleased]
+
+### Performance
+
+- **Packed decode samples its rows in one launch** (1.13x sampled cb-decode @c32 on Qwen3.8-27B).
+  - **Before:** each sampled row ran forward_token's sampler on its own: a full-vocabulary radix
+    sort for top_k/top_p, Gumbel noise over all 248K entries, then argmax, row after row. At 32
+    rows with the checkpoint's default sampling (T=1.0, top_k 20, top_p 0.95) that was about 3 ms
+    of an 18.7 ms step on an RTX 5090, 18% slower than greedy.
+  - **Now:** `launch_sample_rows_topk` takes every row whose top_k is 1–128 in one launch. The
+    top_k survivors are found without sorting the vocab, and only they draw noise, with the same
+    Philox key (seed, vocab id, step) and arithmetic, so each row draws the token the per-row path
+    draws. 32 rows: 2,546 us -> 35 us. Rows without a top_k in range keep the per-row path.
+    `SPARKINFER_BATCHED_SAMPLER=0` samples every row alone.
+  - **Measured** (`qwen3_gguf_cb_bench`, 256-token prompts and answers, default sampling, ModelOpt
+    NVFP4): mean ITL at 16 / 32 rows 14.1-14.3 -> 12.8-12.9 ms and 18.0-18.2 -> 15.9 ms, the same
+    as greedy; aggregate at 32 rows 1,568-1,607 -> 1,792-1,803 tok/s.
+  - **Tested:** `sample_rows_topk_gpu_test` compares 896 rows against the per-row path (ties at the
+    top_k boundary, signed zeros, -inf entries, heavily duplicated logits): 0 mismatches.
+
 ## [0.5.14] — 2026-09-29
 
 **Prefill no longer falls off the fast path on seven prompt lengths in eight.**

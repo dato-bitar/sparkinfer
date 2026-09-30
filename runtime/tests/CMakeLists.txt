@@ -60,6 +60,10 @@ add_executable(topk_topp_sample_gpu_test topk_topp_sample_gpu_test.cpp)
 target_link_libraries(topk_topp_sample_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
 add_test(NAME topk_topp_sample_gpu_test COMMAND topk_topp_sample_gpu_test)
 
+add_executable(sample_rows_topk_gpu_test sample_rows_topk_gpu_test.cpp)
+target_link_libraries(sample_rows_topk_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
+add_test(NAME sample_rows_topk_gpu_test COMMAND sample_rows_topk_gpu_test)
+
 add_executable(logprob_extract_gpu_test logprob_extract_gpu_test.cpp)
 target_link_libraries(logprob_extract_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
 add_test(NAME logprob_extract_gpu_test COMMAND logprob_extract_gpu_test)

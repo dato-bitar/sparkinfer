@@ -4972,8 +4972,7 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
         // argmax. Launched with n_rows = 1 on the row, so the Philox counter is the vocab index
         // exactly as in forward_token, and a request draws the same token packed or alone. The
         // mask reuses forward_token's scratch; the rows run one after another on one stream.
-        for (int i = 0; i < n; i++) {
-            if (!(h->temp[i] > 0.f)) continue;
+        auto sample_row_alone = [&](int i) {
             float* row = packed_logits + (size_t)i * vocab;
             if ((h->top_k[i] > 0 && h->top_k[i] < vocab) || h->top_p[i] < 1.f)
                 kernels::launch_topk_topp_mask(row, vocab, s.d_vocab_iota, s.d_sorted_logits,
@@ -4983,10 +4982,39 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
                                                s.d_rank_by_id, st);
             kernels::launch_temperature_sample(row, 1, vocab, &d->temp[i], &d->seed[i], &d->step[i], st);
             kernels::launch_argmax(row, &d->out[i], 1, vocab, st);
+        };
+        // Rows with a top_k in range are sampled together in one launch: the same survivors, the
+        // same Philox key and noise, without sorting the vocab once per row (at 32 sampled rows
+        // the per-row sorts were ~3 ms of an 18.7 ms step on an RTX 5090). The rest keep the per-
+        // row path. SPARKINFER_BATCHED_SAMPLER=0 samples every row alone.
+        static const bool batched_on = [] {
+            const char* e = getenv("SPARKINFER_BATCHED_SAMPLER");
+            return !(e && e[0] == '0');
+        }();
+        bool any_batched = false;
+        for (int i = 0; i < n; i++) {
+            if (!(h->temp[i] > 0.f)) continue;
+            if (batched_on && kernels::sample_rows_topk_eligible(h->temp[i], h->top_k[i], vocab))
+                any_batched = true;
+            else
+                sample_row_alone(i);
         }
+        if (any_batched)
+            kernels::launch_sample_rows_topk(packed_logits, n, vocab, d->temp, d->seed, d->step,
+                                             d->top_k, d->top_p, d->out, st);
         cu(cudaMemcpyAsync(h->out, d->out, (size_t)n * sizeof(int), cudaMemcpyDeviceToHost, st),
            "packed sampled ids");
         cu(cudaStreamSynchronize(st), "packed sample sync");
+        // A batched row whose candidate set overflowed came back as -1; sample it alone. The
+        // batched kernel does not write the logits, so they are still the forward's.
+        bool redo = false;
+        for (int i = 0; i < n; i++)
+            if (h->temp[i] > 0.f && h->out[i] < 0) { sample_row_alone(i); redo = true; }
+        if (redo) {
+            cu(cudaMemcpyAsync(h->out, d->out, (size_t)n * sizeof(int), cudaMemcpyDeviceToHost, st),
+               "packed sampled ids (redo)");
+            cu(cudaStreamSynchronize(st), "packed sample sync (redo)");
+        }
         for (int i = 0; i < n; i++)
             if (h->temp[i] > 0.f) out_sampled[i] = h->out[i];
     }
