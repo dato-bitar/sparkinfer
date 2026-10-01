@@ -5,6 +5,21 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-10-02
+
+**Requests without `max_tokens` are no longer cut off at 256 tokens**: agents and OpenAI SDK
+clients, which omit it by default, get whole answers again.
+- A server with the DFlash2 or DSpark drafter loaded is now as fast as one without at 16-32
+  concurrent requests (it was 0.23-0.66x), and keeps 1.2-2.2x at 1-4 (AIPerf, RTX 5090).
+- Linux and Windows binaries are attached to the release again: the Windows build had failed
+  since 2026-08-14, so no tag since v0.5.6 produced them.
+- Speculation stays opt-in in the container (`serve-dspark` or `--draft-model`).
+- **Known:** a request speculates only when its prompt plus `max_tokens` fits the drafter's
+  16,384-position context, so one that leaves `max_tokens` to the cap does not speculate yet. The
+  fix (speculate up to the end of that context, then decode on) needs window-sized draft slots
+  first: sized to a long request's whole reach, a few of them fill the device and end
+  speculation for a concurrent load.
+
 ### Fixed
 
 - **A request without `max_tokens` is no longer cut off at 256 tokens.** #1088's fix made such a
@@ -13,6 +28,17 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
   took every request as having set it. Agents and OpenAI SDK clients that omit it (the default)
   had every answer stopped at 256 tokens with `finish_reason: "length"`. `chat_tools_test` now
   checks that an omitted `max_tokens` reads as unset.
+
+### Build
+
+- **The Windows build compiles again** (#1238). MSVC rejected four constructs that gcc accepts:
+  - an `if constexpr` before a `#pragma unroll`;
+  - captureless lambdas reading a local `constexpr`;
+  - a GCC-only format attribute.
+
+  It also failed to link: the NVFP4-off fallbacks (Windows builds without CUTLASS) had drifted, with
+  two stale signatures and six missing. The tag's `release` job needs both platforms, so v0.5.13,
+  v0.5.14 and v0.6.0 have no binaries.
 
 ### Speculative decoding
 
