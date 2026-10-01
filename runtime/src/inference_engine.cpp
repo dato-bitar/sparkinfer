@@ -391,15 +391,16 @@ bool ContinuousBatchEngine::spec_eligible(const Request& r) {
 }
 
 namespace {
-// SPARKINFER_SPEC_GROUP: how many live requests speculate together, at most 4 (their blocks fill
-// one 32-row verify). 1 keeps the single-request path (dflash_generate), which stops speculating
-// once a second request arrives. Measured on Qwen3.8-27B + DFlash2, real prompts at T=0.7,
-// aggregate tok/s at c1/c2/c4: 177/178/319 with 1, 208/349/485 with 4; c6/c8 the same either way.
+// SPARKINFER_SPEC_GROUP: how many live requests speculate together, at most 8. Their blocks share
+// one verify of kQwen35MaxPackedRows rows, so past four each verifies a shorter block. 1 keeps the
+// single-request path (dflash_generate), which stops speculating once a second request arrives.
+// Measured on Qwen3.8-27B + DFlash2 (batched draft), real prompts at T=0.7, aggregate tok/s at
+// c4/c6/c8: 646/422/650 with 4, 652/768/861 with 8.
 int spec_group_max() {
     static const int v = [] {
         const char* e = getenv("SPARKINFER_SPEC_GROUP");
-        const int x = e ? atoi(e) : 4;
-        return std::max(1, std::min(x, 4));
+        const int x = e ? atoi(e) : 8;
+        return std::max(1, std::min(x, 8));
     }();
     return v;
 }
@@ -525,6 +526,46 @@ void ContinuousBatchEngine::run_spec_group() {
         // 1. Drafts, from the hidden rows each member's last verify captured (consumed before a
         //    join below re-arms the capture buffers).
         auto t_draft = std::chrono::steady_clock::now();
+        {
+            // Every member that needs a block, drafted in one pass where the draft can
+            // (spec_group_draft_multi); the loop below takes whatever is left.
+            std::vector<Member*> need;
+            for (Member& m : members)
+                if (!m.done && !m.have_block) need.push_back(&m);
+            if (need.size() >= 2) {
+                const size_t n = need.size();
+                std::vector<int> slots(n), th(n), seeds(n), pos(n), topk(n), prop(n * (size_t)depth, -1);
+                std::vector<const void*> hid(n);
+                std::vector<float> temp(n), topp(n);
+                std::vector<unsigned long long> srng(n), step(n);
+                const char* base = static_cast<const char*>(model_->dflash_hidden_buffer());
+                const size_t row_bytes = (size_t)model_->dflash_hidden_row_stride() * 2;
+                for (size_t i = 0; i < n; ++i) {
+                    const Member& m = *need[i];
+                    slots[i] = m.slot;
+                    hid[i] = base + (size_t)m.feed_off * row_bytes;
+                    th[i] = m.feed_len;
+                    seeds[i] = m.next;
+                    pos[i] = m.pos;
+                    temp[i] = m.job->req.temperature;
+                    srng[i] = (unsigned long long)m.job->req.seed;
+                    step[i] = idx_of_next(m) + 1;
+                    topk[i] = m.job->req.top_k;
+                    topp[i] = m.job->req.top_p;
+                }
+                if (model_->spec_group_draft_multi((int)n, slots.data(), hid.data(), th.data(), seeds.data(),
+                                                   pos.data(), temp.data(), srng.data(), step.data(),
+                                                   topk.data(), topp.data(), prop.data())) {
+                    for (size_t i = 0; i < n; ++i) {
+                        Member& m = *need[i];
+                        m.block.assign(1, m.next);
+                        m.block.insert(m.block.end(), prop.begin() + (long)(i * depth),
+                                       prop.begin() + (long)((i + 1) * depth));
+                        m.have_block = true;
+                    }
+                }
+            }
+        }
         for (Member& m : members) {
             if (m.done || m.have_block) continue;
             const Job& job = *m.job;
@@ -671,11 +712,14 @@ void ContinuousBatchEngine::run_spec_group() {
         std::vector<int> top_k((size_t)n);
         bool any_sampled = false;
         int rows = 0;
+        // The verify takes kQwen35MaxPackedRows rows: past four members each verifies a shorter
+        // block (the draft still proposes its full depth; the rest is not scored).
+        const int row_cap = std::max(2, kQwen35MaxPackedRows / n);
         for (int g = 0; g < n; ++g) {
             Member& m = *act[(size_t)g];
             seqs[(size_t)g] = m.job->seq_id;
             blocks[(size_t)g] = m.block.data();
-            lens[(size_t)g] = (int)m.block.size();
+            lens[(size_t)g] = std::min((int)m.block.size(), row_cap);
             starts[(size_t)g] = m.pos;
             temp[(size_t)g] = m.job->req.temperature;
             seedv[(size_t)g] = (unsigned long long)m.job->req.seed;

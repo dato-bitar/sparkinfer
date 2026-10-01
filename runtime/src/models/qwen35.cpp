@@ -6250,6 +6250,43 @@ bool Qwen35Model::spec_group_draft(int slot, const void* target_hidden, int th_l
     return true;
 }
 
+bool Qwen35Model::spec_group_draft_multi(int n, const int* slots, const void* const* hidden,
+                                         const int* th_len, const int* seeds, const int* pos,
+                                         const float* temperature, const unsigned long long* seed_rng,
+                                         const unsigned long long* step0, const int* top_k,
+                                         const float* top_p, int* proposals) {
+    Impl& s = *p_;
+    if (!s.dflash_draft || n < 2 || !proposals) return false;
+    DFlashDraftModel& draft = *s.dflash_draft;
+    const int depth = spec_group_depth();
+    const int B = draft.config().block_size;
+    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+    std::vector<int> ids((size_t)n * B, draft.config().mask_token_id), out((size_t)n * (depth + 1), -1);
+    std::vector<DFlashDraftModel::BlockJob> jobs((size_t)n);
+    for (int i = 0; i < n; ++i) {
+        DFlashDraftModel::BlockJob& j = jobs[(size_t)i];
+        ids[(size_t)i * B] = seeds[i];
+        j.slot = slots[i];
+        j.target_hidden = hidden[i];
+        j.ctx_len = th_len[i];
+        j.noise_ids = ids.data() + (size_t)i * B;
+        j.pos0 = pos[i];
+        j.temperature = temperature[i];
+        j.seed = seed_rng[i];
+        j.step0 = step0[i];
+        j.top_k = top_k[i];
+        j.top_p = top_p[i];
+        j.out_argmax = out.data() + (size_t)i * (depth + 1);
+    }
+    // The target's NVFP4 head scores every slot's rows in one GEMM when it is resident.
+    if (!draft.forward_blocks(jobs.data(), n, depth, s.w.lm_head_fp4, s.w.lm_head_fp4_sf,
+                              s.w.lm_head_fp4_alpha))
+        return false;
+    for (int i = 0; i < n; ++i)
+        for (int t = 0; t < depth; ++t) proposals[(size_t)i * depth + t] = out[(size_t)i * (depth + 1) + t + 1];
+    return true;
+}
+
 bool Qwen35Model::spec_group_verify(int n, const uint64_t* seq_ids, const int* const* blocks,
                                     const int* lens, const int* start_pos,
                                     const PackedSampling* sampling, int* out_ids, int* keep) {

@@ -16,6 +16,30 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Added
 
+- **Speculating groups draft in one pass, and take up to 8 requests** (DFlash2): aggregate decode
+  on real prompts at T=0.7, c4/c6/c8: 485/~405/633 -> 573/669/733 tok/s on Qwen3.8-27B.
+  - **The draft:** a group's members drafted one after another, each streaming the draft's
+    weights for its own 8 rows. That was ~6 ms of a ~26 ms step at c4.
+    `DFlashDraftModel::forward_blocks` runs every member's block in one pass:
+    - every projection is one block-scaled NVFP4 GEMM over all members' rows (operands built
+      from the bf16 weights on first use, ~260 MB);
+    - the head is the target's NVFP4 LM head when it is resident;
+    - only the convs, RoPE, attention and selector run per member.
+
+    It costs 2.2 ms at four members. `SPARKINFER_DFLASH_BATCHED=0` drafts per member.
+  - **The MLP:** DFlash2's MLP is NVFP4 for every draft, in place of its Q4 copies, at the
+    same bytes. Single-stream spec_bench is unchanged: 226/220 against 220/230 tok/s.
+    `SPARKINFER_DFLASH2_MLP_FP4=0` restores the Q4 GEMVs.
+  - **Groups of up to 8:** `SPARKINFER_SPEC_GROUP` now defaults to 8. Past four members, each
+    verifies a shorter block, to fit the 32-row verify.
+  - **Tested:** lossless as before, with both drafts:
+    - single requests are identical to speculation off at T=0, 0.7 and 1.0;
+    - 4-turn cached conversations are identical too;
+    - the grouped verify check passes.
+
+    A 30K-token prompt prefills at the same speed after the batched operands are built, with
+    no fallback.
+
 - **Concurrent requests speculate together** (`SPARKINFER_SPEC_GROUP`, default 4): aggregate
   decode on real prompts with DFlash2 at T=0.7, c1/c2/c4: 177/178/319 -> 208/349/485 tok/s, on
   Qwen3.8-27B (vLLM 0.30 with the same draft: 191/276/341); c6 and c8 unchanged.

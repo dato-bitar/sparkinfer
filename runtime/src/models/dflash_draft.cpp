@@ -7,6 +7,7 @@
 #include "sparkinfer/kernels/fused.h"
 #include "sparkinfer/kernels/quant.h"
 #include "sparkinfer/kernels/prefill.h"
+#include "sparkinfer/kernels/prefill_nvfp4.h"
 #include "sparkinfer/gguf.h"
 // Header-only Muse Glimmer DFlash draft config derivation (mirrors examples/qwen3_gguf_config.h's
 // museglimmer_config_from_gguf for the target model). Lives in examples/ by this codebase's
@@ -18,6 +19,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <type_traits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -330,6 +332,11 @@ struct LayerWeights {
     // the conv around attention and around the MLP.
     bf16 *attn_conv_base = nullptr, *attn_conv_proj = nullptr;
     bf16 *mlp_conv_base = nullptr, *mlp_conv_proj = nullptr;
+    // DFlash2's MLP as block-scaled NVFP4 GEMM operands (in place of the Q4 copies; see
+    // ensure_quant): data and the CUTLASS SFB scales.
+    unsigned char *fp4_gate = nullptr, *fp4_gate_sf = nullptr;
+    unsigned char *fp4_up = nullptr, *fp4_up_sf = nullptr;
+    unsigned char *fp4_down = nullptr, *fp4_down_sf = nullptr;
 };
 
 // Draft projection weight format: 4 = asymmetric int4, 8 = Q8_0, 0 = bf16. Default 4.
@@ -499,10 +506,86 @@ struct DFlashDraftModel::Impl {
     std::vector<PendingQuant> pending_quant;
     bool quant_ready = false;
 
+    // NVFP4 A operand and workspace for the MLP GEMMs (and forward_blocks' head), sized for
+    // kBatchRows rows.
+    static constexpr int kBatchRows = 64;       // forward_blocks: 8 slots of an 8-row block
+    unsigned char *f4_a = nullptr, *f4_asf = nullptr, *f4_ws = nullptr;
+    bool fp4_mlp = false;
+
+    // forward_blocks' scratch, allocated on its first call: every row-indexed buffer of the
+    // per-slot path at kBatchRows rows, the gathered context, and the per-job sampler/outputs.
+    struct Batch {
+        bool ready = false;
+        bf16 *x = nullptr, *xn = nullptr, *h = nullptr, *hn = nullptr;
+        bf16 *q = nullptr, *k = nullptr, *v = nullptr, *attn = nullptr, *ao = nullptr;
+        bf16 *gate = nullptr, *up = nullptr, *down = nullptr;
+        bf16 *conv_a = nullptr, *conv_m = nullptr, *conv_out = nullptr;
+        bf16 *ctx_h = nullptr, *tp = nullptr, *ctx_k = nullptr, *ctx_v = nullptr;
+        bf16 *sel_h = nullptr;
+        int* sel_ids = nullptr;
+        float* sel_vals = nullptr;
+        float* logits = nullptr;
+        int *d_ids = nullptr, *h_ids = nullptr;
+        int *d_out = nullptr, *h_out = nullptr;
+        DraftSampling *d_samp = nullptr, *h_samp = nullptr;
+        unsigned char* ws = nullptr;            // the GEMMs' workspace, head included
+        // NVFP4 operands of the projections the per-slot path reads in Q4 or bf16: per layer the
+        // block rows' stacked q|k|v, the context rows' k|v, wo and the two conv projections; the
+        // projector fc and the selector's hidden projection.
+        struct Op { unsigned char *d = nullptr, *sf = nullptr; };
+        std::vector<Op> qkv, kv, wo, acp, mcp;
+        Op fc, sel;
+    } batch;
+
     void ensure_quant() {
         if (quant_ready) return;
-        for (auto& pq : pending_quant) *pq.dst = make_q8(pq.w, pq.N, pq.K);
+        // DFlash2's MLP -- 80% of its weights -- runs as block-scaled NVFP4 GEMMs: the same bytes as
+        // the Q4 copies it replaces (4.5 bits a weight), and the operand forward_blocks needs to read
+        // them ONCE for several slots' rows. SPARKINFER_DFLASH2_MLP_FP4=0 keeps the Q4 GEMVs.
+        static const bool fp4_env = [] {
+            const char* e = getenv("SPARKINFER_DFLASH2_MLP_FP4");
+            return !(e && e[0] == '0');
+        }();
+        const int H = cfg.hidden, I = cfg.intermediate;
+        fp4_mlp = fp4_env && cfg.dflash2 && cfg.block_size % 8 == 0 &&
+                  kernels::prefill_nvfp4_supported(8, I, H) &&
+                  kernels::prefill_nvfp4_supported(8, H, I);
+        for (const LayerWeights& lw : layers)
+            fp4_mlp = fp4_mlp && lw.gate && lw.up && lw.down;
+        auto is_mlp = [&](const Q8W* dst) {
+            for (const LayerWeights& lw : layers)
+                if (dst == &lw.q8_gate || dst == &lw.q8_up || dst == &lw.q8_down) return true;
+            return false;
+        };
+        for (auto& pq : pending_quant)
+            if (!(fp4_mlp && is_mlp(pq.dst))) *pq.dst = make_q8(pq.w, pq.N, pq.K);
         pending_quant.clear();
+        if (fp4_mlp) {
+            auto make_fp4 = [&](const bf16* w, int n, int k, unsigned char** d, unsigned char** sf) {
+                *d = alloc<unsigned char>(kernels::prefill_nvfp4_data_bytes(n, k));
+                *sf = alloc<unsigned char>(kernels::prefill_nvfp4_scale_bytes_b(n, k));
+                return kernels::launch_prefill_nvfp4_quant_b(w, *d, *sf, n, k, stream);
+            };
+            for (LayerWeights& lw : layers)
+                fp4_mlp = fp4_mlp && make_fp4(lw.gate, I, H, &lw.fp4_gate, &lw.fp4_gate_sf) &&
+                          make_fp4(lw.up, I, H, &lw.fp4_up, &lw.fp4_up_sf) &&
+                          make_fp4(lw.down, H, I, &lw.fp4_down, &lw.fp4_down_sf);
+            const int kmax = std::max(H, I);
+            size_t ws = std::max(kernels::prefill_nvfp4_workspace_bytes(kBatchRows, I, H),
+                                 kernels::prefill_nvfp4_workspace_bytes(kBatchRows, H, I));
+            f4_a = alloc<unsigned char>(kernels::prefill_nvfp4_data_bytes(kBatchRows, kmax));
+            f4_asf = alloc<unsigned char>(kernels::prefill_nvfp4_scale_bytes_a(kBatchRows, kmax));
+            if (ws) f4_ws = alloc<unsigned char>(ws);
+            cudaStreamSynchronize(stream);
+            if (!fp4_mlp) {
+                // A failed build leaves no usable MLP: make the Q4 copies after all.
+                for (LayerWeights& lw : layers) {
+                    lw.q8_gate = make_q8(lw.gate, I, H);
+                    lw.q8_up = make_q8(lw.up, I, H);
+                    lw.q8_down = make_q8(lw.down, H, I);
+                }
+            }
+        }
         quant_ready = true;
         // DFlash2 always runs its whole block (forward_block forces BW = block_size), and at a
         // batched width its MLP reads only the quantized copies; the bf16 originals are dead
@@ -515,8 +598,9 @@ struct DFlashDraftModel::Impl {
                                    bs == 4 || bs == 2;
         if (cfg.dflash2 && batched_width) {
             for (LayerWeights& lw : layers) {
-                if (!(lw.q8_gate.q4 || lw.q8_gate.q) || !(lw.q8_up.q4 || lw.q8_up.q) ||
-                    !(lw.q8_down.q4 || lw.q8_down.q))
+                if (!lw.fp4_down &&
+                    (!(lw.q8_gate.q4 || lw.q8_gate.q) || !(lw.q8_up.q4 || lw.q8_up.q) ||
+                     !(lw.q8_down.q4 || lw.q8_down.q)))
                     continue;
                 release(lw.gate); release(lw.up); release(lw.down);
                 lw.gate = lw.up = lw.down = nullptr;
@@ -723,6 +807,9 @@ DFlashDraftModel::~DFlashDraftModel() {
     if (p_->h_ids) cudaFreeHost(p_->h_ids);
     if (p_->h_confidence) cudaFreeHost(p_->h_confidence);
     if (p_->h_samp) cudaFreeHost(p_->h_samp);
+    if (p_->batch.h_ids) cudaFreeHost(p_->batch.h_ids);
+    if (p_->batch.h_out) cudaFreeHost(p_->batch.h_out);
+    if (p_->batch.h_samp) cudaFreeHost(p_->batch.h_samp);
     if (p_->stream) cudaStreamDestroy(p_->stream);
     delete p_;
     p_ = nullptr;
@@ -1867,49 +1954,66 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                "dflash2 mlp conv");
             hn_ready = false;
         }
-        if (fast16) {
-            if (w.q8_gate.q4 && dp4a_gu)
-                dflash_kernels::launch_gemv_batched_q4_dp4a_fused3(
-                    hn_ready ? s.xq81 : q81(s.hn, H), w.q8_gate.q4, w.q8_up.q4, nullptr,
-                    w.q8_gate.dm, w.q8_up.dm, nullptr,
-                    s.gate, s.up, nullptr, I, I, 0, H, st, BW);
-            else if (w.q8_gate.q4)
-                dflash_kernels::launch_gemv_batched_q4_fused3(
-                    s.hn, w.q8_gate.q4, w.q8_up.q4, nullptr, w.q8_gate.dm, w.q8_up.dm, nullptr,
-                    s.gate, s.up, nullptr, I, I, 0, H, st, BW);
-            else if (w.q8_gate.q)
-                dflash_kernels::launch_gemv_batched_q8_fused3(
-                    s.hn, w.q8_gate.q, w.q8_up.q, nullptr, w.q8_gate.s, w.q8_up.s, nullptr,
-                    s.gate, s.up, nullptr, I, I, 0, H, st, BW);
-            else
-                dflash_kernels::launch_gemv_batched16_fused2(
-                    s.hn, w.gate, w.up, s.gate, s.up, I, I, H, st, BW);
-        } else {
-            for (int t = 0; t < BW; t++) {
-                kernels::launch_gemv(s.hn + (size_t)t * H, w.gate, s.gate + (size_t)t * I, I, H, st);
-                kernels::launch_gemv(s.hn + (size_t)t * H, w.up,   s.up   + (size_t)t * I, I, H, st);
-            }
+        // DFlash2: the MLP as block-scaled NVFP4 GEMMs (see ensure_quant); the SwiGLU is folded into
+        // the down projection's A quantize. BW is a multiple of 8 there, as the A operand needs.
+        bool mlp_done = false;
+        if (w.fp4_gate && s.f4_a && BW % 8 == 0 && BW <= Impl::kBatchRows) {
+            mlp_done = kernels::launch_prefill_nvfp4_quant_a(s.hn, s.f4_a, s.f4_asf, BW, H, st) &&
+                       kernels::launch_prefill_nvfp4_gemm(s.f4_a, s.f4_asf, w.fp4_gate, w.fp4_gate_sf,
+                                                          s.gate, BW, I, H, s.f4_ws, st) &&
+                       kernels::launch_prefill_nvfp4_gemm(s.f4_a, s.f4_asf, w.fp4_up, w.fp4_up_sf,
+                                                          s.up, BW, I, H, s.f4_ws, st) &&
+                       kernels::launch_prefill_nvfp4_swiglu_quant_a(s.gate, s.up, s.f4_a, s.f4_asf,
+                                                                    BW, I, st) &&
+                       kernels::launch_prefill_nvfp4_gemm(s.f4_a, s.f4_asf, w.fp4_down, w.fp4_down_sf,
+                                                          s.down, BW, H, I, s.f4_ws, st);
+            if (!mlp_done) return false;   // its Q4 copies were never made
         }
-        dflash_kernels::launch_swiglu(s.gate, s.up, s.gate, BW * I, st);
-        if (fast16) {
-            if (w.q8_down.q4 && dp4a_down)
-                dflash_kernels::launch_gemv_batched_q4_dp4a_fused3(
-                    q81(s.gate, I), w.q8_down.q4, nullptr, nullptr,
-                    w.q8_down.dm, nullptr, nullptr,
-                    s.down, nullptr, nullptr, H, 0, 0, I, st, BW);
-            else if (w.q8_down.q4)
-                dflash_kernels::launch_gemv_batched_q4_fused3(
-                    s.gate, w.q8_down.q4, nullptr, nullptr, w.q8_down.dm, nullptr, nullptr,
-                    s.down, nullptr, nullptr, H, 0, 0, I, st, BW);
-            else if (w.q8_down.q)
-                dflash_kernels::launch_gemv_batched_q8_fused3(
-                    s.gate, w.q8_down.q, nullptr, nullptr, w.q8_down.s, nullptr, nullptr,
-                    s.down, nullptr, nullptr, H, 0, 0, I, st, BW);
-            else
-                dflash_kernels::launch_gemv_batched16(s.gate, w.down, s.down, H, I, st, BW);
-        } else {
-            for (int t = 0; t < BW; t++)
-                kernels::launch_gemv(s.gate + (size_t)t * I, w.down, s.down + (size_t)t * H, H, I, st);
+        if (!mlp_done) {
+            if (fast16) {
+                if (w.q8_gate.q4 && dp4a_gu)
+                    dflash_kernels::launch_gemv_batched_q4_dp4a_fused3(
+                        hn_ready ? s.xq81 : q81(s.hn, H), w.q8_gate.q4, w.q8_up.q4, nullptr,
+                        w.q8_gate.dm, w.q8_up.dm, nullptr,
+                        s.gate, s.up, nullptr, I, I, 0, H, st, BW);
+                else if (w.q8_gate.q4)
+                    dflash_kernels::launch_gemv_batched_q4_fused3(
+                        s.hn, w.q8_gate.q4, w.q8_up.q4, nullptr, w.q8_gate.dm, w.q8_up.dm, nullptr,
+                        s.gate, s.up, nullptr, I, I, 0, H, st, BW);
+                else if (w.q8_gate.q)
+                    dflash_kernels::launch_gemv_batched_q8_fused3(
+                        s.hn, w.q8_gate.q, w.q8_up.q, nullptr, w.q8_gate.s, w.q8_up.s, nullptr,
+                        s.gate, s.up, nullptr, I, I, 0, H, st, BW);
+                else
+                    dflash_kernels::launch_gemv_batched16_fused2(
+                        s.hn, w.gate, w.up, s.gate, s.up, I, I, H, st, BW);
+            } else {
+                for (int t = 0; t < BW; t++) {
+                    kernels::launch_gemv(s.hn + (size_t)t * H, w.gate, s.gate + (size_t)t * I, I, H, st);
+                    kernels::launch_gemv(s.hn + (size_t)t * H, w.up,   s.up   + (size_t)t * I, I, H, st);
+                }
+            }
+            dflash_kernels::launch_swiglu(s.gate, s.up, s.gate, BW * I, st);
+            if (fast16) {
+                if (w.q8_down.q4 && dp4a_down)
+                    dflash_kernels::launch_gemv_batched_q4_dp4a_fused3(
+                        q81(s.gate, I), w.q8_down.q4, nullptr, nullptr,
+                        w.q8_down.dm, nullptr, nullptr,
+                        s.down, nullptr, nullptr, H, 0, 0, I, st, BW);
+                else if (w.q8_down.q4)
+                    dflash_kernels::launch_gemv_batched_q4_fused3(
+                        s.gate, w.q8_down.q4, nullptr, nullptr, w.q8_down.dm, nullptr, nullptr,
+                        s.down, nullptr, nullptr, H, 0, 0, I, st, BW);
+                else if (w.q8_down.q)
+                    dflash_kernels::launch_gemv_batched_q8_fused3(
+                        s.gate, w.q8_down.q, nullptr, nullptr, w.q8_down.s, nullptr, nullptr,
+                        s.down, nullptr, nullptr, H, 0, 0, I, st, BW);
+                else
+                    dflash_kernels::launch_gemv_batched16(s.gate, w.down, s.down, H, I, st, BW);
+            } else {
+                for (int t = 0; t < BW; t++)
+                    kernels::launch_gemv(s.gate + (size_t)t * I, w.down, s.down + (size_t)t * H, H, I, st);
+            }
         }
         // Fold the second residual into the norm that always consumes it: the next layer's input
         // norm, or the final norm after the last layer. Same math, one launch instead of two, and
@@ -2275,6 +2379,334 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     // from an empty cache — draft quality collapses (τ≈1.x) after the first block.
     s.seq_len = past + ctx_len + BW;
     crop(pos0);
+    return true;
+}
+
+
+namespace {
+// forward_blocks' operand builder: rows [n0, n0 + rows) of an n-row NVFP4 operand from a bf16
+// matrix holding only those rows (see launch_prefill_nvfp4_quant_b_slice).
+bool fp4_slice(const void* w, unsigned char* d, unsigned char* sf, int n, int n0, int rows, int k,
+               cudaStream_t st) {
+    return n0 == 0 && rows == n ? kernels::launch_prefill_nvfp4_quant_b(w, d, sf, n, k, st)
+                                : kernels::launch_prefill_nvfp4_quant_b_slice(w, d, sf, n, n0, rows, k, st);
+}
+}  // namespace
+
+bool DFlashDraftModel::forward_blocks(const BlockJob* jobs, int n_jobs, int proposals,
+                                      const void* head_fp4, const void* head_fp4_sf, float head_alpha) {
+    Impl& s = *p_;
+    const auto& c = s.cfg;
+    static const bool enabled = [] {
+        const char* e = getenv("SPARKINFER_DFLASH_BATCHED");
+        return !(e && e[0] == '0');
+    }();
+    if (!enabled || !jobs || n_jobs < 1 || !c.dflash2) return false;
+    s.ensure_quant();
+    const int BW = c.block_size;
+    const int H = c.hidden, I = c.intermediate;
+    const int qdim = c.n_q_heads * c.head_dim, kvdim = c.n_kv_heads * c.head_dim, d = c.head_dim;
+    const int n_cap = (int)c.target_layer_ids.size();
+    const int depth = std::min(BW - 1, proposals);
+    const int R = n_jobs * BW;
+    const int dyn = 2 * c.conv_kernel * (H / std::max(c.conv_group, 1));
+    if (!s.fp4_mlp || !s.fc || !s.embed || !s.sel_hproj || !s.sel_ids || depth < 1 ||
+        BW % 8 || R > Impl::kBatchRows || dyn <= 0 || dyn % 128 || (n_cap * H) % 128)
+        return false;
+    for (const LayerWeights& w : s.layers)
+        if (!w.wq || !w.wk || !w.wv || !w.wo || !w.attn_conv_proj || !w.mlp_conv_proj) return false;
+    const int Vd = (draft_vocab_env() > 0 && draft_vocab_env() < s.vocab) ? draft_vocab_env() : s.vocab;
+    const bool head4 = head_fp4 && head_fp4_sf && Vd % 128 == 0;
+    // Every job a steady-state block: its last verify's accepted rows, appended at the position the
+    // previous block cropped to, with nothing below the context floor and nothing outside a window
+    // -- so none of forward_block's skips apply (checked rather than assumed).
+    s.park_current();
+    int C = 0;
+    for (int j = 0; j < n_jobs; ++j) {
+        const BlockJob& jb = jobs[j];
+        if (jb.slot < 0 || (size_t)jb.slot >= s.slots.size() || !s.slots[(size_t)jb.slot].live ||
+            !jb.target_hidden || !jb.noise_ids || !jb.out_argmax || jb.ctx_len < 1 || jb.ctx_len > 8)
+            return false;
+        const Impl::Slot& sl = s.slots[(size_t)jb.slot];
+        const int past = sl.seq_len;
+        if (past + jb.ctx_len != jb.pos0 || sl.ctx_floor > past || past + jb.ctx_len + BW > sl.cap)
+            return false;
+        for (int L = 0; L < c.n_layers; ++L) {
+            const int window = (L < (int)c.sliding_layers.size() && c.sliding_layers[L]) ? c.sliding_window : 0;
+            const int lo = dflash_kernels::attn_gqa_kv_lo(BW, past + jb.ctx_len + BW, c.n_q_heads,
+                                                          c.n_kv_heads, d, jb.pos0, 0, window);
+            if (lo > past) return false;
+        }
+        for (int j2 = 0; j2 < j; ++j2) if (jobs[j2].slot == jb.slot) return false;
+        C += jb.ctx_len;
+    }
+    cudaStream_t st = s.stream;
+    Impl::Batch& b = s.batch;
+    auto fail = [&](const char* what) {
+        fprintf(stderr, "[dflash] batched draft: %s failed\n", what);
+        cudaGetLastError();
+        return false;
+    };
+    if (!b.ready) {
+        const int RM = Impl::kBatchRows;
+        cudaGetLastError();
+        bool ok = true;
+        auto al = [&](auto*& p, size_t n) {
+            using T = std::remove_pointer_t<std::remove_reference_t<decltype(p)>>;
+            if (ok && cudaMalloc(reinterpret_cast<void**>(&p), n * sizeof(T)) != cudaSuccess) ok = false;
+            if (ok) s.owned.push_back((void*)p);
+        };
+        al(b.x, (size_t)RM * H); al(b.xn, (size_t)RM * H); al(b.h, (size_t)RM * H); al(b.hn, (size_t)RM * H);
+        al(b.q, (size_t)RM * (qdim + 2 * kvdim)); al(b.attn, (size_t)RM * qdim); al(b.ao, (size_t)RM * H);
+        al(b.gate, (size_t)RM * I); al(b.up, (size_t)RM * I); al(b.down, (size_t)RM * H);
+        al(b.conv_a, (size_t)RM * dyn); al(b.conv_m, (size_t)RM * dyn);
+        al(b.conv_out, (size_t)RM * std::max(H, qdim));
+        al(b.ctx_h, (size_t)RM * n_cap * H); al(b.tp, (size_t)RM * H); al(b.ctx_k, (size_t)RM * 2 * kvdim);
+        al(b.sel_h, (size_t)RM * c.selector_rank);
+        al(b.sel_ids, (size_t)RM * c.selector_top_k); al(b.sel_vals, (size_t)RM * c.selector_top_k);
+        al(b.logits, (size_t)RM * Vd); al(b.d_ids, (size_t)RM); al(b.d_out, (size_t)RM + 8);
+        al(b.d_samp, 8);
+        auto pin = [&](auto*& p, size_t bytes) {
+            if (ok && cudaHostAlloc(reinterpret_cast<void**>(&p), bytes, cudaHostAllocDefault) != cudaSuccess)
+                ok = false;
+        };
+        pin(b.h_ids, RM * sizeof(int));
+        pin(b.h_out, (RM + 8) * sizeof(int));
+        pin(b.h_samp, 8 * sizeof(Impl::DraftSampling));
+        size_t ws = 0;
+        auto wsz = [&](int n, int k) { ws = std::max(ws, kernels::prefill_nvfp4_workspace_bytes(RM, n, k)); };
+        wsz(qdim + 2 * kvdim, H); wsz(2 * kvdim, H); wsz(H, qdim); wsz(dyn, H); wsz(H, n_cap * H);
+        wsz(c.selector_rank, H); wsz(I, H); wsz(H, I);
+        ws = std::max(ws, kernels::prefill_nvfp4_workspace_bytes_f32(RM, Vd, H));
+        al(b.ws, ws ? ws : 1);
+        // The operands, from the bf16 weights the per-slot path keeps.
+        auto op = [&](Impl::Batch::Op& o, int n, int k) {
+            al(o.d, kernels::prefill_nvfp4_data_bytes(n, k));
+            al(o.sf, kernels::prefill_nvfp4_scale_bytes_b(n, k));
+        };
+        const int nq = qdim + 2 * kvdim;
+        b.qkv.resize(c.n_layers); b.kv.resize(c.n_layers); b.wo.resize(c.n_layers);
+        b.acp.resize(c.n_layers); b.mcp.resize(c.n_layers);
+        for (int L = 0; ok && L < c.n_layers; ++L) {
+            const LayerWeights& w = s.layers[L];
+            op(b.qkv[L], nq, H); op(b.kv[L], 2 * kvdim, H); op(b.wo[L], H, qdim);
+            op(b.acp[L], dyn, H); op(b.mcp[L], dyn, H);
+            ok = ok && fp4_slice(w.wq, b.qkv[L].d, b.qkv[L].sf, nq, 0, qdim, H, st) &&
+                 fp4_slice(w.wk, b.qkv[L].d, b.qkv[L].sf, nq, qdim, kvdim, H, st) &&
+                 fp4_slice(w.wv, b.qkv[L].d, b.qkv[L].sf, nq, qdim + kvdim, kvdim, H, st) &&
+                 fp4_slice(w.wk, b.kv[L].d, b.kv[L].sf, 2 * kvdim, 0, kvdim, H, st) &&
+                 fp4_slice(w.wv, b.kv[L].d, b.kv[L].sf, 2 * kvdim, kvdim, kvdim, H, st) &&
+                 fp4_slice(w.wo, b.wo[L].d, b.wo[L].sf, H, 0, H, qdim, st) &&
+                 fp4_slice(w.attn_conv_proj, b.acp[L].d, b.acp[L].sf, dyn, 0, dyn, H, st) &&
+                 fp4_slice(w.mlp_conv_proj, b.mcp[L].d, b.mcp[L].sf, dyn, 0, dyn, H, st);
+        }
+        if (ok) {
+            op(b.fc, H, n_cap * H);
+            op(b.sel, c.selector_rank, H);
+            ok = ok && fp4_slice(s.fc, b.fc.d, b.fc.sf, H, 0, H, n_cap * H, st) &&
+                 fp4_slice(s.sel_hproj, b.sel.d, b.sel.sf, c.selector_rank, 0, c.selector_rank, H, st);
+        }
+        ok = ok && cudaStreamSynchronize(st) == cudaSuccess;
+        if (!ok) return fail("setup");
+        b.ready = true;
+    }
+    // One block-scaled GEMM: out[m, n] = A[m, k] . W[n, k], A quantized here.
+    auto gemm = [&](const bf16* a, int m, int k, const Impl::Batch::Op& w, int n, bf16* out) {
+        return kernels::launch_prefill_nvfp4_quant_a(a, s.f4_a, s.f4_asf, m, k, st) &&
+               kernels::launch_prefill_nvfp4_gemm(s.f4_a, s.f4_asf, w.d, w.sf, out, m, n, k, b.ws, st);
+    };
+    const int C8 = (C + 7) & ~7;
+    // Ids and context rows.
+    for (int j = 0; j < n_jobs; ++j)
+        for (int i = 0; i < BW; ++i) b.h_ids[j * BW + i] = jobs[j].noise_ids[i];
+    if (cudaMemcpyAsync(b.d_ids, b.h_ids, R * sizeof(int), cudaMemcpyHostToDevice, st) != cudaSuccess)
+        return fail("ids");
+    kernels::launch_embedding(b.d_ids, s.embed, b.x, R, H, st);
+    std::vector<int> coff((size_t)n_jobs);
+    for (int j = 0, o = 0; j < n_jobs; o += jobs[j].ctx_len, ++j) {
+        coff[(size_t)j] = o;
+        cu(cudaMemcpyAsync(b.ctx_h + (size_t)o * n_cap * H, jobs[j].target_hidden,
+                           (size_t)jobs[j].ctx_len * n_cap * H * sizeof(bf16), cudaMemcpyDeviceToDevice, st),
+           "batched ctx gather");
+    }
+    if (C8 > C)   // the GEMM's rows come in eights: zero the pad so it stays finite
+        cu(cudaMemsetAsync(b.ctx_h + (size_t)C * n_cap * H, 0, (size_t)(C8 - C) * n_cap * H * sizeof(bf16), st),
+           "batched ctx pad");
+    if (!gemm(b.ctx_h, C8, n_cap * H, b.fc, H, b.tp)) return fail("fc");
+    dflash_kernels::launch_rms(b.tp, s.hidden_norm, b.tp, C8, H, c.rms_eps, st);
+
+    const float scale = 1.f / sqrtf((float)d);
+    const int nq = qdim + 2 * kvdim;
+    const bool causal_force = [] {
+        const char* e = getenv("SPARKINFER_DFLASH_FORCE_CAUSAL");
+        return e && e[0] == '1';
+    }();
+    for (int L = 0; L < c.n_layers; ++L) {
+        const LayerWeights& w = s.layers[L];
+        const int window = (L < (int)c.sliding_layers.size() && c.sliding_layers[L]) ? c.sliding_window : 0;
+        const bool causal = causal_force ||
+                            (c.is_causal >= 0 ? c.is_causal != 0
+                                              : (L < (int)c.sliding_layers.size() && c.sliding_layers[L]));
+        if (L == 0) dflash_kernels::launch_rms(b.x, w.input_norm, b.xn, R, H, c.rms_eps, st);
+        // Attention conv "prepare": the kernels for every row in one GEMM, the conv per job (it runs
+        // along a block's own rows).
+        if (!gemm(b.xn, R, H, b.acp[L], dyn, b.conv_a)) return fail("attn conv");
+        for (int j = 0; j < n_jobs; ++j)
+            dflash_kernels::launch_grouped_conv(b.xn + (size_t)j * BW * H, w.attn_conv_base,
+                                                b.conv_a + (size_t)j * BW * dyn, 0,
+                                                b.conv_out + (size_t)j * BW * H, BW, H, c.conv_kernel,
+                                                c.conv_group, dyn, st);
+        cu(cudaMemcpyAsync(b.xn, b.conv_out, (size_t)R * H * sizeof(bf16), cudaMemcpyDeviceToDevice, st),
+           "batched attn conv");
+        // q|k|v for the block rows, k|v for the context rows.
+        if (!gemm(b.xn, R, H, b.qkv[L], nq, b.q)) return fail("qkv");
+        if (!gemm(b.tp, C8, H, b.kv[L], 2 * kvdim, b.ctx_k)) return fail("ctx kv");
+        // Q packed for the attention, into attn's buffer (free until the attention writes it).
+        cu(cudaMemcpy2DAsync(b.attn, (size_t)qdim * sizeof(bf16), b.q, (size_t)nq * sizeof(bf16),
+                             (size_t)qdim * sizeof(bf16), R, cudaMemcpyDeviceToDevice, st), "batched q");
+        for (int j = 0; j < n_jobs; ++j) {
+            const BlockJob& jb = jobs[j];
+            const Impl::Slot& sl = s.slots[(size_t)jb.slot];
+            const int past = sl.seq_len, cl = jb.ctx_len;
+            bf16* kd = sl.k[L] + (size_t)past * kvdim;
+            bf16* vd = sl.v[L] + (size_t)past * kvdim;
+            const bf16* ck = b.ctx_k + (size_t)coff[(size_t)j] * 2 * kvdim;
+            const bf16* bq = b.q + (size_t)j * BW * nq;
+            const size_t kvb = (size_t)kvdim * sizeof(bf16);
+            cu(cudaMemcpy2DAsync(kd, kvb, ck, 2 * kvb, kvb, cl, cudaMemcpyDeviceToDevice, st), "ctx k");
+            cu(cudaMemcpy2DAsync(vd, kvb, ck + kvdim, 2 * kvb, kvb, cl, cudaMemcpyDeviceToDevice, st), "ctx v");
+            cu(cudaMemcpy2DAsync(kd + (size_t)cl * kvdim, kvb, bq + qdim, (size_t)nq * sizeof(bf16), kvb, BW,
+                                 cudaMemcpyDeviceToDevice, st), "block k");
+            cu(cudaMemcpy2DAsync(vd + (size_t)cl * kvdim, kvb, bq + qdim + kvdim, (size_t)nq * sizeof(bf16), kvb,
+                                 BW, cudaMemcpyDeviceToDevice, st), "block v");
+            bf16* qj = b.attn + (size_t)j * BW * qdim;
+            if (c.rope_normal) {
+                dflash_kernels::launch_rms_heads_rope_normal(qj, w.q_norm, BW, c.n_q_heads, d, c.rms_eps,
+                                                             jb.pos0, c.rope_theta, st);
+                dflash_kernels::launch_rms_heads_rope_normal(kd, w.k_norm, cl + BW, c.n_kv_heads, d,
+                                                             c.rms_eps, jb.pos0 - cl, c.rope_theta, st);
+            } else {
+                dflash_kernels::launch_rms_heads_rope(qj, w.q_norm, BW, c.n_q_heads, d, c.rms_eps, jb.pos0,
+                                                     c.rope_theta, st, s.d_yarn_inv_freq, s.yarn_att_scale);
+                dflash_kernels::launch_rms_heads_rope(kd, w.k_norm, cl + BW, c.n_kv_heads, d, c.rms_eps,
+                                                     jb.pos0 - cl, c.rope_theta, st, s.d_yarn_inv_freq,
+                                                     s.yarn_att_scale);
+            }
+            const int kv_len = past + cl + BW;
+            const int kv0 = std::min(sl.ctx_floor, kv_len);
+            // q is read from attn's buffer and the output goes to conv_out (attn is overwritten
+            // only after every job's attention, below).
+            dflash_kernels::launch_attn_gqa(qj, sl.k[L] + (size_t)kv0 * kvdim, sl.v[L] + (size_t)kv0 * kvdim,
+                                            b.conv_out + (size_t)j * BW * qdim, BW, kv_len - kv0,
+                                            c.n_q_heads, c.n_kv_heads, d, jb.pos0, kv0, window, causal, scale,
+                                            st, s.fa_m, s.fa_l, s.fa_acc);
+        }
+        cu(cudaMemcpyAsync(b.attn, b.conv_out, (size_t)R * qdim * sizeof(bf16), cudaMemcpyDeviceToDevice, st),
+           "batched attn");
+        if (!gemm(b.attn, R, qdim, b.wo[L], H, b.ao)) return fail("wo");
+        for (int j = 0; j < n_jobs; ++j)
+            dflash_kernels::launch_grouped_conv(b.ao + (size_t)j * BW * H,
+                                                w.attn_conv_base + (size_t)c.conv_kernel * H,
+                                                b.conv_a + (size_t)j * BW * dyn, 1,
+                                                b.conv_out + (size_t)j * BW * H, BW, H, c.conv_kernel,
+                                                c.conv_group, dyn, st);
+        cu(cudaMemcpyAsync(b.ao, b.conv_out, (size_t)R * H * sizeof(bf16), cudaMemcpyDeviceToDevice, st),
+           "batched attn conv finish");
+        dflash_kernels::launch_add_rms(b.x, b.ao, b.h, w.post_norm, b.hn, R, H, c.rms_eps, st);
+        // MLP conv "prepare", then the MLP.
+        if (!gemm(b.hn, R, H, b.mcp[L], dyn, b.conv_m)) return fail("mlp conv");
+        for (int j = 0; j < n_jobs; ++j)
+            dflash_kernels::launch_grouped_conv(b.hn + (size_t)j * BW * H, w.mlp_conv_base,
+                                                b.conv_m + (size_t)j * BW * dyn, 0,
+                                                b.conv_out + (size_t)j * BW * H, BW, H, c.conv_kernel,
+                                                c.conv_group, dyn, st);
+        cu(cudaMemcpyAsync(b.hn, b.conv_out, (size_t)R * H * sizeof(bf16), cudaMemcpyDeviceToDevice, st),
+           "batched mlp conv");
+        auto mm = [&](const unsigned char* wd, const unsigned char* wsf, bf16* out, int n, int kk) {
+            return kernels::launch_prefill_nvfp4_gemm(s.f4_a, s.f4_asf, wd, wsf, out, R, n, kk, b.ws, st);
+        };
+        const bool mlp_ok =
+            kernels::launch_prefill_nvfp4_quant_a(b.hn, s.f4_a, s.f4_asf, R, H, st) &&
+            mm(w.fp4_gate, w.fp4_gate_sf, b.gate, I, H) && mm(w.fp4_up, w.fp4_up_sf, b.up, I, H) &&
+            kernels::launch_prefill_nvfp4_swiglu_quant_a(b.gate, b.up, s.f4_a, s.f4_asf, R, I, st) &&
+            mm(w.fp4_down, w.fp4_down_sf, b.down, H, I);
+        if (!mlp_ok) return fail("mlp");
+        for (int j = 0; j < n_jobs; ++j)
+            dflash_kernels::launch_grouped_conv(b.down + (size_t)j * BW * H,
+                                                w.mlp_conv_base + (size_t)c.conv_kernel * H,
+                                                b.conv_m + (size_t)j * BW * dyn, 1,
+                                                b.conv_out + (size_t)j * BW * H, BW, H, c.conv_kernel,
+                                                c.conv_group, dyn, st);
+        cu(cudaMemcpyAsync(b.down, b.conv_out, (size_t)R * H * sizeof(bf16), cudaMemcpyDeviceToDevice, st),
+           "batched mlp conv finish");
+        const bf16* next_norm = (L + 1 < c.n_layers) ? s.layers[L + 1].input_norm : s.final_norm;
+        dflash_kernels::launch_add_rms(b.h, b.down, b.x, next_norm, b.xn, R, H, c.rms_eps, st);
+    }
+    // Head over every row (rows 1..depth of each block are read), then each block's selector walk.
+    if (head4) {
+        if (!(kernels::launch_prefill_nvfp4_quant_a(b.xn, s.f4_a, s.f4_asf, R, H, st) &&
+              kernels::launch_prefill_nvfp4_gemm_f32(s.f4_a, s.f4_asf, head_fp4, head_fp4_sf, b.logits, R, Vd, H,
+                                                     b.ws, st, head_alpha)))
+            return fail("head");
+    } else {
+        for (int j = 0; j < n_jobs; ++j) {
+            kernels::launch_quantize_q8_1_rows(b.xn + ((size_t)j * BW + 1) * H, s.head_q8, H, depth, H, st);
+            float* y = b.logits + ((size_t)j * BW + 1) * Vd;
+            bool ok = false;
+            if (s.lm_head_type == 12 && s.lm_head_i4)
+                ok = kernels::launch_gemv_i4_q81_multirow_f32(s.head_q8, s.lm_head_i4, s.lm_head_i4_scale,
+                                                              y, Vd, H, depth, st);
+            else if (s.lm_head_type == 12 && s.lm_head_i8)
+                ok = kernels::launch_gemv_i8_q81_multirow_f32(s.head_q8, s.lm_head_i8, s.lm_head_i8_scale,
+                                                              y, Vd, H, depth, st);
+            else if (s.lm_head_type == 12)
+                ok = kernels::launch_gemv_q4k_dp4a_multirow_f32(s.head_q8, s.lm_head, y, Vd, H, depth, st);
+            else if (s.lm_head_type == 14)
+                ok = kernels::launch_gemv_q6k_dp4a_multirow_f32(s.head_q8, s.lm_head, y, Vd, H, depth, st);
+            if (!ok) return fail("head");
+        }
+    }
+    const int k = c.selector_top_k, rank = c.selector_rank;
+    kernels::launch_topk_rows(b.logits, R, Vd, k, b.sel_ids, b.sel_vals, st);
+    if (!gemm(b.xn, R, H, b.sel, rank, b.sel_h)) return fail("selector");
+    static const bool coupled_on = [] {
+        const char* e = getenv("SPARKINFER_DFLASH_COUPLED");
+        return !(e && e[0] == '0');
+    }();
+    std::vector<bool> couple((size_t)n_jobs);
+    for (int j = 0; j < n_jobs; ++j) {
+        const BlockJob& jb = jobs[j];
+        couple[(size_t)j] = coupled_on && kernels::sample_rows_topk_eligible(jb.temperature, jb.top_k, 1 << 30);
+        Impl::DraftSampling& hs = b.h_samp[j];
+        for (int r = 0; r <= depth; ++r) {
+            hs.temp[r] = r == 0 ? 0.f : jb.temperature;
+            hs.seed[r] = jb.seed;
+            hs.step[r] = r == 0 ? 0ull : jb.step0 + (unsigned long long)(r - 1);
+            hs.top_k[r] = jb.top_k;
+            hs.top_p[r] = jb.top_p;
+        }
+    }
+    cu(cudaMemcpyAsync(b.d_samp, b.h_samp, (size_t)n_jobs * sizeof(Impl::DraftSampling),
+                       cudaMemcpyHostToDevice, st), "batched sampling");
+    for (int j = 0; j < n_jobs; ++j) {
+        const size_t r1 = (size_t)j * BW + 1;
+        const Impl::DraftSampling* ds = b.d_samp + j;
+        dflash_kernels::launch_selector_walk(b.sel_vals + r1 * k, b.sel_ids + r1 * k, b.sel_h + r1 * rank,
+                                             s.sel_pred, s.sel_succ, b.d_ids + (size_t)j * BW, depth, k, rank,
+                                             couple[(size_t)j] ? &ds->temp[1] : nullptr,
+                                             couple[(size_t)j] ? &ds->seed[1] : nullptr,
+                                             couple[(size_t)j] ? &ds->step[1] : nullptr,
+                                             b.d_out + (size_t)j * BW + 1, st);
+    }
+    cu(cudaMemcpyAsync(b.h_out, b.d_out, (size_t)R * sizeof(int), cudaMemcpyDeviceToHost, st), "batched out");
+    if (cudaStreamSynchronize(st) != cudaSuccess) return fail("sync");
+    for (int j = 0; j < n_jobs; ++j) {
+        for (int t = 1; t <= depth; ++t) jobs[j].out_argmax[t] = b.h_out[(size_t)j * BW + t];
+        // As forward_block ends: the block's rows appended, then cropped back to its start.
+        Impl::Slot& sl = s.slots[(size_t)jobs[j].slot];
+        sl.seq_len = jobs[j].pos0;
+    }
+    s.load_slot(s.cur_slot);
     return true;
 }
 

@@ -122,6 +122,29 @@ public:
                        int proposals = 0, float* out_confidence = nullptr,
                        int target_hidden_start = 0);
 
+    // Several slots' steady-state blocks in one pass: what forward_block does for each job's slot,
+    // with every projection run once over all the jobs' rows (block-scaled NVFP4 / bf16 tensor-core
+    // GEMMs) instead of once per slot, and only the conv, RoPE, attention and selector per slot.
+    // DFlash2 only, and only for a block that ingests its last verify's 1..8 accepted rows (not a
+    // prompt's first block); anything else returns false having changed nothing, and the caller
+    // runs forward_block per slot. Each job's out_argmax gets [1..proposals]. head_fp4 /
+    // head_fp4_sf / head_alpha: the target's NVFP4 LM head when resident (one GEMM for every row),
+    // else null (the per-slot head forward_block uses).
+    struct BlockJob {
+        int slot = 0;
+        const void* target_hidden = nullptr;   // [ctx_len, n_capture * hidden]
+        int ctx_len = 0;
+        const int* noise_ids = nullptr;        // [block_size]
+        int pos0 = 0;
+        float temperature = 0.f;               // the coupled sampler, as set_sampling
+        unsigned long long seed = 0, step0 = 0;
+        int top_k = 0;
+        float top_p = 1.f;
+        int* out_argmax = nullptr;             // [proposals + 1]
+    };
+    bool forward_blocks(const BlockJob* jobs, int n_jobs, int proposals, const void* head_fp4 = nullptr,
+                        const void* head_fp4_sf = nullptr, float head_alpha = 1.f);
+
     // Couple the next forward_block's proposals to a sampled request's sampler: proposal r (1-based)
     // becomes the token that sampler would draw from the draft's own logits -- top_k/top_p mask,
     // temperature, Gumbel noise from Philox(seed, vocab id, step0 + r - 1) -- instead of their

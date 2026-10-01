@@ -773,6 +773,15 @@ public:
     bool spec_group_draft(int slot, const void* target_hidden, int th_len, int seed, int pos,
                           float temperature, unsigned long long seed_rng, unsigned long long step0,
                           int top_k, float top_p, int* proposals);
+    // spec_group_draft for n slots in one pass (DFlashDraftModel::forward_blocks): job i drafts
+    // slot slots[i] from hidden rows hidden[i] (th_len[i] of them) with seed seeds[i] at position
+    // pos[i], its sampler at temperature[i] / seed_rng[i] / step0[i] / top_k[i] / top_p[i], into
+    // proposals + i * spec_group_depth(). False -- nothing drafted -- where forward_blocks declines;
+    // the caller drafts per slot.
+    bool spec_group_draft_multi(int n, const int* slots, const void* const* hidden, const int* th_len,
+                                const int* seeds, const int* pos, const float* temperature,
+                                const unsigned long long* seed_rng, const unsigned long long* step0,
+                                const int* top_k, const float* top_p, int* proposals);
     bool spec_group_verify(int n, const uint64_t* seq_ids, const int* const* blocks, const int* lens,
                            const int* start_pos, const PackedSampling* sampling, int* out_ids,
                            int* keep);
