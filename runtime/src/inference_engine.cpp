@@ -1387,7 +1387,8 @@ void ContinuousBatchEngine::worker_loop() {
                         (live == 1 && !only->spec_tried && only->phase == SeqPhase::PREFILL &&
                          only->prefill_pos == only->req.prefill_start && spec_eligible(only->req));
                     if (want_spec && model_->dflash_draft_offloaded()) {
-                        // Bring it back outside mu_ (a submit must not wait on the copy), then decide again.
+                        // Bring it back outside mu_ (submits keep queueing jobs meanwhile; one that
+                        // opens a session waits on the device mutex for the ~0.1 s copy), then decide again.
                         draft_restore = true;
                         spec_group = false;
                     }

@@ -118,6 +118,9 @@ public:
     size_t offload();
     bool restore();
     bool offloaded() const;
+    // While pinned (a speculation group or generation is using the draft), offload() refuses.
+    // Counted; the caller pins and unpins under the target's device mutex.
+    void pin(bool on);
     size_t resident_bytes() const;
     size_t footprint_bytes() const;   // what restore() maps back
 

@@ -372,6 +372,7 @@ struct DFlashDraftModel::Impl {
     // the whole draft can step off the device while nothing speculates (see offload()).
     VmmArena arena;
     bool arena_on = false;
+    int pins = 0;   // speculation in progress: offload() refuses (see DFlashDraftModel::pin)
     void* dev_alloc(size_t bytes) {
         if (arena_on) return arena.alloc(bytes);
         void* p = nullptr;
@@ -952,7 +953,7 @@ int DFlashDraftModel::current_slot() const { return p_->cur_slot; }
 
 size_t DFlashDraftModel::offload() {
     Impl& s = *p_;
-    if (!s.arena_on || s.arena.offloaded()) return 0;
+    if (!s.arena_on || s.arena.offloaded() || s.pins > 0) return 0;
     // Slots 1.. are per-request cudaMalloc buffers the speculation group frees when it ends; one
     // still live means a group is, and the draft must stay.
     for (size_t i = 1; i < s.slots.size(); ++i)
@@ -962,6 +963,11 @@ size_t DFlashDraftModel::offload() {
 }
 
 bool DFlashDraftModel::restore() { return !p_->arena_on || p_->arena.restore(); }
+
+void DFlashDraftModel::pin(bool on) {
+    if (on) ++p_->pins;
+    else if (p_->pins > 0) --p_->pins;
+}
 
 bool DFlashDraftModel::offloaded() const { return p_->arena_on && p_->arena.offloaded(); }
 
@@ -1418,6 +1424,7 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                                      int* out_argmax, cudaStream_t stream, int proposals,
                                      float* out_confidence, int target_hidden_start) {
     Impl& s = *p_;
+    if (s.arena_on && s.arena.offloaded()) return false;   // never read unmapped memory
     s.ensure_quant();
     if (!s.fc || !s.embed || !s.lm_head || !noise_ids || !out_argmax) return false;
     if (ctx_len < 0 || ctx_len > s.cap) return false;
@@ -2439,6 +2446,7 @@ bool fp4_slice(const void* w, unsigned char* d, unsigned char* sf, int n, int n0
 bool DFlashDraftModel::forward_blocks(const BlockJob* jobs, int n_jobs, int proposals,
                                       const void* head_fp4, const void* head_fp4_sf, float head_alpha) {
     Impl& s = *p_;
+    if (s.arena_on && s.arena.offloaded()) return false;   // never read unmapped memory
     const auto& c = s.cfg;
     static const bool enabled = [] {
         const char* e = getenv("SPARKINFER_DFLASH_BATCHED");

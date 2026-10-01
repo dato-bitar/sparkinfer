@@ -5,6 +5,51 @@
 namespace sparkinfer {
 
 namespace {
+// The driver API, resolved through the runtime rather than linked: linking libcuda would make the
+// runtime library refuse to load on a host without the driver (CI runners, `--help`), where it
+// should start and report that there is no device. decltype keeps each pointer's exact type.
+struct Driver {
+    decltype(&::cuInit) Init = nullptr;
+    decltype(&::cuDeviceGet) DeviceGet = nullptr;
+    decltype(&::cuDeviceGetAttribute) DeviceGetAttribute = nullptr;
+    decltype(&::cuMemGetAllocationGranularity) MemGetAllocationGranularity = nullptr;
+    decltype(&::cuMemAddressReserve) MemAddressReserve = nullptr;
+    decltype(&::cuMemAddressFree) MemAddressFree = nullptr;
+    decltype(&::cuMemCreate) MemCreate = nullptr;
+    decltype(&::cuMemRelease) MemRelease = nullptr;
+    decltype(&::cuMemMap) MemMap = nullptr;
+    decltype(&::cuMemUnmap) MemUnmap = nullptr;
+    decltype(&::cuMemSetAccess) MemSetAccess = nullptr;
+    bool ok = false;
+};
+
+template <class F> bool resolve(F& fn, const char* name) {
+    void* p = nullptr;
+    cudaDriverEntryPointQueryResult q = cudaDriverEntryPointSymbolNotFound;
+    if (cudaGetDriverEntryPointByVersion(name, &p, 12000, cudaEnableDefault, &q) != cudaSuccess ||
+        q != cudaDriverEntryPointSuccess || !p) {
+        cudaGetLastError();
+        return false;
+    }
+    fn = reinterpret_cast<F>(p);
+    return true;
+}
+
+const Driver& driver() {
+    static const Driver d = [] {
+        Driver r;
+        r.ok = resolve(r.Init, "cuInit") && resolve(r.DeviceGet, "cuDeviceGet") &&
+               resolve(r.DeviceGetAttribute, "cuDeviceGetAttribute") &&
+               resolve(r.MemGetAllocationGranularity, "cuMemGetAllocationGranularity") &&
+               resolve(r.MemAddressReserve, "cuMemAddressReserve") &&
+               resolve(r.MemAddressFree, "cuMemAddressFree") && resolve(r.MemCreate, "cuMemCreate") &&
+               resolve(r.MemRelease, "cuMemRelease") && resolve(r.MemMap, "cuMemMap") &&
+               resolve(r.MemUnmap, "cuMemUnmap") && resolve(r.MemSetAccess, "cuMemSetAccess");
+        return r;
+    }();
+    return d;
+}
+
 CUmemAllocationProp device_prop(int dev) {
     CUmemAllocationProp p = {};
     p.type = CU_MEM_ALLOCATION_TYPE_PINNED;
@@ -17,22 +62,23 @@ size_t round_up(size_t n, size_t m) { return (n + m - 1) / m * m; }
 
 bool VmmArena::init(int device, size_t va_bytes) {
     // The runtime has made the primary context current by now; the driver API needs it initialized.
-    if (cuInit(0) != CUDA_SUCCESS) return false;
+    const Driver& d0 = driver();
+    if (!d0.ok || d0.Init(0) != CUDA_SUCCESS) return false;
     int vmm = 0;
     CUdevice d = 0;
-    if (cuDeviceGet(&d, device) != CUDA_SUCCESS ||
-        cuDeviceGetAttribute(&vmm, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, d) !=
+    if (driver().DeviceGet(&d, device) != CUDA_SUCCESS ||
+        driver().DeviceGetAttribute(&vmm, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, d) !=
             CUDA_SUCCESS ||
         !vmm)
         return false;
     const CUmemAllocationProp prop = device_prop(device);
     size_t g = 0;
-    if (cuMemGetAllocationGranularity(&g, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED) !=
+    if (driver().MemGetAllocationGranularity(&g, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED) !=
             CUDA_SUCCESS || g == 0)
         return false;
     const size_t va = round_up(va_bytes, g);
     CUdeviceptr base = 0;
-    if (cuMemAddressReserve(&base, va, 0, 0, 0) != CUDA_SUCCESS) return false;
+    if (driver().MemAddressReserve(&base, va, 0, 0, 0) != CUDA_SUCCESS) return false;
     dev_ = device;
     gran_ = g;
     base_ = base;
@@ -44,24 +90,24 @@ VmmArena::~VmmArena() {
     if (!base_) return;
     cudaDeviceSynchronize();
     for (Block& b : blocks_) unmap_block(b);
-    cuMemAddressFree(base_, va_size_);
+    driver().MemAddressFree(base_, va_size_);
     if (host_) cudaFreeHost(host_);
 }
 
 bool VmmArena::map_block(Block& b) {
     const CUmemAllocationProp prop = device_prop(dev_);
-    if (cuMemCreate(&b.h, b.size, &prop, 0) != CUDA_SUCCESS) return false;
-    if (cuMemMap(b.va, b.size, 0, b.h, 0) != CUDA_SUCCESS) {
-        cuMemRelease(b.h);
+    if (driver().MemCreate(&b.h, b.size, &prop, 0) != CUDA_SUCCESS) return false;
+    if (driver().MemMap(b.va, b.size, 0, b.h, 0) != CUDA_SUCCESS) {
+        driver().MemRelease(b.h);
         return false;
     }
     CUmemAccessDesc acc = {};
     acc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     acc.location.id = dev_;
     acc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-    if (cuMemSetAccess(b.va, b.size, &acc, 1) != CUDA_SUCCESS) {
-        cuMemUnmap(b.va, b.size);
-        cuMemRelease(b.h);
+    if (driver().MemSetAccess(b.va, b.size, &acc, 1) != CUDA_SUCCESS) {
+        driver().MemUnmap(b.va, b.size);
+        driver().MemRelease(b.h);
         return false;
     }
     b.mapped = true;
@@ -70,8 +116,8 @@ bool VmmArena::map_block(Block& b) {
 
 void VmmArena::unmap_block(Block& b) {
     if (!b.mapped) return;
-    cuMemUnmap(b.va, b.size);
-    cuMemRelease(b.h);
+    driver().MemUnmap(b.va, b.size);
+    driver().MemRelease(b.h);
     b.mapped = false;
 }
 
@@ -135,7 +181,7 @@ size_t VmmArena::live_bytes() const {
 }
 
 size_t VmmArena::offload() {
-    if (!base_ || offloaded_) return 0;
+    if (!base_ || offloaded_ || pin_failed_) return 0;
     const size_t total = mapped_bytes();
     if (total == 0) return 0;
     if (host_size_ < total) {
@@ -148,19 +194,26 @@ size_t VmmArena::offload() {
         if (cudaHostAlloc(&host_, want, cudaHostAllocDefault) != cudaSuccess) {
             cudaGetLastError();
             host_ = nullptr;
+            pin_failed_ = true;
+            fprintf(stderr, "[vmm] cannot pin %.2f GB of host memory: the draft stays on the device\n",
+                    (double)want / 1e9);
             return 0;
         }
         host_size_ = want;
     }
     cudaDeviceSynchronize();
     size_t off = 0;
-    for (const Block& b : blocks_) {
+    for (Block& b : blocks_) {
+        b.in_host = false;
         if (!b.mapped) continue;
         if (cudaMemcpy(static_cast<char*>(host_) + off, reinterpret_cast<void*>(b.va), b.size,
                        cudaMemcpyDeviceToHost) != cudaSuccess) {
             cudaGetLastError();
             return 0;   // nothing released yet: still resident and intact
         }
+        // Each block keeps its own offset, so a free() while offloaded cannot shift the others'.
+        b.in_host = true;
+        b.host_off = off;
         off += b.size;
     }
     for (Block& b : blocks_)
@@ -171,21 +224,19 @@ size_t VmmArena::offload() {
 
 bool VmmArena::restore() {
     if (!offloaded_) return true;
-    size_t off = 0;
     for (size_t i = 0; i < blocks_.size(); ++i) {
         Block& b = blocks_[i];
-        if (!b.live) continue;
+        if (!b.live || !b.in_host) continue;
         if (!map_block(b)) {
             for (size_t j = 0; j < i; ++j) unmap_block(blocks_[j]);
             return false;
         }
-        if (cudaMemcpy(reinterpret_cast<void*>(b.va), static_cast<char*>(host_) + off, b.size,
+        if (cudaMemcpy(reinterpret_cast<void*>(b.va), static_cast<char*>(host_) + b.host_off, b.size,
                        cudaMemcpyHostToDevice) != cudaSuccess) {
             cudaGetLastError();
             for (size_t j = 0; j <= i; ++j) unmap_block(blocks_[j]);
             return false;
         }
-        off += b.size;
     }
     offloaded_ = false;
     return true;

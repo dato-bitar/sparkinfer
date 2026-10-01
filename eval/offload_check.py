@@ -4,11 +4,13 @@
 One server (draft loaded, SPARKINFER_DRAFT_OFFLOAD_MS=200): seeded prompts one at a time (they
 speculate), then a 16-request burst (the draft goes to the host), then the same prompts again (it
 comes back and they speculate again). A second launch with SPARKINFER_SPECULATIVE=0 is the
-reference. PASS when all three sets of completions are identical and the log shows both moves.
+reference. PASS when all three sets of completions are identical, the log shows both moves, and
+each request's speculation (verifies, rows, tokens kept) is the same before the burst and after the
+draft came back: lossless verification hides a draft restored wrong, its acceptance does not.
 
 usage: offload_check.py <server-bin> <model-dir> <draft-dir>
 """
-import json, os, signal, subprocess, sys, tempfile, threading, time, urllib.request
+import json, os, re, signal, subprocess, sys, tempfile, threading, time, urllib.request
 
 PORT = 18137
 TMP = tempfile.mkdtemp(prefix="offload_check_")
@@ -66,7 +68,8 @@ def run_set():
 def main():
     binary, model, draft = sys.argv[1:4]
     log = os.path.join(TMP, "offload_check_spec.log")
-    p = launch(binary, model, draft, log, {"SPARKINFER_DRAFT_OFFLOAD_MS": "200"})
+    p = launch(binary, model, draft, log, {"SPARKINFER_DRAFT_OFFLOAD_MS": "200",
+                                           "SPARKINFER_SPEC_GROUP_TRACE": "1"})
     first = run_set()
     burst = [threading.Thread(target=ask, args=(PROMPTS[i % 4] + f" (variant {i})", 0.7, 384)) for i in range(16)]
     for t in burst:
@@ -77,6 +80,13 @@ def main():
     stop(p)
     text = open(log).read()
     off, back = "draft off the device" in text, "draft back on the device" in text
+    # One group per request, one at a time: the first and last len(PROMPTS)*len(TEMPS) "end:" lines
+    # are the two sets, in the same order.
+    ends = re.findall(r"\[spec-group\] end: 1 members, \d+ handed off, (\d+) verifies, (\d+) rows, (\d+) kept", text)
+    k = len(PROMPTS) * len(TEMPS)
+    same_accept = len(ends) >= 2 * k and ends[:k] == ends[-k:]
+    print("acceptance (verifies, rows, kept) before:", ends[:k])
+    print("acceptance after the round trip:        ", ends[-k:])
     print("log:", [l for l in text.splitlines() if "[spec] draft" in l or "step off the device" in l][:6])
     p = launch(binary, model, draft, os.path.join(TMP, "offload_check_ref.log"), {"SPARKINFER_SPECULATIVE": "0"})
     ref = run_set()
@@ -84,8 +94,9 @@ def main():
     bad = [k for k in ref if not (first[k] == second[k] == ref[k])]
     for k in bad:
         print("MISMATCH", k, "first==ref", first[k] == ref[k], "second==ref", second[k] == ref[k])
-    ok = not bad and off and back
-    print(f"offloaded={off} restored={back} identical={not bad} ({len(ref) - len(bad)}/{len(ref)})")
+    ok = not bad and off and back and same_accept
+    print(f"offloaded={off} restored={back} identical={not bad} ({len(ref) - len(bad)}/{len(ref)}) "
+          f"same_acceptance={same_accept}")
     print("OFFLOAD_CHECK", "PASS" if ok else "FAIL")
 
 

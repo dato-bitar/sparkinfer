@@ -59,6 +59,8 @@ private:
         bool mapped = false;
         bool live = true;     // false once free()d: its address range is never reused
         bool small = false;   // a shared chunk of small allocations
+        bool in_host = false; // its bytes are in the host copy, at host_off
+        size_t host_off = 0;
     };
     bool map_block(Block& b);
     void unmap_block(Block& b);
@@ -72,6 +74,7 @@ private:
     void* host_ = nullptr;
     size_t host_size_ = 0;
     bool offloaded_ = false;
+    bool pin_failed_ = false;   // the host copy could not be pinned: do not retry on every pressure
 };
 
 }  // namespace sparkinfer

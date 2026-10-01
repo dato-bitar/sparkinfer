@@ -4687,7 +4687,7 @@ uint64_t Qwen35Model::open_session(int num_tokens, bool* alloc_failed,
         if (attempt == 0 && release_bonsai_shadow(s)) continue;
         // An idle draft next: it comes back when speculation resumes; the head below does not.
         if (attempt <= 1 && offload_idle_draft(s, "a session's state")) continue;
-        if (attempt <= 1 && (s.lm_head_fp4_payload || s.lm_head_fp4_sf_buf)) {
+        if (attempt <= 2 && (s.lm_head_fp4_payload || s.lm_head_fp4_sf_buf)) {
             fprintf(stderr, "[compressed-tensors] NVFP4 lm_head released for a session's state\n");
             release_lm_head_fp4();
             continue;
@@ -6132,6 +6132,11 @@ bool Qwen35Model::spec_group_begin() {
     Impl& s = *p_;
     if (!s.dflash_draft) return false;
     std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+    // The worker restored the draft before deciding to speculate, but a session opened on another
+    // thread may have offloaded it again since (offload_idle_draft). Bring it back or decline, and
+    // pin it for the group: nothing may take it off the device while a member can read it.
+    if (s.dflash_draft->offloaded() && !s.dflash_draft->restore()) return false;
+    s.dflash_draft->pin(true);
     bind_draft_shared_weights();
     s.dflash_draft->ensure_quant();
     return true;
@@ -6146,6 +6151,7 @@ void Qwen35Model::spec_group_end() {
     if (s.dflash_draft) {
         s.dflash_draft->use_slot(0);
         for (int i = 1; i < 8; ++i) s.dflash_draft->free_slot(i);
+        s.dflash_draft->pin(false);
     }
     // Capture-on graphs may not be replayed by the decode that takes over.
     invalidate_decode_graph();
@@ -6615,6 +6621,18 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     if (resume) *resume = SpecResume{};
     if (!s.dflash_draft || prompt.empty() || max_new <= 0) return out;
     DFlashDraftModel& draft = *s.dflash_draft;
+    // On the device and pinned for the whole generation, as spec_group_begin does for a group:
+    // an empty result sends the request down the ordinary path.
+    {
+        std::lock_guard<std::recursive_mutex> dl(s.device_mu);
+        if (draft.offloaded() && !draft.restore()) return out;
+        draft.pin(true);
+    }
+    struct Unpin {
+        DFlashDraftModel& d;
+        std::recursive_mutex& m;
+        ~Unpin() { std::lock_guard<std::recursive_mutex> l(m); d.pin(false); }
+    } unpin{draft, s.device_mu};
     const DFlashDraftConfig& dc = draft.config();
     // The most proposals a block carries: DFlash2 reads them from rows 1..block_size-1 (row 0 is
     // the anchor), DSpark's row-shifted mapping from all block_size rows.
