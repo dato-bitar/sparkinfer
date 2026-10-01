@@ -628,7 +628,28 @@ void ContinuousBatchEngine::run_spec_group() {
         auto t_join = std::chrono::steady_clock::now();
         if (!leave) {
             std::lock_guard<std::mutex> lock(mu_);
+            // Count everything waiting first. Each check below only asks whether ONE more fits, so
+            // 15 prompts arriving behind one member all "fit" and joined one at a time -- an 8K
+            // join is a 0.6 s speculative prefill with its own draft slot and capture -- until the
+            // group was full, and then the next one ended it anyway. Measured: AIPerf 8K prompts
+            // at 16 concurrent, 4-5 joins per burst, the 5th out of memory and on the token loop
+            // (83 s), 38 tok/s against 167 without a draft. When they cannot all join, none should.
+            int waiting = 0;
             for (auto& kv : jobs_) {
+                const Job* j = kv.second.get();
+                if (j->done) continue;
+                bool member = false;
+                for (const Member& m : members) member = member || (!m.done && m.job == j);
+                if (!member) ++waiting;
+            }
+            if (live_members() + waiting > G) {
+                if (spec_group_trace())
+                    fprintf(stderr, "[spec-group] leave: %d waiting, %d members, group of %d\n",
+                            waiting, live_members(), G);
+                leave = true;
+            }
+            for (auto& kv : jobs_) {
+                if (leave) break;
                 Job* j = kv.second.get();
                 if (j->done) continue;
                 bool member = false;

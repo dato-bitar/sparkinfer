@@ -6184,7 +6184,7 @@ int Qwen35Model::spec_group_join(const std::vector<int>& prompt, int max_new, in
     if (trace) { cudaDeviceSynchronize(); t_setup = ms_at(); }
     // The same prefill dflash_generate runs (see there): batched from zero or resumed past it, the
     // token loop for what a pass leaves, and the caller's checkpoints one pass or per segment.
-    auto prefill_range = [&](int a, int b) -> int {
+    auto prefill_range = [&](int a, int b, bool may_decline = false) -> int {
         int r = -1, done = a;
         if (a == 0 && batched_prefill_windowed_enabled(s.gguf, s.cfg, b, s.kv)) {
             int d = 0;
@@ -6195,6 +6195,14 @@ int Qwen35Model::spec_group_join(const std::vector<int>& prompt, int max_new, in
             r = prefill_batched_resume(prompt.data(), a, b, false, &d);
             done = a + d;
         }
+        // The token loop below is ~10 ms a token: 83 s for an 8K prompt whose batched pass found
+        // no room (measured, joining a group beside four other 8K members). A join is optional:
+        // declined with nothing written, the request prefills on the ordinary path, as after the
+        // declines above. So for a whole prompt that the pass left untouched, past a few hundred
+        // tokens, decline rather than hold every member for a minute. Not for a segment of a
+        // checkpointed prompt (the next segment assumes this one ran) or a resumed one (its
+        // failure aborts the request).
+        if (r < 0 && may_decline && done == a && b - a > 256) return -1;
         if (r < 0)
             for (int i = done; i < b; i++) {
                 set_dflash_capture_row(0);
@@ -6225,7 +6233,7 @@ int Qwen35Model::spec_group_join(const std::vector<int>& prompt, int max_new, in
             next = prefill_range(pos, n);
         }
     } else {
-        next = prefill_range(prefill_from, n);
+        next = prefill_range(prefill_from, n, /*may_decline=*/prefill_from == 0);
     }
     if (trace) t_prefill = ms_at();
     if (next >= 0 && next < s.cfg.vocab && hooks.temperature > 0.f)
