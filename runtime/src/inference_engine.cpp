@@ -284,9 +284,16 @@ int ContinuousBatchEngine::num_active() const {
 }
 
 // Free blocks plus those only the prefix cache holds: admission evicts the cache for those
-// (PrefixCache::evict_for), so for a caller sizing what it may send they are free.
+// (PrefixCache::evict_for), so for a caller sizing what it may send they are free. The refcounts
+// behind the second term change under the device mutex, so they are read only while holding it --
+// and only if it is free: /v1/capacity and /metrics must not wait out a long prefill. Otherwise the
+// last count stands.
 int ContinuousBatchEngine::num_free_kv_blocks() const {
-    return kv_->num_free_blocks() + (prefix_cache_ ? prefix_cache_->evictable_blocks() : 0);
+    if (prefix_cache_) {
+        std::unique_lock<std::recursive_mutex> lock(model_->device_mutex(), std::try_to_lock);
+        if (lock.owns_lock()) evictable_last_.store(prefix_cache_->evictable_blocks(), std::memory_order_relaxed);
+    }
+    return kv_->num_free_blocks() + (prefix_cache_ ? evictable_last_.load(std::memory_order_relaxed) : 0);
 }
 
 int ContinuousBatchEngine::num_waiting() const {
@@ -1041,7 +1048,12 @@ uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(
         std::lock_guard<std::recursive_mutex> device_lock(model_->device_mutex());
         if (job.req.use_prefix_session) {
             seq_id = 0;
-            if (!kv_->allocate(seq_id, budget)) return fail(EnqueueError::OVERLOADED);
+            // The prefix cache may be holding the room this turn needs: give it back first, as the
+            // automatic-cache branch below does.
+            if (!kv_->allocate(seq_id, budget) &&
+                !(prefix_cache_ && prefix_cache_->evict_for((budget + kv_->block_size() - 1) / kv_->block_size()) &&
+                  kv_->allocate(seq_id, budget)))
+                return fail(EnqueueError::OVERLOADED);
             model_->activate_session(seq_id);
             // The KV blocks survived the previous request, but its decoding advanced the hybrid
             // recurrent state past the prefix. Replay the end-of-prefix snapshot so the 48

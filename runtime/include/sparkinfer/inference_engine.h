@@ -331,6 +331,9 @@ private:
     std::atomic<bool> spec_running_{false};    // the worker is inside run_speculative
     std::atomic<bool> spec_interrupt_{false};  // a request was submitted meanwhile: hand over
     std::atomic<uint64_t> spec_runs_{0}, spec_tokens_{0}, spec_handoffs_{0}, spec_tier_stops_{0};
+    // Last count of blocks only the prefix cache holds (num_free_kv_blocks), refreshed whenever the
+    // device mutex is free to read the KV refcounts under.
+    mutable std::atomic<int> evictable_last_{0};
 };
 
 }  // namespace sparkinfer
