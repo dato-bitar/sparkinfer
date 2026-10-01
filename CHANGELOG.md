@@ -5,6 +5,25 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Speculative decoding
+
+- **DFlash2's draft slots hold a sliding window, not all the context a request can reach**: about
+  4K rows instead of up to 16,384, so ~130 MB a slot instead of ~0.5 GB. That includes slot 0,
+  which every loaded DFlash2 holds (its resident footprint 2.70 -> 2.35 GB).
+  - **Why it is safe:** every DFlash2 layer attends a 2,048-token sliding window, and positions only
+    grow, so no block reads a key older than `pos0 - 2047`.
+  - **How a slot slides:** when the next block would run past its rows, the keys still in the window
+    move to row 0 (one non-overlapping copy per layer, about every 2,048 positions) and the slot's
+    base position advances. Keys are stored rotated at their absolute positions, so moving them
+    changes nothing.
+  - **Long prompts:** a long prompt's first block keeps only the window's rows.
+  - DSpark, whose layers attend everything, keeps full slots. `SPARKINFER_DFLASH_SLOT_WINDOW` sets
+    the rows (0 keeps full slots).
+  - **Tested:** `dspark_tau_check`, this branch against main. tau, steps and LOSSLESS are identical
+    for 8K and 16K prompts (first block at the window) and for 1K + 4,096 and 1.6K + 3,000
+    generated tokens (slots slide mid-generation): 2.633/2.633, 3.000/3.000, 4.645/4.645,
+    3.674/3.674. `spec_group_check`, `spec_multiturn_check` and `offload_check` pass; conc_bench
+    c1-c8 is unchanged.
 ## [0.6.1] — 2026-10-02
 
 **Requests without `max_tokens` are no longer cut off at 256 tokens**: agents and OpenAI SDK
