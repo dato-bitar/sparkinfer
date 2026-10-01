@@ -55,5 +55,6 @@ void launch_ct_dequant_nvfp4_dev(const void*, const void*, const float*, void*, 
     ct_nvfp4_unavailable();
 }
 bool launch_ct_nvfp4_pack_sfb(const void*, void*, int, int, cudaStream_t) { return false; }
+bool launch_nvfp4_pack_sfa(const void*, void*, int, int, cudaStream_t) { return false; }
 } // namespace sparkinfer::kernels
 #endif
