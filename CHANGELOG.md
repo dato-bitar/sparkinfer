@@ -5,6 +5,20 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.2] — 2026-10-02
+
+**The release container speculates by default** with z-lab's DFlash2 drafter:
+- **Faster at low and medium concurrency:** 1.2-2.2x the throughput of the same server without a
+  drafter at 1-4 concurrent requests (AIPerf), and the same at 16-32.
+- **Long answers:** for answers of thousands of tokens without `max_tokens`, 2.92x at 4
+  concurrent requests and 1.13x at 8.
+- **What made it possible:**
+  - DFlash2's draft slots slide over a 2,048-token window (~130 MB a slot, not ~0.5 GB);
+  - a request speculates up to the end of the drafter's context instead of only when its whole
+    `max_tokens` fits;
+  - the drafter steps off the device under load (0.6.1).
+- **Opting out:** `-e SPEC_DRAFT=none` serves without a drafter.
+
 ### Speculative decoding
 
 - **DFlash2's draft slots hold a sliding window, not all the context a request can reach**: about
