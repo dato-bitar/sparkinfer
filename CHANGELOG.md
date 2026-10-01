@@ -19,6 +19,10 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
   - **Long prompts:** a long prompt's first block keeps only the window's rows.
   - DSpark, whose layers attend everything, keeps full slots. `SPARKINFER_DFLASH_SLOT_WINDOW` sets
     the rows (0 keeps full slots).
+  - **Draft numerics:** unchanged wherever the attention launcher already trimmed to the window,
+    i.e. with default settings past ~2.2K keys, which is where a slot slides. Elsewhere only
+    acceptance could move, never output. With `SPARKINFER_DFLASH_IDLE_DRAFT` (whose cache can fall
+    behind the positions) a windowed slot declines the block instead of sliding.
   - **Tested:** `dspark_tau_check`, this branch against main. tau, steps and LOSSLESS are identical
     for 8K and 16K prompts (first block at the window) and for 1K + 4,096 and 1.6K + 3,000
     generated tokens (slots slide mid-generation): 2.633/2.633, 3.000/3.000, 4.645/4.645,

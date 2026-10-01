@@ -1,6 +1,8 @@
 // DFlash draft runtime: safetensors load + GGUF load + block-parallel forward.
 #include "sparkinfer/models/dflash_draft.h"
 #include "vmm_arena.h"
+
+#include <cstddef>
 #include "sparkinfer/device_health.h"
 #include <atomic>
 #include "sparkinfer/models/dflash_kernels.h"
@@ -476,8 +478,9 @@ struct DFlashDraftModel::Impl {
     // Slots (DFlashDraftModel::use_slot): the members above are the current slot's; the others
     // are parked here. Slot 0's buffers come from alloc_scratch (in `owned`); the rest are this
     // struct's own.
-    // `cap` is the positions the slot's buffers hold: cfg.max_seq for slot 0, what its request can
-    // reach for the others (use_slot's `need`). forward_block checks against the current one.
+    // `cap` is the rows the slot's buffers hold: cfg.max_seq for slot 0 and what its request can
+    // reach for the others (use_slot's `need`), both at most win_rows for a windowed draft, whose
+    // slots slide. forward_block checks against the current one.
     // `base` is the absolute position of a windowed slot's row 0 (see win_rows): its caches hold
     // positions [base, base + cap). Always 0 for a slot that holds every position.
     struct Slot {
@@ -676,9 +679,11 @@ struct DFlashDraftModel::Impl {
             bool all_sliding = cfg.dflash2 && cfg.sliding_window > 0 && !cfg.sliding_layers.empty();
             for (bool sl : cfg.sliding_layers) all_sliding = all_sliding && sl;
             const char* e = getenv("SPARKINFER_DFLASH_SLOT_WINDOW");
+            // Never fewer than the default: a slide keeps up to a window and must drop at least as
+            // much, or the one cudaMemcpyAsync that moves the kept rows would overlap itself.
             const int def = 2 * cfg.sliding_window + 2 * B;
             const int want = e ? atoi(e) : def;
-            win_rows = (all_sliding && want > 0) ? std::max(want, cfg.sliding_window + 2 * B) : 0;
+            win_rows = (all_sliding && want > 0) ? std::max(want, def) : 0;
             if (win_rows >= max_ctx) win_rows = 0;
             if (win_rows > 0)
                 fprintf(stderr, "[dflash] draft slots slide: %d rows of the %d-position context "
@@ -1567,6 +1572,11 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     auto q81 = [&](const bf16* src, int kk) { return q81n(src, kk, BW); };
     const float scale = 1.f / sqrtf((float)d);
     const int past = s.seq_len;
+    // A windowed slot maps position p to row p - base, which holds only while the cache keeps up
+    // with the positions (past + ctx_len == pos0). SPARKINFER_DFLASH_IDLE_DRAFT lets it fall behind;
+    // decline there rather than slide by positions the rows do not have (the request then decodes
+    // on without the draft, as after any failed block).
+    if (s.win_rows > 0 && past > 0 && past + ctx_len != pos0) return false;
     if (past == 0) { s.ctx_floor = std::max(0, target_hidden_start); s.base = 0; }
     // A windowed slot slides: when this block would run past its rows, every key older than the
     // window this block reads (pos0 - sliding_window + 1: the earliest query is pos0, keys only
@@ -1591,6 +1601,7 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
             }
             s.base = nb;
         }
+        if (s.base > past + ctx_len) return false;   // the window starts past every row this block has
     }
     const int eff_floor = s.win_rows > 0 ? std::max(s.ctx_floor, s.base) : s.ctx_floor;
     // How many of this block's context rows sit below the floor: never produced, never attended.
@@ -1831,8 +1842,8 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         if (window_of_layer == 0 && kFullWindow > 0) window_of_layer = kFullWindow;
         // Position p lives at row p - base (base 0 unless a windowed slot has slid). After a long
         // prompt's first block starts at the window, past < base: the rows below it are never written.
-        bf16* const kdst = s.k_cache[L] + ((long)past - s.base) * kvdim;
-        bf16* const vdst = s.v_cache[L] + ((long)past - s.base) * kvdim;
+        bf16* const kdst = s.k_cache[L] + ((ptrdiff_t)past - s.base) * kvdim;
+        bf16* const vdst = s.v_cache[L] + ((ptrdiff_t)past - s.base) * kvdim;
         if (L == 0)
             dflash_kernels::launch_rms(s.x, w.input_norm, s.xn, BW, H, c.rms_eps, st);
         // DFlash2: the attention conv's "prepare" (z-lab GroupedDynamicCausalConv). A per-group
@@ -2026,8 +2037,8 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         // a slot slides only past its ~4K rows), so the same keys and the same splits.
         const int kv0 = s.base > 0 ? std::max(s.ctx_floor, pos0 - window + 1)
                                    : std::min(s.ctx_floor, kv_len);
-        dflash_kernels::launch_attn_gqa(s.q, s.k_cache[L] + ((long)kv0 - s.base) * kvdim,
-                                        s.v_cache[L] + ((long)kv0 - s.base) * kvdim, s.attn,
+        dflash_kernels::launch_attn_gqa(s.q, s.k_cache[L] + ((ptrdiff_t)kv0 - s.base) * kvdim,
+                                        s.v_cache[L] + ((ptrdiff_t)kv0 - s.base) * kvdim, s.attn,
                                         BW, kv_len - kv0, c.n_q_heads, c.n_kv_heads, d,
                                         q_pos0, /*k_pos0_cache=*/kv0, window, causal, scale, st,
                                         s.fa_m, s.fa_l, s.fa_acc);
@@ -2686,8 +2697,8 @@ bool DFlashDraftModel::forward_blocks(const BlockJob* jobs, int n_jobs, int prop
             const BlockJob& jb = jobs[j];
             const Impl::Slot& sl = s.slots[(size_t)jb.slot];
             const int past = sl.seq_len, cl = jb.ctx_len;
-            bf16* kd = sl.k[L] + ((long)past - sl.base) * kvdim;
-            bf16* vd = sl.v[L] + ((long)past - sl.base) * kvdim;
+            bf16* kd = sl.k[L] + ((ptrdiff_t)past - sl.base) * kvdim;
+            bf16* vd = sl.v[L] + ((ptrdiff_t)past - sl.base) * kvdim;
             const bf16* ck = b.ctx_k + (size_t)coff[(size_t)j] * 2 * kvdim;
             const bf16* bq = b.q + (size_t)j * BW * nq;
             const size_t kvb = (size_t)kvdim * sizeof(bf16);
@@ -2715,8 +2726,8 @@ bool DFlashDraftModel::forward_blocks(const BlockJob* jobs, int n_jobs, int prop
                                         : std::min(sl.ctx_floor, kv_len);
             // q is read from attn's buffer and the output goes to conv_out (attn is overwritten
             // only after every job's attention, below).
-            dflash_kernels::launch_attn_gqa(qj, sl.k[L] + ((long)kv0 - sl.base) * kvdim,
-                                            sl.v[L] + ((long)kv0 - sl.base) * kvdim,
+            dflash_kernels::launch_attn_gqa(qj, sl.k[L] + ((ptrdiff_t)kv0 - sl.base) * kvdim,
+                                            sl.v[L] + ((ptrdiff_t)kv0 - sl.base) * kvdim,
                                             b.conv_out + (size_t)j * BW * qdim, BW, kv_len - kv0,
                                             c.n_q_heads, c.n_kv_heads, d, jb.pos0, kv0, window, causal, scale,
                                             st, s.fa_m, s.fa_l, s.fa_acc);
