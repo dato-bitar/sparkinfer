@@ -5849,11 +5849,11 @@ bool Qwen35Model::dflash_draft_restore() {
     // Only into room it leaves room beside: right after a busy stretch the device is still full of
     // that load's arenas and graphs, and a draft restored there leaves a speculative 8K prefill no
     // arena -- it then runs the token loop for ~80 s with every other request behind it (AIPerf
-    // 8K prompts at c16 after a chat cell: 0.37x). SPARKINFER_DRAFT_RESTORE_HEADROOM_MB sets the
-    // room kept (a speculative 8K prefill's arena, capture and slot, with margin).
+    // 8K prompts at c16 after a chat cell: 0.37x). spec_group_join checks the room a join needs;
+    // this keeps a margin beside the draft itself (SPARKINFER_DRAFT_RESTORE_HEADROOM_MB).
     static const size_t headroom = [] {
         const char* e = getenv("SPARKINFER_DRAFT_RESTORE_HEADROOM_MB");
-        const long long mb = e ? atoll(e) : 3072LL;
+        const long long mb = e ? atoll(e) : 1024LL;
         return (size_t)(mb < 0 ? 0 : mb) << 20;
     }();
     if (p_->dflash_draft->offloaded()) {
@@ -6183,6 +6183,37 @@ int Qwen35Model::spec_group_join(const std::vector<int>& prompt, int max_new, in
         return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_join0).count();
     };
     double t_setup = 0, t_prefill = 0, t_seed = 0;
+    // Room for the whole join, checked before anything is touched -- so a decline here is like
+    // "draft slot" below, and the ordinary path prefills the request. Without it a long join
+    // started on a device that a busy stretch had filled got its slot and capture, then no arena
+    // for its pass, and a checkpointed or resumed prompt -- which cannot decline mid-way -- ran
+    // the token loop: ~80 s for 8K tokens with every other request waiting (AIPerf 8K prompts at
+    // c16, 0.37x). The pass's arena is ~128 KB a row (1,035 MB at 8,240) up to the 16K window;
+    // the capture, the slot and the verify arenas are sized as they are allocated below.
+    // SPARKINFER_SPEC_JOIN_ROOM=0 skips the check.
+    {
+        static const bool room_check = [] {
+            const char* e = getenv("SPARKINFER_SPEC_JOIN_ROOM");
+            return !(e && e[0] == '0');
+        }();
+        if (room_check) {
+            const size_t rows = (size_t)(n - prefill_from);
+            const size_t arena = ((size_t)64 << 20) + std::min<size_t>(rows, 16384) * ((size_t)128 << 10);
+            const int cap_from = std::max(prefill_from, n >= 12288 ? n - 4096 : 0);
+            const size_t cap_rows = (size_t)std::max(0, std::min(s.cfg.max_seq, n + max_new + depth + 1) - cap_from);
+            const size_t capture = cap_rows * dc.target_layer_ids.size() * (size_t)s.cfg.hidden * sizeof(bf16);
+            const size_t slot_bytes = (size_t)(n + max_new + 2 * (depth + 1)) *
+                (2 * (size_t)dc.n_layers * dc.n_kv_heads * dc.head_dim + dc.hidden) * sizeof(bf16);
+            const size_t verify = (size_t)320 << 20, margin = (size_t)256 << 20;
+            // The capture buffer this join replaces is freed before the new one is allocated.
+            const size_t reused = s.dflash_context
+                ? (size_t)s.dflash_ctx_cap * s.dflash_n_cap * s.cfg.hidden * sizeof(bf16) : 0;
+            size_t fb = 0, tb = 0;
+            if (cudaMemGetInfo(&fb, &tb) == cudaSuccess &&
+                fb + reused < arena + capture + slot_bytes + verify + margin)
+                return fail("no room for the join");
+        }
+    }
     // The slot holds what this request can reach (the bound checked above), not the draft's whole
     // context: a group of four at 16K would otherwise borrow ~1.5 GB.
     if (!draft.use_slot(slot, n + max_new + 2 * (depth + 1))) return fail("draft slot");
