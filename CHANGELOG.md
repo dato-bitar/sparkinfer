@@ -16,6 +16,11 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Added
 
+- **A batched draft walks every member's selector in one launch** (c8 ~960 -> 982-998 tok/s,
+  Qwen3.8-27B + DFlash2, real prompts at T=0.7). DFlash2's candidate selector ran one single-block
+  ~90 us launch per group member, eight in series at c8. `launch_selector_walks` runs them as one
+  grid, through the same per-walk code: pick for pick identical, greedy and coupled to a sampler.
+
 - **A grouped verify runs its sequences' GDN work in one launch per layer** (c4/c8 652/864 ->
   691/962 tok/s, Qwen3.8-27B + DFlash2, real prompts at T=0.7).
   - **Before:** each speculating sequence's compact GDN conv and scan was its own launch, at every

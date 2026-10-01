@@ -247,6 +247,14 @@ void launch_grouped_conv(const void* x, const void* base_side, const void* dyn, 
 // Gumbel noise at step[e] (coupled). pred is anchor[0] for slot 0, then the previous pick.
 // Writes out[0..depth). temp/seed/step may be null (greedy). k <= kSelectorTopkMax.
 inline constexpr int kSelectorTopkMax = 64;
+// n_walks of those walks in one launch: walk w's unary/cand/hproj/anchor/out start `stride` rows
+// past walk w - 1's, and its temp/seed/step (each null for every walk, or set for every walk)
+// `samp_stride` bytes past. Each walk is the single launch's arithmetic.
+void launch_selector_walks(const float* unary, const int* cand, const void* hproj,
+                           const void* pred_cb, const void* succ_cb, const int* anchor,
+                           int depth, int k, int R, const float* temp, const unsigned long long* seed,
+                           const unsigned long long* step, size_t samp_stride, int* out, int n_walks,
+                           int stride, cudaStream_t stream);
 void launch_selector_walk(const float* unary, const int* cand, const void* hproj,
                           const void* pred_cb, const void* succ_cb, const int* anchor,
                           int depth, int k, int R, const float* temp, const unsigned long long* seed,

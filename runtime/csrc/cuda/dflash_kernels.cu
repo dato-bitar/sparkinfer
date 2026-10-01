@@ -2306,12 +2306,11 @@ __global__ void grouped_conv_kernel(const bf16* __restrict__ x, const bf16* __re
 // and keeps the argmax -- or, with a temperature, the argmax of score / T plus Gumbel noise from
 // Philox(seed, candidate id, step), the target sampler's key, so the pick couples to the target's
 // draw at that step. blockDim.x == R.
-__global__ void selector_walk_kernel(const float* __restrict__ unary, const int* __restrict__ cand,
-                                     const bf16* __restrict__ hproj, const bf16* __restrict__ pred_cb,
-                                     const bf16* __restrict__ succ_cb, const int* __restrict__ anchor,
-                                     int depth, int k, int R,
-                                     const float* __restrict__ temp, const unsigned long long* __restrict__ seed,
-                                     const unsigned long long* __restrict__ step, int* __restrict__ out) {
+__device__ __forceinline__ void selector_walk_body(
+        const float* __restrict__ unary, const int* __restrict__ cand, const bf16* __restrict__ hproj,
+        const bf16* __restrict__ pred_cb, const bf16* __restrict__ succ_cb, const int* __restrict__ anchor,
+        int depth, int k, int R, const float* __restrict__ temp, const unsigned long long* __restrict__ seed,
+        const unsigned long long* __restrict__ step, int* __restrict__ out) {
     extern __shared__ float sh[];
     float* red = sh;             // [blockDim.x]
     __shared__ int s_pred;
@@ -2357,6 +2356,32 @@ __global__ void selector_walk_kernel(const float* __restrict__ unary, const int*
         __syncthreads();
     }
 }
+
+__global__ void selector_walk_kernel(const float* __restrict__ unary, const int* __restrict__ cand,
+                                     const bf16* __restrict__ hproj, const bf16* __restrict__ pred_cb,
+                                     const bf16* __restrict__ succ_cb, const int* __restrict__ anchor,
+                                     int depth, int k, int R,
+                                     const float* __restrict__ temp, const unsigned long long* __restrict__ seed,
+                                     const unsigned long long* __restrict__ step, int* __restrict__ out) {
+    selector_walk_body(unary, cand, hproj, pred_cb, succ_cb, anchor, depth, k, R, temp, seed, step, out);
+}
+
+// One walk per block, blockIdx.x = walk: walk w's inputs and output sit `stride` rows past walk
+// w - 1's, and its sampler arrays `samp_stride` bytes past.
+__global__ void selector_walks_kernel(const float* __restrict__ unary, const int* __restrict__ cand,
+                                      const bf16* __restrict__ hproj, const bf16* __restrict__ pred_cb,
+                                      const bf16* __restrict__ succ_cb, const int* __restrict__ anchor,
+                                      int depth, int k, int R, const float* temp,
+                                      const unsigned long long* seed, const unsigned long long* step,
+                                      size_t samp_stride, int* __restrict__ out, int stride) {
+    const size_t w = blockIdx.x, rows = (size_t)w * stride;
+    auto at = [&](const auto* p) {
+        using T = std::remove_cv_t<std::remove_reference_t<decltype(*p)>>;
+        return p ? reinterpret_cast<const T*>(reinterpret_cast<const char*>(p) + w * samp_stride) : nullptr;
+    };
+    selector_walk_body(unary + rows * k, cand + rows * k, hproj + rows * R, pred_cb, succ_cb, anchor + rows,
+                       depth, k, R, at(temp), at(seed), at(step), out + rows);
+}
 }  // namespace
 
 void launch_grouped_conv(const void* x, const void* base_side, const void* dyn, int side, void* out,
@@ -2366,6 +2391,19 @@ void launch_grouped_conv(const void* x, const void* base_side, const void* dyn, 
     grouped_conv_kernel<<<grid, 256, 0, stream>>>((const bf16*)x, (const bf16*)base_side,
                                                   (const bf16*)dyn, side, (bf16*)out, rows, H, taps,
                                                   group, dyn_stride);
+}
+
+void launch_selector_walks(const float* unary, const int* cand, const void* hproj,
+                           const void* pred_cb, const void* succ_cb, const int* anchor,
+                           int depth, int k, int R, const float* temp, const unsigned long long* seed,
+                           const unsigned long long* step, size_t samp_stride, int* out, int n_walks,
+                           int stride, cudaStream_t stream) {
+    if (depth < 1 || k < 1 || k > kSelectorTopkMax || n_walks < 1) return;
+    int threads = 32;
+    while (threads < R) threads <<= 1;
+    selector_walks_kernel<<<n_walks, threads, threads * sizeof(float), stream>>>(
+        unary, cand, (const bf16*)hproj, (const bf16*)pred_cb, (const bf16*)succ_cb, anchor, depth, k,
+        R, temp, seed, step, samp_stride, out, stride);
 }
 
 void launch_selector_walk(const float* unary, const int* cand, const void* hproj,

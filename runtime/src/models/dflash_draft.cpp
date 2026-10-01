@@ -2684,7 +2684,7 @@ bool DFlashDraftModel::forward_blocks(const BlockJob* jobs, int n_jobs, int prop
         couple[(size_t)j] = coupled_on && kernels::sample_rows_topk_eligible(jb.temperature, jb.top_k, 1 << 30);
         Impl::DraftSampling& hs = b.h_samp[j];
         for (int r = 0; r <= depth; ++r) {
-            hs.temp[r] = r == 0 ? 0.f : jb.temperature;
+            hs.temp[r] = (r == 0 || !couple[(size_t)j]) ? 0.f : jb.temperature;
             hs.seed[r] = jb.seed;
             hs.step[r] = r == 0 ? 0ull : jb.step0 + (unsigned long long)(r - 1);
             hs.top_k[r] = jb.top_k;
@@ -2693,16 +2693,12 @@ bool DFlashDraftModel::forward_blocks(const BlockJob* jobs, int n_jobs, int prop
     }
     cu(cudaMemcpyAsync(b.d_samp, b.h_samp, (size_t)n_jobs * sizeof(Impl::DraftSampling),
                        cudaMemcpyHostToDevice, st), "batched sampling");
-    for (int j = 0; j < n_jobs; ++j) {
-        const size_t r1 = (size_t)j * BW + 1;
-        const Impl::DraftSampling* ds = b.d_samp + j;
-        dflash_kernels::launch_selector_walk(b.sel_vals + r1 * k, b.sel_ids + r1 * k, b.sel_h + r1 * rank,
-                                             s.sel_pred, s.sel_succ, b.d_ids + (size_t)j * BW, depth, k, rank,
-                                             couple[(size_t)j] ? &ds->temp[1] : nullptr,
-                                             couple[(size_t)j] ? &ds->seed[1] : nullptr,
-                                             couple[(size_t)j] ? &ds->step[1] : nullptr,
-                                             b.d_out + (size_t)j * BW + 1, st);
-    }
+    // Every block's walk in one launch. A job its sampler does not couple walks at temperature 0
+    // (its argmax), which is what passing no sampler does.
+    dflash_kernels::launch_selector_walks(b.sel_vals + (size_t)k, b.sel_ids + (size_t)k, b.sel_h + (size_t)rank,
+                                          s.sel_pred, s.sel_succ, b.d_ids, depth, k, rank, &b.d_samp->temp[1],
+                                          &b.d_samp->seed[1], &b.d_samp->step[1], sizeof(Impl::DraftSampling),
+                                          b.d_out + 1, n_jobs, BW, st);
     cu(cudaMemcpyAsync(b.h_out, b.d_out, (size_t)R * sizeof(int), cudaMemcpyDeviceToHost, st), "batched out");
     if (cudaStreamSynchronize(st) != cudaSuccess) return fail("sync");
     for (int j = 0; j < n_jobs; ++j) {
