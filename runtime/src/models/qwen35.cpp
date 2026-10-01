@@ -6356,7 +6356,7 @@ bool Qwen35Model::spec_group_draft_multi(int n, const int* slots, const void* co
 }
 
 bool Qwen35Model::spec_group_verify(int n, const uint64_t* seq_ids, const int* const* blocks,
-                                    const int* lens, const int* start_pos,
+                                    int* lens, const int* start_pos,
                                     const PackedSampling* sampling, int* out_ids, int* keep,
                                     const bool* commit_all) {
     Impl& s = *p_;
@@ -6393,6 +6393,7 @@ bool Qwen35Model::spec_group_verify(int n, const uint64_t* seq_ids, const int* c
         int k = 1;
         while (k < len && blocks[0][k] == out_ids[k - 1]) ++k;
         keep[0] = k;
+        lens[0] = len;   // what was verified, for the caller's bookkeeping
         return true;
     }
     return verify_grouped(n, seq_ids, blocks, lens, start_pos, sampling, out_ids, keep,

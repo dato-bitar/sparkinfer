@@ -793,7 +793,9 @@ public:
                                 const int* seeds, const int* pos, const float* temperature,
                                 const unsigned long long* seed_rng, const unsigned long long* step0,
                                 const int* top_k, const float* top_p, int* proposals);
-    bool spec_group_verify(int n, const uint64_t* seq_ids, const int* const* blocks, const int* lens,
+    // lens: rows per member; the one-member verify may cut its block at a KV split tier and then
+    // writes the rows it verified back into lens[0].
+    bool spec_group_verify(int n, const uint64_t* seq_ids, const int* const* blocks, int* lens,
                            const int* start_pos, const PackedSampling* sampling, int* out_ids,
                            int* keep,
                            const bool* commit_all = nullptr);
