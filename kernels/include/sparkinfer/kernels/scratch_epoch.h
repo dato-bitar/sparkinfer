@@ -13,5 +13,9 @@ namespace sparkinfer { namespace kernels {
 
 uint64_t prefill_scratch_epoch();
 void note_prefill_scratch_moved();   // call after freeing a buffer a captured graph may reference
+// Frees the grow-on-demand prefill scratch above that a pass leaves sized for itself (the GDN scan
+// workspaces, the attention V plane), so a long prompt's sizes are not held for every later,
+// shorter pass. The next pass that needs them allocates them again at its own size.
+void prefill_scratch_release();
 
 }}  // namespace sparkinfer::kernels

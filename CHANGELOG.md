@@ -81,6 +81,21 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Performance
 
+- **A long prompt's prefill scratch is given back** (chat c32 after an 8K-prompt cell 1,073 ->
+  1,183 tok/s on Qwen3.8-27B, the same as on a fresh server).
+  - **Before:** the batched prefill keeps its scratch arenas across calls and only ever grows
+    them, releasing them only past 1 GB. An 8K pass (~0.9 GB) stayed resident for every later
+    chat-sized pass, as did the GDN scan workspace it grew. A c32 server has ~1 GB free beside
+    its KV pool and 32 sessions' recurrent state, and that headroom is what the packed prefill
+    needs: its passes ran 278 ms instead of 207.
+  - **Now:** a pass gives the arenas back -- and the GDN scan workspaces and the attention V plane
+    -- when they hold more than twice the largest use of the last 8 passes. A one-off long prompt
+    ages out after a few ordinary passes, and a mix of sizes does not churn.
+    `SPARKINFER_PREFILL_ARENA_SHRINK=0` keeps them.
+  - **Measured** (AIPerf, RTX 5090, one server per run): chat 1024/256 c32 on a fresh server
+    1,175.8 tok/s; after an 8192/128 c16 cell 1,183.0 (shrink off: 1,072.9); the 8K cell itself
+    unchanged at 168.3.
+
 - **Tokens are streamed off the engine thread** (long answers c32 1,600 -> 1,986 tok/s, ITL p50
   19.7 -> 15.9 ms on Qwen3.8-27B).
   - **Before:** every emitted token ran the caller's callback on the worker thread, one row after

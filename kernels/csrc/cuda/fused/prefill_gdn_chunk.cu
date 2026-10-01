@@ -754,6 +754,18 @@ constexpr int kGdncSlots = 4;
 void* g_ws[kGdncSlots] = {};
 size_t g_ws_bytes[kGdncSlots] = {};
 
+void gdnc_workspace_release() {
+    bool any = false;
+    for (int i = 0; i < kGdncSlots; ++i) {
+        if (!g_ws[i]) continue;
+        cudaFree(g_ws[i]);
+        g_ws[i] = nullptr;
+        g_ws_bytes[i] = 0;
+        any = true;
+    }
+    if (any) note_prefill_scratch_moved();
+}
+
 bool ws_reserve(size_t bytes, int slot) {
     if (bytes <= g_ws_bytes[slot]) return true;
     // Allocate the new buffer first so a failed grow keeps the working one.
@@ -1049,6 +1061,13 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
             return false;
     }
     return true;
+}
+
+void prefill_attn_vpack_release();   // prefill_attn_mma.cu
+
+void prefill_scratch_release() {
+    gdnc_workspace_release();
+    prefill_attn_vpack_release();
 }
 
 }  // namespace kernels

@@ -89,6 +89,7 @@ struct Arena {
     std::vector<void*> bufs;
     std::vector<size_t> sizes;
     size_t cursor = 0;
+    size_t used = 0;   // bytes this call has asked for (since the last rewind)
     bool ok = true;
     // Advances whenever a buffer this arena handed out is freed. Anything that kept one of its
     // pointers past a call -- the whole-prefill CUDA graph -- is stale once this has moved.
@@ -96,6 +97,7 @@ struct Arena {
     template <class T> T* alloc(size_t n) {
         if (n == 0) n = 1;
         const size_t bytes = n * sizeof(T);
+        used += bytes;
         void* p = nullptr;
         if (cursor < bufs.size() && sizes[cursor] >= bytes) {
             p = bufs[cursor++];
@@ -113,7 +115,7 @@ struct Arena {
         ++cursor;
         return static_cast<T*>(p);
     }
-    void rewind() { cursor = 0; ok = true; }
+    void rewind() { cursor = 0; used = 0; ok = true; }
     void free_all() {
         if (!bufs.empty()) ++gen;
         for (void* b : bufs) cudaFree(b);
@@ -4865,8 +4867,32 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // this is a window of a longer prompt whose next window follows at once (prefill_hold_arena):
     // it would allocate exactly what this one frees, and the free/malloc pair of a 16k window's
     // ~37 buffers costs ~10.6 ms of idle GPU per window boundary. The last window still releases.
+    // ...or when what it holds is well past what recent calls used: the arenas only ever grow, so
+    // one long prompt (an 8K pass's ~0.9 GB, just under the keep limit) used to stay resident
+    // for every later chat-sized pass. Near the card's edge -- a c32 server's KV pool and 32
+    // sessions' recurrent state leave ~1 GB -- that headroom is what the packed prefill's
+    // scratch and the GDN scan workspaces need: chat c32 after an 8K cell measured 1,026 tok/s
+    // against 1,182 on a fresh server, its packed passes 278 ms against 207. The kernel-level
+    // scratch a long pass grew (the GDN scan workspaces, the attention V plane) goes with them.
+    const size_t pf_held = a.total() + a8.total() + am.total() + aw.total();
+    const size_t pf_used = a.used + a8.used + am.used + aw.used;
+    static const bool shrink_on = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ARENA_SHRINK");
+        return !(e && e[0] == '0');
+    }();
+    // Against the largest use of the last 8 passes, not this one alone: a chat workload alternates
+    // one-prompt and packed passes of a few sizes, and freeing on every smaller one would churn
+    // the arenas (and the whole-prefill graph) every other pass. A one-off long prompt ages out of
+    // the window after a few ordinary passes and is given back once.
+    static thread_local size_t recent_used[8] = {};
+    static thread_local int recent_i = 0;
+    recent_used[recent_i++ & 7] = pf_used;
+    size_t recent_max = 0;
+    for (size_t u : recent_used) recent_max = std::max(recent_max, u);
+    const bool pf_oversized = shrink_on && pf_held > 2 * recent_max + (64ull << 20);
     if (!arena_reuse ||
-        (!g_pf_hold_arena && a.total() + a8.total() + am.total() + aw.total() > kArenaKeepBytes)) {
+        (!g_pf_hold_arena && (pf_held > kArenaKeepBytes || pf_oversized))) {
+        if (shrink_on) kernels::prefill_scratch_release();
         a.free_all();
         a8.free_all();
         am.free_all();

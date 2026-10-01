@@ -1117,6 +1117,15 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
 namespace {
 void*  g_vpack = nullptr;
 size_t g_vpack_bytes = 0;
+}  // namespace
+void prefill_attn_vpack_release() {
+    if (!g_vpack) return;
+    cudaFree(g_vpack);
+    g_vpack = nullptr;
+    g_vpack_bytes = 0;
+    note_prefill_scratch_moved();
+}
+namespace {
 
 bool vpack_reserve(size_t bytes) {
     if (bytes <= g_vpack_bytes) return true;
