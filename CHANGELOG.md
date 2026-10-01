@@ -28,6 +28,27 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
     generated tokens (slots slide mid-generation): 2.633/2.633, 3.000/3.000, 4.645/4.645,
     3.674/3.674. `spec_group_check`, `spec_multiturn_check` and `offload_check` pass; conc_bench
     c1-c8 is unchanged.
+- **The release container speculates by default.** `serve` downloads z-lab's
+  [`Qwen3.8-27B-DFlash2`](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) drafter on first run
+  (3.8 GB, Apache-2.0) and loads it. With the draft offload (0.6.1) and the windowed draft slots
+  above, that is 1.2-2.2x the throughput at 1-4 concurrent requests and the same at 16-32
+  (AIPerf). For answers that run to thousands of tokens without `max_tokens`, it is 2.92x at 4
+  concurrent requests (859.7 vs 294.6 tok/s) and 1.13x at 8 (527.1 vs 466.7).
+  - `-e SPEC_DRAFT=none` serves without a drafter.
+  - `serve-dspark`, `SPARKINFER_DRAFT_MODEL` and `--draft-model` keep choosing their drafter.
+  - Past a 131,072-token context (`CTX` or `--ctx`) the default skips the drafter: a 32 GB card
+    has no room for it beside a pool that size.
+  - With `SPARKINFER_NO_DOWNLOAD=1` and no staged drafter, or when its download fails, it serves
+    without one instead of failing, so a deployment that cannot reach the Hub keeps starting.
+
+- **A request speculates up to the end of the draft's context, then decodes on.** Speculation
+  required prompt + `max_tokens` to fit the draft's 16,384 positions, so a request that left
+  `max_tokens` to the server's cap (16,384 in the release container; the OpenAI SDK's default)
+  never speculated. A group now speculates until a member reaches the end of the draft's context,
+  then every member decodes on as usual. The draft slot is sized to that reach rather than to
+  `max_tokens`, and the capture buffer to the prompt (verifies capture elsewhere): ~51 MB rather
+  than ~838 MB for a 1K prompt. `SPARKINFER_SPEC_GROUP=1` keeps the old bound.
+
 ## [0.6.1] — 2026-10-02
 
 **Requests without `max_tokens` are no longer cut off at 256 tokens**: agents and OpenAI SDK
@@ -65,25 +86,6 @@ clients, which omit it by default, get whole answers again.
   v0.5.14 and v0.6.0 have no binaries.
 
 ### Speculative decoding
-
-- **The release container speculates by default.** `serve` downloads z-lab's
-  [`Qwen3.8-27B-DFlash2`](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) drafter on first run
-  (3.8 GB, Apache-2.0) and loads it. With the draft offload below, that is 1.2-2.2x the throughput
-  at 1-4 concurrent requests and the same at 16-32.
-  - `-e SPEC_DRAFT=none` serves without a drafter.
-  - `serve-dspark`, `SPARKINFER_DRAFT_MODEL` and `--draft-model` keep choosing their drafter.
-  - Past a 131,072-token context (`CTX` or `--ctx`) the default skips the drafter: a 32 GB card
-    has no room for it beside a pool that size.
-  - With `SPARKINFER_NO_DOWNLOAD=1` and no staged drafter, or when its download fails, it serves
-    without one instead of failing, so a deployment that cannot reach the Hub keeps starting.
-
-- **A request speculates up to the end of the draft's context, then decodes on.** Speculation
-  required prompt + `max_tokens` to fit the draft's 16,384 positions, so a request that left
-  `max_tokens` to the server's cap (16,384 in the release container; the OpenAI SDK's default)
-  never speculated. A group now speculates until a member reaches the end of the draft's context,
-  then every member decodes on as usual. The draft slot is sized to that reach rather than to
-  `max_tokens`, and the capture buffer to the prompt (verifies capture elsewhere): ~51 MB rather
-  than ~838 MB for a 1K prompt. `SPARKINFER_SPEC_GROUP=1` keeps the old bound.
 
 - **A server with a draft loaded is as fast as one without at 16 and 32 concurrent requests, and
   up to 2.2x faster at 1-4** (Qwen3.8-27B NVFP4 + DFlash2, AIPerf, RTX 5090). Before, a loaded
