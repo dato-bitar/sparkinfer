@@ -70,7 +70,13 @@ inline void pf_cu(cudaError_t e, const char* what) {
 // string's address rather than the formatted text on purpose: several of these carry a position
 // or layer index that moves every step, so deduplicating on the text would suppress nothing and
 // grow without bound.
-__attribute__((format(printf, 1, 2))) void verify_decline(const char* fmt, ...) {
+// MSVC has no format attribute; gcc and clang still check every call's arguments.
+#if defined(__GNUC__) || defined(__clang__)
+#define SI_VERIFY_DECLINE_FMT __attribute__((format(printf, 1, 2)))
+#else
+#define SI_VERIFY_DECLINE_FMT
+#endif
+SI_VERIFY_DECLINE_FMT void verify_decline(const char* fmt, ...) {
     static std::mutex mu;
     static std::vector<const char*> seen;
     {
