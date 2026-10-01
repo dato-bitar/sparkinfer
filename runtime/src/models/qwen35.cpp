@@ -9259,17 +9259,17 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         // batched-prefill arena still allocates, and prefill@128 is 1.05x the down-only build.
         // A card that genuinely cannot spare it still declines here, and declines for the real
         // reason rather than for its label.
+        // How many sessions this deployment will actually hold. The KV pool is allocated
+        // before this point and was sized for exactly that, so it already carries the number
+        // rather than needing one plumbed in.
+        int fp4_sessions = 1;
+        if (s.kv && s.kv->block_size() > 0 && c.max_seq > 0) {
+            const int bps = c.max_seq / s.kv->block_size() + 4;   // blocks one session takes
+            if (bps > 0) fp4_sessions = s.kv->num_total_blocks() / bps;
+            if (fp4_sessions < 1)   fp4_sessions = 1;
+            if (fp4_sessions > 256) fp4_sessions = 256;
+        }
         {
-            // How many sessions this deployment will actually hold. The KV pool is allocated
-            // before this point and was sized for exactly that, so it already carries the number
-            // rather than needing one plumbed in.
-            int fp4_sessions = 1;
-            if (s.kv && s.kv->block_size() > 0 && c.max_seq > 0) {
-                const int bps = c.max_seq / s.kv->block_size() + 4;   // blocks one session takes
-                if (bps > 0) fp4_sessions = s.kv->num_total_blocks() / bps;
-                if (fp4_sessions < 1)   fp4_sessions = 1;
-                if (fp4_sessions > 256) fp4_sessions = 256;
-            }
             // A reserve that covers ONE session's prefill arena is what starved the runtime under
             // concurrency: every live request needs its own scratch beside these weights, so at 32
             // requests the card finished with 3 MB free -- the packed decode arena (16 MB) declined
@@ -9531,10 +9531,17 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         // What it must leave is the runtime's own allocation after load, measured at ~576 MiB at 8
         // sessions: a 512 MiB margin starves the batched-prefill scratch and halves throughput, so
         // the default keeps 1024. SPARKINFER_MUSE_NVFP4_DOWN_KEEP_MB tunes it; 0 restores main.
+        // That allocation grows with the sessions held, and a flat 1024 at 33 sessions sat on a
+        // knife edge: peak use differed by 16 MB between runs, and in two runs of five the graph
+        // captures and the verify scratch then failed for lack of it (Muse cb c32 2140 -> 380
+        // tok/s, mean ITL 13 -> 82 ms). 16 MB per session past 17 keeps c16 and below exactly as
+        // they were (49/52 layers at 17 sessions) and leaves 1280 at 33: 12/52 layers, 5/5 runs
+        // at ~2127 tok/s.
         const long long down_keep_mb = [&] {
             const char* e = getenv("SPARKINFER_MUSE_NVFP4_DOWN_KEEP_MB");
             if (e) return atoll(e);
-            return c.max_seq >= 16384 ? 2560LL : 1024LL;
+            if (c.max_seq >= 16384) return 2560LL;
+            return 1024LL + 16LL * std::max(0, fp4_sessions - 17);
         }();
         if (ok && down_eligible && !down_fp4_on && down_keep_mb > 0) {
             const size_t per_layer = kernels::prefill_nvfp4_data_bytes(H, c.moe_ffn) +
