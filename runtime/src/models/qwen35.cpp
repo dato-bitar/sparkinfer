@@ -5846,6 +5846,22 @@ size_t Qwen35Model::dflash_draft_offload() {
 bool Qwen35Model::dflash_draft_restore() {
     if (!p_->dflash_draft) return false;
     std::lock_guard<std::recursive_mutex> lock(device_mutex());
+    // Only into room it leaves room beside: right after a busy stretch the device is still full of
+    // that load's arenas and graphs, and a draft restored there leaves a speculative 8K prefill no
+    // arena -- it then runs the token loop for ~80 s with every other request behind it (AIPerf
+    // 8K prompts at c16 after a chat cell: 0.37x). SPARKINFER_DRAFT_RESTORE_HEADROOM_MB sets the
+    // room kept (a speculative 8K prefill's arena, capture and slot, with margin).
+    static const size_t headroom = [] {
+        const char* e = getenv("SPARKINFER_DRAFT_RESTORE_HEADROOM_MB");
+        const long long mb = e ? atoll(e) : 3072LL;
+        return (size_t)(mb < 0 ? 0 : mb) << 20;
+    }();
+    if (p_->dflash_draft->offloaded()) {
+        size_t fb = 0, tb = 0;
+        if (cudaMemGetInfo(&fb, &tb) != cudaSuccess ||
+            fb < p_->dflash_draft->footprint_bytes() + headroom)
+            return false;
+    }
     return p_->dflash_draft->restore();
 }
 

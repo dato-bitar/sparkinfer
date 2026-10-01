@@ -1413,7 +1413,7 @@ void ContinuousBatchEngine::worker_loop() {
                     std::lock_guard<std::mutex> lock(mu_);
                     for (auto& kv : jobs_)
                         if (!kv.second->done) kv.second->spec_tried = true;
-                    fprintf(stderr, "[spec] draft cannot come back on the device yet; decoding without it\n");
+                    fprintf(stderr, "[spec] no room to bring the draft back yet; decoding without it\n");
                 }
                 continue;
             }

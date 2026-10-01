@@ -119,6 +119,7 @@ public:
     bool restore();
     bool offloaded() const;
     size_t resident_bytes() const;
+    size_t footprint_bytes() const;   // what restore() maps back
 
     //   proposals:     how many rows after the seed to score (0 = the built-in default). The
     //                  verifier picks this by context length, so the draft has to be told rather

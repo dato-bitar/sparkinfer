@@ -965,6 +965,8 @@ bool DFlashDraftModel::restore() { return !p_->arena_on || p_->arena.restore(); 
 
 bool DFlashDraftModel::offloaded() const { return p_->arena_on && p_->arena.offloaded(); }
 
+size_t DFlashDraftModel::footprint_bytes() const { return p_->arena_on ? p_->arena.live_bytes() : 0; }
+
 size_t DFlashDraftModel::resident_bytes() const {
     return p_->arena_on && !p_->arena.offloaded() ? p_->arena.mapped_bytes() : 0;
 }

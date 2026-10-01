@@ -127,6 +127,13 @@ size_t VmmArena::mapped_bytes() const {
     return n;
 }
 
+size_t VmmArena::live_bytes() const {
+    size_t n = 0;
+    for (const Block& b : blocks_)
+        if (b.live) n += b.size;
+    return n;
+}
+
 size_t VmmArena::offload() {
     if (!base_ || offloaded_) return 0;
     const size_t total = mapped_bytes();

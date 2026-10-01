@@ -48,6 +48,8 @@ public:
     bool restore();
     bool offloaded() const { return offloaded_; }
     size_t mapped_bytes() const;
+    // What restore() needs: every live block, mapped or not.
+    size_t live_bytes() const;
 
 private:
     struct Block {
