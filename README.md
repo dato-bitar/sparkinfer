@@ -191,8 +191,8 @@ Output tok/s, sparkinfer / vLLM:
 
 Inter-token latency p50 is lower than vLLM's in every cell. Two places are still behind:
 - **Time to first token at 16 and 32 concurrent chats:** p50 553 / 1,121 ms against 360 / 356.
-  The opt-in mixed prefill + decode steps (`SPARKINFER_MIXED_CHUNK`) bring it to ~330 ms at 32,
-  for ~15% less throughput.
+  The opt-in mixed prefill + decode steps (`SPARKINFER_MIXED_CHUNK`) measured 332 ms at 32
+  (against 1,240 off, on an earlier main), for ~15% less throughput.
 - **The 8K-prompt cells at 4+ requests:** AIPerf re-sends earlier cells' prompts, and vLLM's
   larger KV pool keeps them in its prefix cache (a 35% hit rate there).
 

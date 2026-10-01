@@ -30,11 +30,13 @@ server per engine, the same cells and seeds):
   re-sends earlier cells' prompts, and vLLM's larger KV pool keeps them in its prefix cache;
   ours is sized from `--ctx`;
 - time to first token at 16 and 32 concurrent chats is still behind (p50 553 / 1,121 ms against
-  360 / 356). The opt-in mixed steps below bring it to ~330 ms at a throughput cost.
+  360 / 356). The opt-in mixed steps below measured 332 ms at 32 (against 1,240 ms off, on an
+  earlier main), at a throughput cost.
 
-**Against 0.5.14** (same box, engine benches, every model's teacher-forced scores identical):
-Qwen3.8-27B NVFP4 decodes 5-8% faster at every context (97.2 -> 102.5 tok/s at 128 tokens, 86.9
--> 94.3 at 32K) and Ternary-Bonsai-2-27B 8-13%; continuous batching at 32 requests is +4% on
+**Against 0.5.14** (same box, engine benches; teacher-forced scores identical on Qwen3.8 NVFP4
+and GGUF, Muse Glimmer and Bonsai, while Qwen3.6's vary run to run on either build):
+Qwen3.8-27B NVFP4 decodes 5-8% faster at every context (97.2 -> 102.5 tok/s at empty context,
+86.9 -> 94.3 at 32K) and Ternary-Bonsai-2-27B 8-13%; continuous batching at 32 requests is +4% on
 Qwen3.8 and +23% on Bonsai. This release also carries the eight eval-bot speedups prepared as
 0.5.15, which was never tagged (see Kernels).
 
@@ -106,9 +108,9 @@ Qwen3.8 and +23% on Bonsai. This release also carries the eight eval-bot speedup
   Qwen3.8-27B (vLLM 0.30 with the same draft: 191/276/341); c6 and c8 unchanged.
   - **Before:** speculation ran only for a request that was alone, and stopped as soon as a
     second one arrived.
-  - **Now:** fresh prompts form a group (four at first, eight
-    since the batched draft above). Each drafts its own block from its own draft
-    state (`DFlashDraftModel::use_slot`), and one forward verifies every block
+  - **Now:** fresh prompts form a group (four at first, eight since the batched draft above).
+    Each drafts its own block from its own draft state (`DFlashDraftModel::use_slot`), and one
+    forward verifies every block
     (`Qwen35Model::verify_grouped`): per-row attention tables as packed decode has, the compact GDN
     scan and an accepted-prefix commit per sequence, and the block-scaled GEMMs a wide pass takes
     (4 x 8 rows: 16.6 ms against 56 on the row kernels). A new prompt joins between steps. One
@@ -362,7 +364,7 @@ Merged by the eval bots. Each gain is on the RTX 5090 eval box against the same-
 
 ### Fixed
 
-- **Muse Glimmer at 32 concurrent requests no longer falls to a fifth of its speed in some runs**
+- **Muse Glimmer at 32 concurrent requests no longer falls to under a fifth of its speed in some runs**
   (#1236; `qwen3_gguf_cb_bench` c32: 2,140 or ~380 tok/s from run to run -> 2,117-2,126 every
   run). v0.5.14 does the same.
   - **Cause:** the partial ffn_down fill left a flat 1 GB for the runtime's own allocations after

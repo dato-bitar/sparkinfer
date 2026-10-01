@@ -1,6 +1,6 @@
 # Roadmap: the fastest inference engine on the RTX 5090
 
-Status: draft plan, 2026-09-30. Nothing in it has started. Each phase needs an explicit go-ahead.
+Status: plan written 2026-09-30; the progress log at the end records what has shipped since.
 Scope: one GeForce RTX 5090 (sm_120, 32 GB, 1792 GB/s). The RTX PRO 6000 Blackwell comes second
 (see "After the 5090" at the end).
 Primary model: Qwen3.8-27B (NVFP4, ModelOpt release checkpoint). Ternary-Bonsai-2-27B, Muse
@@ -162,7 +162,7 @@ reverted for this). MTP is a separately selected, separately labelled, opt-in dr
 
 | Step | Work | Gate |
 |---|---|---|
-| 2.1 | **Mixed prefill + decode steps** (design: `scratchpad/design_mixed_batches.md`). Each step carries all decode rows plus the next chunk of the oldest pending prompt. Row-wise work (GEMMs, LM head) runs once over all rows; attention and GDN run per segment (recurrent for decode rows, chunked scan for the prompt chunk). The chunk contains its prefix-cache checkpoint | a correctness tool comparing mixed-step decode rows with `decode_packed` and the chunk's KV/state with prefill resume |
+| 2.1 | **Mixed prefill + decode steps** (shipped opt-in as #1224). Each step carries all decode rows plus the next chunk of the oldest pending prompt. Row-wise work (GEMMs, LM head) runs once over all rows; attention and GDN run per segment (recurrent for decode rows, chunked scan for the prompt chunk). The chunk contains its prefix-cache checkpoint | a correctness tool comparing mixed-step decode rows with `decode_packed` and the chunk's KV/state with prefill resume |
 | 2.2 | **CPU/GPU overlap.** Prepare step N+1 on the host while step N runs, and remove host–device syncs from the hot path (SGLang's zero-overhead scheduler gave about 1.1x) | no idle gaps between steps in nsys at c16/c32 |
 | 2.3 | **Token budget and chunk coalescing** for many short prompts arriving together | TTFT p99 at c32 below vLLM's |
 
@@ -202,7 +202,8 @@ Items, in order:
   README, model card and release notes.
 - Claims are made per axis (single-user, c8/c16/c32 throughput, TTFT, long context), never as one
   number.
-- Release as v0.6.0.
+- Release it. (v0.6.0 shipped earlier, after Phase 1.3–1.6, with the vLLM head-to-head only; the
+  full multi-engine head-to-head goes in a later release.)
 
 ## 5. Timeline (estimates)
 
@@ -213,7 +214,7 @@ Items, in order:
 | 3 | 1.3, 1.4, 1.5; start 2.1 |
 | 4 | 1.6; 2.1, 2.2 |
 | 5–6 | 2.3; Phase 4; Phase 3 PRs landing |
-| 6+ | Phase 5: head-to-head, publish, v0.6.0 |
+| 6+ | Phase 5: head-to-head, publish |
 
 ## 6. Risks
 
