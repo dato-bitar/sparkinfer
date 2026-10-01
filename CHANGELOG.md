@@ -16,6 +16,15 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Added
 
+- **A grouped verify runs its sequences' GDN work in one launch per layer** (c4/c8 652/864 ->
+  691/962 tok/s, Qwen3.8-27B + DFlash2, real prompts at T=0.7).
+  - **Before:** each speculating sequence's compact GDN conv and scan was its own launch, at every
+    one of the 48 GDN layers. A scan steps its few rows one by one, so it is latency-bound, and
+    at 8 sequences that was ~800 such launches a step.
+  - **Now:** `launch_dflash_gdn_{conv,scan}_compact_grouped` run every sequence in one launch each,
+    through the same per-sequence code. `grouped_verify_check` stays bit-identical.
+  - `SPARKINFER_GROUPED_GDN_ONE_LAUNCH=0` keeps the per-sequence launches.
+
 - **Speculating groups draft in one pass, and take up to 8 requests** (DFlash2): aggregate decode
   on real prompts at T=0.7, c4/c6/c8: 485/~405/633 -> 573/669/733 tok/s on Qwen3.8-27B.
   - **The draft:** a group's members drafted one after another, each streaming the draft's

@@ -6587,17 +6587,42 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 // commit after the verify writes each group's accepted prefix.
                 if (split_ok) pf_cu(cudaStreamWaitEvent(st, ev_join_ab, 0), "grouped gdn ab wait");
                 const size_t lq = (size_t)s.linear_qdim;
-                for (int g = 0; g < s.group_n; ++g) {
-                    const size_t o = (size_t)s.group_off[g];
-                    const int len = s.group_len[g];
-                    const bf16* conv_live = static_cast<const bf16*>(s.group_lin_conv[g]) + conv_off;
-                    kernels::launch_dflash_gdn_conv_compact(rq + o * lqkv, w.ssm_conv, conv_live,
-                        gq + o * lq, rk + o * lq, rv + o * lvdim, len, c.linear_q_heads, vh,
-                        c.linear_head_dim, c.linear_conv_kernel, c.rms_eps, st);
-                    kernels::launch_dflash_gdn_scan_compact(gq + o * lq, rk + o * lq, rv + o * lvdim,
-                        ra + o * vh, rb + o * vh, w.ssm_dt, w.ssm_a, s.group_lin_state[g] + state_off,
-                        att + o * lvdim, len, c.linear_q_heads, vh, c.linear_head_dim,
-                        c.gdn_qh_block, st);
+                // One launch each for every sequence where it fits (DfGdnGroups::kMax); the
+                // per-sequence launches otherwise. SPARKINFER_GROUPED_GDN_ONE_LAUNCH=0 keeps those.
+                static const bool one_launch = [] {
+                    const char* e = getenv("SPARKINFER_GROUPED_GDN_ONE_LAUNCH");
+                    return !(e && e[0] == '0');
+                }();
+                bool fused = false;
+                if (one_launch && s.group_n <= kernels::DfGdnGroups::kMax) {
+                    kernels::DfGdnGroups gc, gs;
+                    gc.n = gs.n = s.group_n;
+                    for (int g = 0; g < s.group_n; ++g) {
+                        gc.off[g] = gs.off[g] = s.group_off[g];
+                        gc.len[g] = gs.len[g] = s.group_len[g];
+                        gc.state[g] = static_cast<const bf16*>(s.group_lin_conv[g]) + conv_off;
+                        gs.state[g] = s.group_lin_state[g] + state_off;
+                    }
+                    fused = kernels::launch_dflash_gdn_conv_compact_grouped(
+                                rq, w.ssm_conv, gc, gq, rk, rv, c.linear_q_heads, vh, c.linear_head_dim,
+                                c.linear_conv_kernel, c.rms_eps, st) &&
+                            kernels::launch_dflash_gdn_scan_compact_grouped(
+                                gq, rk, rv, ra, rb, w.ssm_dt, w.ssm_a, gs, att, c.linear_q_heads, vh,
+                                c.linear_head_dim, c.gdn_qh_block, st);
+                }
+                if (!fused) {
+                    for (int g = 0; g < s.group_n; ++g) {
+                        const size_t o = (size_t)s.group_off[g];
+                        const int len = s.group_len[g];
+                        const bf16* conv_live = static_cast<const bf16*>(s.group_lin_conv[g]) + conv_off;
+                        kernels::launch_dflash_gdn_conv_compact(rq + o * lqkv, w.ssm_conv, conv_live,
+                            gq + o * lq, rk + o * lq, rv + o * lvdim, len, c.linear_q_heads, vh,
+                            c.linear_head_dim, c.linear_conv_kernel, c.rms_eps, st);
+                        kernels::launch_dflash_gdn_scan_compact(gq + o * lq, rk + o * lq, rv + o * lvdim,
+                            ra + o * vh, rb + o * vh, w.ssm_dt, w.ssm_a, s.group_lin_state[g] + state_off,
+                            att + o * lvdim, len, c.linear_q_heads, vh, c.linear_head_dim,
+                            c.gdn_qh_block, st);
+                    }
                 }
             } else {
             const bf16* conv_live = static_cast<const bf16*>(s.lin_conv_state) + conv_off;

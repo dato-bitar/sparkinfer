@@ -125,6 +125,27 @@ void launch_dflash_gdn_scan_compact(const void* q, const void* k, const void* v,
                                     int head_dim, bool qh_block = false,
                                     cudaStream_t stream = nullptr);
 
+// The two compact forms for several sequences in one launch each (a grouped speculative verify):
+// sequence g's rows are [off[g], off[g] + len[g]) of the shared buffers, contiguous and in order,
+// and state[g] is its live conv state (bf16) or recurrent state (fp32), already offset to the
+// layer. Per sequence the same arithmetic as the one-sequence launch. False: not launched.
+struct DfGdnGroups {
+    static constexpr int kMax = 8;
+    int n = 0;
+    int off[kMax] = {};
+    int len[kMax] = {};
+    const void* state[kMax] = {};
+};
+bool launch_dflash_gdn_conv_compact_grouped(const void* qkv, const void* conv_w, const DfGdnGroups& groups,
+                                            void* q, void* k, void* v, int q_heads, int v_heads,
+                                            int head_dim, int conv_kernel, float eps,
+                                            cudaStream_t stream = nullptr);
+bool launch_dflash_gdn_scan_compact_grouped(const void* q, const void* k, const void* v,
+                                            const void* alpha, const void* beta, const void* dt,
+                                            const void* a, const DfGdnGroups& groups, void* out,
+                                            int q_heads, int v_heads, int head_dim, bool qh_block,
+                                            cudaStream_t stream = nullptr);
+
 // Compact accepted-prefix commit. Verification retains qkv plus k/v/alpha/beta per GDN layer;
 // these launchers update the live decode state once after posterior selection, avoiding both
 // per-candidate full-state checkpoints and target-token replay.

@@ -841,19 +841,16 @@ __global__ void pf_gdn_scan_kernel(const __nv_bfloat16* __restrict__ q,
 // DFlash verification scan. Arithmetic and reduction order match pf_gdn_scan_kernel, but the
 // register state is seeded from decode and each candidate's post-token state is checkpointed.
 // The live state is read-only, so a rejected suffix never needs rollback or replay.
+// The body, shared with the grouped form below (one block column of one head of one sequence).
 template <int COLS, int HEAD_DIM, bool WRITE_CHECKPOINT>
-__global__ void df_gdn_scan_checkpoint_kernel(
+__device__ __forceinline__ void df_gdn_scan_checkpoint_body(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ v, const __nv_bfloat16* __restrict__ alpha,
     const __nv_bfloat16* __restrict__ beta, const __nv_bfloat16* __restrict__ dt,
     const __nv_bfloat16* __restrict__ a, const float* __restrict__ live_state,
     __nv_bfloat16* __restrict__ out, float* __restrict__ checkpoints,
-    int n_tokens, int q_heads, int v_heads, bool qh_block, bool state_bf16) {
+    int n_tokens, int q_heads, int v_heads, bool qh_block, bool state_bf16, int vh, int j, int lane) {
     constexpr int NROW = HEAD_DIM / 32;
-    const int vh = blockIdx.x;
-    const int j = blockIdx.y * COLS + (threadIdx.x >> 5);
-    const int lane = threadIdx.x & 31;
-    if (vh >= v_heads || j >= HEAD_DIM) return;
     const int qh = qh_block ? (vh / (v_heads / q_heads)) : (vh % q_heads);
     const int q_dim = q_heads * HEAD_DIM;
     const int v_dim = v_heads * HEAD_DIM;
@@ -895,6 +892,46 @@ __global__ void df_gdn_scan_checkpoint_kernel(
         const float y = pf_wsum(part_y);
         if (lane == 0) out[(size_t)t * v_dim + vh * HEAD_DIM + j] = __float2bfloat16(y);
     }
+}
+
+template <int COLS, int HEAD_DIM, bool WRITE_CHECKPOINT>
+__global__ void df_gdn_scan_checkpoint_kernel(
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v, const __nv_bfloat16* __restrict__ alpha,
+    const __nv_bfloat16* __restrict__ beta, const __nv_bfloat16* __restrict__ dt,
+    const __nv_bfloat16* __restrict__ a, const float* __restrict__ live_state,
+    __nv_bfloat16* __restrict__ out, float* __restrict__ checkpoints,
+    int n_tokens, int q_heads, int v_heads, bool qh_block, bool state_bf16) {
+    const int vh = blockIdx.x;
+    const int j = blockIdx.y * COLS + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (vh >= v_heads || j >= HEAD_DIM) return;
+    df_gdn_scan_checkpoint_body<COLS, HEAD_DIM, WRITE_CHECKPOINT>(
+        q, k, v, alpha, beta, dt, a, live_state, out, checkpoints, n_tokens, q_heads, v_heads,
+        qh_block, state_bf16, vh, j, lane);
+}
+
+// Several sequences' compact scans in one launch (blockIdx.z = sequence): sequence g's rows are
+// [off[g], off[g] + len[g]) of the shared q/k/v/alpha/beta/out, against its own live state. The
+// same body per sequence as the one-sequence launch.
+template <int COLS, int HEAD_DIM>
+__global__ void df_gdn_scan_compact_grouped_kernel(
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v, const __nv_bfloat16* __restrict__ alpha,
+    const __nv_bfloat16* __restrict__ beta, const __nv_bfloat16* __restrict__ dt,
+    const __nv_bfloat16* __restrict__ a, DfGdnGroups groups, __nv_bfloat16* __restrict__ out,
+    int q_heads, int v_heads, bool qh_block, bool state_bf16) {
+    const int g = blockIdx.z;
+    const int vh = blockIdx.x;
+    const int j = blockIdx.y * COLS + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (g >= groups.n || vh >= v_heads || j >= HEAD_DIM) return;
+    const size_t o = (size_t)groups.off[g];
+    const size_t q_dim = (size_t)q_heads * HEAD_DIM, v_dim = (size_t)v_heads * HEAD_DIM;
+    df_gdn_scan_checkpoint_body<COLS, HEAD_DIM, false>(
+        q + o * q_dim, k + o * q_dim, v + o * v_dim, alpha + o * v_heads, beta + o * v_heads, dt, a,
+        static_cast<const float*>(groups.state[g]), out + o * v_dim, nullptr, groups.len[g], q_heads,
+        v_heads, qh_block, state_bf16, vh, j, lane);
 }
 
 // Commit only the accepted compact recurrence inputs. Verification already retained k/v and the
@@ -1050,15 +1087,14 @@ __global__ void df_gdn_conv_checkpoint_kernel(
 // verify reproducing AR (see the serial kernel's own comment on #712) -- and the same block
 // reduction for the q/k norm.
 template <bool WRITE_CHECKPOINT>
-__global__ void df_gdn_conv_par_kernel(
+__device__ __forceinline__ void df_gdn_conv_par_body(
     const __nv_bfloat16* __restrict__ qkv, const __nv_bfloat16* __restrict__ conv_w,
     const __nv_bfloat16* __restrict__ live_state, __nv_bfloat16* __restrict__ q,
     __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v,
     __nv_bfloat16* __restrict__ checkpoints, int n_tokens, int q_heads, int v_heads,
-    int head_dim, int qkv_dim, int conv_kernel, float eps) {
+    int head_dim, int qkv_dim, int conv_kernel, float eps, int blk, int tok, int t) {
     const int q_dim = q_heads * head_dim;
     const int v_dim = v_heads * head_dim;
-    const int blk = blockIdx.x, tok = blockIdx.y, t = threadIdx.x;
     int d, out_dim, hh; __nv_bfloat16* out; bool do_norm;
     if (blk < q_heads) { hh = blk; d = hh * head_dim + t; out = q; out_dim = q_dim; do_norm = true; }
     else if (blk < 2 * q_heads) { hh = blk - q_heads; d = q_dim + hh * head_dim + t; out = k; out_dim = q_dim; do_norm = true; }
@@ -1104,6 +1140,36 @@ __global__ void df_gdn_conv_par_kernel(
             checkpoints[(size_t)tok * state_elems + (size_t)c * qkv_dim + d] =
                 __float2bfloat16(c < conv_kernel - 2 ? hist[c + 1] : cur);
     }
+}
+
+template <bool WRITE_CHECKPOINT>
+__global__ void df_gdn_conv_par_kernel(
+    const __nv_bfloat16* __restrict__ qkv, const __nv_bfloat16* __restrict__ conv_w,
+    const __nv_bfloat16* __restrict__ live_state, __nv_bfloat16* __restrict__ q,
+    __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v,
+    __nv_bfloat16* __restrict__ checkpoints, int n_tokens, int q_heads, int v_heads,
+    int head_dim, int qkv_dim, int conv_kernel, float eps) {
+    df_gdn_conv_par_body<WRITE_CHECKPOINT>(qkv, conv_w, live_state, q, k, v, checkpoints, n_tokens,
+                                           q_heads, v_heads, head_dim, qkv_dim, conv_kernel, eps,
+                                           blockIdx.x, blockIdx.y, threadIdx.x);
+}
+
+// Several sequences' compact convs in one launch: blockIdx.y runs over every sequence's rows, and
+// row r belongs to the sequence g with off[g] <= r < off[g] + len[g], whose conv state seeds it.
+__global__ void df_gdn_conv_compact_grouped_kernel(
+    const __nv_bfloat16* __restrict__ qkv, const __nv_bfloat16* __restrict__ conv_w,
+    DfGdnGroups groups, __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k,
+    __nv_bfloat16* __restrict__ v, int q_heads, int v_heads, int head_dim, int qkv_dim,
+    int conv_kernel, float eps) {
+    const int row = blockIdx.y;
+    int g = 0;
+    while (g + 1 < groups.n && row >= groups.off[g + 1]) ++g;
+    const size_t o = (size_t)groups.off[g];
+    const size_t q_dim = (size_t)q_heads * head_dim, v_dim = (size_t)v_heads * head_dim;
+    df_gdn_conv_par_body<false>(qkv + o * qkv_dim, conv_w, static_cast<const __nv_bfloat16*>(groups.state[g]),
+                                q + o * q_dim, k + o * q_dim, v + o * v_dim, nullptr, groups.len[g], q_heads,
+                                v_heads, head_dim, qkv_dim, conv_kernel, eps, blockIdx.x, row - (int)o,
+                                threadIdx.x);
 }
 
 // ============================================================================
@@ -2288,6 +2354,42 @@ void launch_dflash_gdn_scan_compact(const void* q, const void* k, const void* v,
         reinterpret_cast<const __nv_bfloat16*>(a), live_state,
         reinterpret_cast<__nv_bfloat16*>(out), nullptr, n_tokens, q_heads, v_heads, qh_block,
         state_bf16);
+}
+
+bool launch_dflash_gdn_conv_compact_grouped(const void* qkv, const void* conv_w, const DfGdnGroups& groups,
+                                            void* q, void* k, void* v, int q_heads, int v_heads, int head_dim,
+                                            int conv_kernel, float eps, cudaStream_t stream) {
+    if (groups.n < 1 || groups.n > DfGdnGroups::kMax || head_dim <= 0 || conv_kernel < 2 || conv_kernel > 8 ||
+        !df_gdn_conv_par())
+        return false;
+    // The rows tile [0, rows) in order: the kernel maps a row to its sequence by these offsets.
+    if (groups.off[0] != 0) return false;
+    for (int g = 0; g < groups.n; ++g)
+        if (groups.len[g] < 1 || (g > 0 && groups.off[g] != groups.off[g - 1] + groups.len[g - 1])) return false;
+    const int rows = groups.off[groups.n - 1] + groups.len[groups.n - 1];
+    const int qkv_dim = 2 * q_heads * head_dim + v_heads * head_dim;
+    df_gdn_conv_compact_grouped_kernel<<<dim3(2 * q_heads + v_heads, rows), head_dim, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(qkv), reinterpret_cast<const __nv_bfloat16*>(conv_w), groups,
+        reinterpret_cast<__nv_bfloat16*>(q), reinterpret_cast<__nv_bfloat16*>(k),
+        reinterpret_cast<__nv_bfloat16*>(v), q_heads, v_heads, head_dim, qkv_dim, conv_kernel, eps);
+    return true;
+}
+
+bool launch_dflash_gdn_scan_compact_grouped(const void* q, const void* k, const void* v, const void* alpha,
+                                            const void* beta, const void* dt, const void* a,
+                                            const DfGdnGroups& groups, void* out, int q_heads, int v_heads,
+                                            int head_dim, bool qh_block, cudaStream_t stream) {
+    if (groups.n < 1 || groups.n > DfGdnGroups::kMax || head_dim != 128) return false;
+    constexpr int COLS = 4;
+    static const bool state_bf16 = [] { const char* e = getenv("SPARKINFER_GDN_STATE_BF16");
+                                        return e && e[0] == '1'; }();
+    df_gdn_scan_compact_grouped_kernel<COLS, 128><<<dim3(v_heads, 128 / COLS, groups.n), COLS * 32, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k),
+        reinterpret_cast<const __nv_bfloat16*>(v), reinterpret_cast<const __nv_bfloat16*>(alpha),
+        reinterpret_cast<const __nv_bfloat16*>(beta), reinterpret_cast<const __nv_bfloat16*>(dt),
+        reinterpret_cast<const __nv_bfloat16*>(a), groups, reinterpret_cast<__nv_bfloat16*>(out), q_heads,
+        v_heads, qh_block, state_bf16);
+    return true;
 }
 
 void launch_dflash_gdn_conv_commit(const void* qkv, void* live_state, int n_tokens,
