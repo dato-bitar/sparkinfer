@@ -765,6 +765,17 @@ public:
     // spec_group_draft runs a slot's next block from the hidden rows its last verify captured.
     // spec_group_verify verifies every member's block in one pass (verify_grouped; one member
     // takes the single-sequence graph-cached verify) and commits each accepted prefix.
+    // A join whose prompt ends in a partial 8-row group, while other members are already
+    // speculating: spec_group_join_body prefills only the aligned body [0, *body) (same setup as
+    // spec_group_join, no seed, no draft); the caller verifies the rest of the prompt as that
+    // member's rows in the group's next verify with commit_all, whose last row is the seed, and
+    // spec_group_join_finish then moves those rows' captured hidden states (hidden + row offset)
+    // into the prompt's context and runs the slot's first draft block. -1: not taken, nothing ran.
+    int spec_group_join_body(const std::vector<int>& prompt, int max_new, int slot, const SpecHooks& hooks,
+                             int* body);
+    bool spec_group_join_finish(int slot, int n, int tail_len, const void* tail_hidden, int seed,
+                                float temperature, unsigned long long seed_rng, int top_k, float top_p,
+                                int* proposals);
     bool spec_group_begin();
     void spec_group_end();
     int spec_group_depth() const;
@@ -784,10 +795,12 @@ public:
                                 const int* top_k, const float* top_p, int* proposals);
     bool spec_group_verify(int n, const uint64_t* seq_ids, const int* const* blocks, const int* lens,
                            const int* start_pos, const PackedSampling* sampling, int* out_ids,
-                           int* keep);
+                           int* keep,
+                           const bool* commit_all = nullptr);
     bool verify_grouped(int n_groups, const uint64_t* seq_ids, const int* const* tokens,
                         const int* lens, const int* start_pos, const PackedSampling* sampling,
-                        int* out_ids, int* keep, const void* capture_dst = nullptr);
+                        int* out_ids, int* keep, const void* capture_dst = nullptr,
+                        const bool* commit_all = nullptr);
 
 private:
     void invalidate_decode_graph();

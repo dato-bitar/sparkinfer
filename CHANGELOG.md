@@ -16,6 +16,19 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Added
 
+- **8 concurrent requests speculate at over 1,000 tok/s at default sampling** (T=1.0, top_k 20,
+  top_p 0.95; c8 ~965 -> 1,013-1,017 tok/s, Qwen3.8-27B + DFlash2, real prompts).
+  - **A joining prompt's tail rides the group's verify:** when other members are speculating, a
+    joining prompt whose length is not a multiple of 8 prefills only its aligned body. Its last
+    1-7 tokens are rows of the group's next verify, committed whole; the last row's draw (at step
+    0, as prefill draws a seed) is the seed. This saves the separate forward the tail cost
+    (~12 ms), during which every member waited. Measured: c8 964/966 -> 999/988 tok/s.
+    A request that arrives alone keeps the whole prefill, so it stays identical to speculation
+    off. `SPARKINFER_SPEC_JOIN_TAIL=0` restores the whole prefill for every join.
+  - **Full-attention k/v take the block-scaled GEMM in wide passes** (`SPARKINFER_ATTN_GEMM`
+    default 3 -> 7). At 32 rows they ran as 8-row GEMV chunks, reading each weight four times.
+    Measured: c8 1001/1005 -> 1017/1013 tok/s; plain packed decode is unchanged.
+
 - **A batched draft walks every member's selector in one launch** (c8 ~960 -> 982-998 tok/s,
   Qwen3.8-27B + DFlash2, real prompts at T=0.7). DFlash2's candidate selector ran one single-block
   ~90 us launch per group member, eight in series at c8. `launch_selector_walks` runs them as one

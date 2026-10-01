@@ -235,6 +235,8 @@ struct Qwen35PrefillCtx {
     float* const*        group_lin_state  = nullptr;
     void* const*         group_lin_conv   = nullptr;
     int*                 group_keep       = nullptr;
+    // Optional, per group: commit every row (prompt rows ingested in the verify, not proposals).
+    const bool*          group_commit_all = nullptr;
 
     // MIXED STEP (Qwen35Model::mixed_step). mix_n > 0 puts mix_n packed DECODE rows at rows
     // [0, mix_n) of prefill_batched_run's pass, ahead of the prompt chunk it was called for, which

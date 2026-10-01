@@ -427,6 +427,10 @@ void ContinuousBatchEngine::run_spec_group() {
         std::vector<int> block;      // [next, proposals...]
         bool have_block = false;
         int feed_off = 0, feed_len = 0;   // this member's rows of the last verify's capture
+        // A join whose prompt tail rides the next verify (spec_group_join_body): `block` holds the
+        // tail, committed whole, and the last row's token is the seed; `first_block` then marks
+        // that the slot's first draft block (over the whole prompt) is still to run.
+        bool tail_pending = false, first_block = false;
         bool done = false;
     };
     std::vector<Member> members;
@@ -526,7 +530,24 @@ void ContinuousBatchEngine::run_spec_group() {
         // 1. Drafts, from the hidden rows each member's last verify captured (consumed before a
         //    join below re-arms the capture buffers).
         auto t_draft = std::chrono::steady_clock::now();
-        {
+        for (Member& m : members) {
+            if (m.done || !m.first_block || leave) continue;
+            const Job& job = *m.job;
+            std::vector<int> prop((size_t)depth, -1);
+            const char* hid = static_cast<const char*>(model_->dflash_hidden_buffer()) +
+                              (size_t)m.feed_off * model_->dflash_hidden_row_stride() * 2;
+            if (!model_->spec_group_join_finish(m.slot, m.pos, m.feed_len, hid, m.next, job.req.temperature,
+                                                (unsigned long long)job.req.seed, job.req.top_k, job.req.top_p,
+                                                prop.data())) {
+                leave = true;
+                break;
+            }
+            m.first_block = false;
+            m.block.assign(1, m.next);
+            m.block.insert(m.block.end(), prop.begin(), prop.end());
+            m.have_block = true;
+        }
+        if (!leave) {
             // Every member that needs a block, drafted in one pass where the draft can
             // (spec_group_draft_multi); the loop below takes whatever is left.
             std::vector<Member*> need;
@@ -567,6 +588,7 @@ void ContinuousBatchEngine::run_spec_group() {
             }
         }
         for (Member& m : members) {
+            if (leave) break;
             if (m.done || m.have_block) continue;
             const Job& job = *m.job;
             std::vector<int> prop((size_t)depth, -1);
@@ -634,58 +656,84 @@ void ContinuousBatchEngine::run_spec_group() {
                 hooks.n_ckpts = (int)ckpts.size();
                 hooks.snaps = snaps.data();
             }
-            Qwen35Model::SpecResume r;
-            std::vector<int> prop((size_t)depth, -1);
-            Member nm;
-            nm.job = joiner;
-            nm.slot = slot;
-            nm.pos = n;
-            slot_used[(size_t)slot] = true;
-            bool seed_out = false;
-            // The seed goes out the moment prefill has drawn it, ahead of the first draft block
-            // (which reads the whole prompt context), as dflash_generate hands its seed over.
-            hooks.on_tokens = [&](const int* toks, int) -> bool {
-                if (r.ckpts_taken)
-                    for (size_t i = 0; i < ckpts.size(); ++i) {
-                        Job::Checkpoint cp;
-                        cp.pos = ckpts[i];
-                        cp.state = std::move(snaps[i]);
-                        joiner->checkpoints.push_back(std::move(cp));
-                    }
-                joiner->prefill_pos = n;
-                joiner->phase = SeqPhase::DECODE;
-                spec_runs_.fetch_add(1, std::memory_order_relaxed);
-                seed_out = true;
-                nm.next = toks[0];
-                if (!emit(nm, toks[0])) return false;
-                nm.next_emitted = true;
-                return true;
-            };
-            const int seed = model_->spec_group_join(joiner->req.prompt, joiner->req.max_new_tokens,
-                                                     slot, hooks, &r, prop.data());
-            if (spec_group_trace())
-                fprintf(stderr, "[spec-group] join: %zu-token prompt, slot %d, seed %d\n",
-                        joiner->req.prompt.size(), slot, seed);
-            if (nm.done) {
-                // Finished at its seed (EOS, a one-token limit, a cancel): nothing more to do.
-            } else if (seed_out && seed >= 0) {
-                nm.block.assign(1, nm.next);
-                nm.block.insert(nm.block.end(), prop.begin(), prop.end());
-                nm.have_block = true;
-                members.push_back(std::move(nm));
-            } else if (seed_out) {
-                // Prefilled and its seed handed out, but the first draft block failed: the member
-                // goes to ordinary decode with the others below.
-                members.push_back(std::move(nm));
-                leave = true;
+            // With others speculating, a prompt ending in a partial group of eight prefills only its
+            // aligned body here and verifies the rest in the group's next verify: one forward
+            // fewer than prefilling the tail on its own. SPARKINFER_SPEC_JOIN_TAIL=0 keeps the
+            // whole prefill here.
+            static const bool join_tail = [] {
+                const char* e = getenv("SPARKINFER_SPEC_JOIN_TAIL");
+                return !(e && e[0] == '0');
+            }();
+            int body = 0;
+            if (join_tail && live_members() >= 1 && ckpts.empty() &&
+                model_->spec_group_join_body(joiner->req.prompt, joiner->req.max_new_tokens, slot, hooks,
+                                             &body) == 0) {
+                Member tm;
+                tm.job = joiner;
+                tm.slot = slot;
+                tm.pos = body;
+                tm.block.assign(joiner->req.prompt.begin() + body, joiner->req.prompt.end());
+                tm.have_block = true;
+                tm.tail_pending = true;
+                slot_used[(size_t)slot] = true;
+                members.push_back(std::move(tm));
+                if (spec_group_trace())
+                    fprintf(stderr, "[spec-group] join: %d-token prompt, body %d, tail in the verify, slot %d\n", n,
+                            body, slot);
             } else {
-                slot_used[(size_t)slot] = false;
-                if (r.failed) {
-                    joiner->error = "speculative prefill failed; the request was aborted";
-                    joiner->internal_error = true;
-                    finish_job_impl(*joiner);
+                Qwen35Model::SpecResume r;
+                std::vector<int> prop((size_t)depth, -1);
+                Member nm;
+                nm.job = joiner;
+                nm.slot = slot;
+                nm.pos = n;
+                slot_used[(size_t)slot] = true;
+                bool seed_out = false;
+                // The seed goes out the moment prefill has drawn it, ahead of the first draft block
+                // (which reads the whole prompt context), as dflash_generate hands its seed over.
+                hooks.on_tokens = [&](const int* toks, int) -> bool {
+                    if (r.ckpts_taken)
+                        for (size_t i = 0; i < ckpts.size(); ++i) {
+                            Job::Checkpoint cp;
+                            cp.pos = ckpts[i];
+                            cp.state = std::move(snaps[i]);
+                            joiner->checkpoints.push_back(std::move(cp));
+                        }
+                    joiner->prefill_pos = n;
+                    joiner->phase = SeqPhase::DECODE;
+                    spec_runs_.fetch_add(1, std::memory_order_relaxed);
+                    seed_out = true;
+                    nm.next = toks[0];
+                    if (!emit(nm, toks[0])) return false;
+                    nm.next_emitted = true;
+                    return true;
+                };
+                const int seed = model_->spec_group_join(joiner->req.prompt, joiner->req.max_new_tokens,
+                                                         slot, hooks, &r, prop.data());
+                if (spec_group_trace())
+                    fprintf(stderr, "[spec-group] join: %zu-token prompt, slot %d, seed %d\n",
+                            joiner->req.prompt.size(), slot, seed);
+                if (nm.done) {
+                    // Finished at its seed (EOS, a one-token limit, a cancel): nothing more to do.
+                } else if (seed_out && seed >= 0) {
+                    nm.block.assign(1, nm.next);
+                    nm.block.insert(nm.block.end(), prop.begin(), prop.end());
+                    nm.have_block = true;
+                    members.push_back(std::move(nm));
+                } else if (seed_out) {
+                    // Prefilled and its seed handed out, but the first draft block failed: the member
+                    // goes to ordinary decode with the others below.
+                    members.push_back(std::move(nm));
+                    leave = true;
+                } else {
+                    slot_used[(size_t)slot] = false;
+                    if (r.failed) {
+                        joiner->error = "speculative prefill failed; the request was aborted";
+                        joiner->internal_error = true;
+                        finish_job_impl(*joiner);
+                    }
+                    leave = true;   // otherwise nothing ran: the ordinary path prefills it
                 }
-                leave = true;   // otherwise nothing ran: the ordinary path prefills it
             }
         }
         if (joiner) trace_join_ms += ms_since(t_join);
@@ -713,17 +761,30 @@ void ContinuousBatchEngine::run_spec_group() {
         bool any_sampled = false;
         int rows = 0;
         // The verify takes kQwen35MaxPackedRows rows: past four members each verifies a shorter
-        // block (the draft still proposes its full depth; the rest is not scored).
-        const int row_cap = std::max(2, kQwen35MaxPackedRows / n);
+        // block (the draft still proposes its full depth; the rest is not scored). A joiner's
+        // prompt tail (at most 7 rows) is verified whole, committed, and the others share the rest.
+        std::unique_ptr<bool[]> commit(new bool[(size_t)n]());
+        bool any_commit = false;
+        int tail_rows = 0, n_spec = 0;
+        for (int g = 0; g < n; ++g) {
+            const Member& m = *act[(size_t)g];
+            if (m.tail_pending) tail_rows += (int)m.block.size();
+            else ++n_spec;
+        }
+        const int row_cap = std::max(2, (kQwen35MaxPackedRows - tail_rows) / std::max(n_spec, 1));
         for (int g = 0; g < n; ++g) {
             Member& m = *act[(size_t)g];
             seqs[(size_t)g] = m.job->seq_id;
             blocks[(size_t)g] = m.block.data();
-            lens[(size_t)g] = std::min((int)m.block.size(), row_cap);
+            lens[(size_t)g] = m.tail_pending ? (int)m.block.size() : std::min((int)m.block.size(), row_cap);
+            commit[(size_t)g] = m.tail_pending;
+            any_commit = any_commit || m.tail_pending;
             starts[(size_t)g] = m.pos;
             temp[(size_t)g] = m.job->req.temperature;
             seedv[(size_t)g] = (unsigned long long)m.job->req.seed;
-            step[(size_t)g] = idx_of_next(m) + 1;
+            // A tail's last row draws the seed, which prefill samples at step 0 (row i is drawn at
+            // step[g] + i; unsigned wrap is the intent).
+            step[(size_t)g] = m.tail_pending ? (unsigned long long)(1 - lens[(size_t)g]) : idx_of_next(m) + 1;
             top_k[(size_t)g] = m.job->req.top_k;
             top_p[(size_t)g] = m.job->req.top_p;
             any_sampled = any_sampled || temp[(size_t)g] > 0.f;
@@ -738,7 +799,8 @@ void ContinuousBatchEngine::run_spec_group() {
         std::vector<int> out((size_t)rows, -1);
         auto t_verify = std::chrono::steady_clock::now();
         if (!model_->spec_group_verify(n, seqs.data(), blocks.data(), lens.data(), starts.data(),
-                                       any_sampled ? &samp : nullptr, out.data(), keep.data())) {
+                                       any_sampled ? &samp : nullptr, out.data(), keep.data(),
+                                       any_commit ? commit.get() : nullptr)) {
             for (Member* pm : act) {
                 pm->job->error = "speculative decode failed; the request was aborted";
                 pm->job->internal_error = true;
@@ -754,6 +816,25 @@ void ContinuousBatchEngine::run_spec_group() {
         for (int g = 0, off = 0; g < n; off += lens[(size_t)g], ++g) {
             Member& m = *act[(size_t)g];
             const int k = keep[(size_t)g];
+            if (m.tail_pending) {
+                // The prompt is in: its last row's token is the seed, emitted now, and the slot's
+                // first draft block runs at the next step's draft, from these rows.
+                Job& job = *m.job;
+                m.tail_pending = false;
+                m.pos += k;
+                m.next = out[(size_t)(off + k - 1)];
+                m.feed_off = off;
+                m.feed_len = k;
+                m.have_block = false;
+                job.prefill_pos = (int)job.req.prompt.size();
+                job.phase = SeqPhase::DECODE;
+                spec_runs_.fetch_add(1, std::memory_order_relaxed);
+                if (emit(m, m.next)) {
+                    m.next_emitted = true;
+                    m.first_block = true;
+                }
+                continue;
+            }
             bool going = true;
             for (int i = (m.next_emitted ? 1 : 0); i < k && going; ++i) going = emit(m, m.block[(size_t)i]);
             if (!going) continue;

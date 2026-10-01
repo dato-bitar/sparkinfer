@@ -5942,7 +5942,7 @@ void Qwen35Model::dflash_warm_verify(int n, int start_pos) {
 
 bool Qwen35Model::verify_grouped(int n_groups, const uint64_t* seq_ids, const int* const* tokens,
                                  const int* lens, const int* start_pos, const PackedSampling* sampling,
-                                 int* out_ids, int* keep, const void* capture_dst) {
+                                 int* out_ids, int* keep, const void* capture_dst, const bool* commit_all) {
     Impl& s = *p_;
     if (n_groups < 1 || n_groups > 8 || !seq_ids || !tokens || !lens || !start_pos || !out_ids || !keep)
         return false;
@@ -6009,6 +6009,7 @@ bool Qwen35Model::verify_grouped(int n_groups, const uint64_t* seq_ids, const in
     ctx.group_lin_state = g_state.data();
     ctx.group_lin_conv = g_conv.data();
     ctx.group_keep = g_keep.data();
+    ctx.group_commit_all = commit_all;
     ctx.verify_eager = true;
     // Each row drawn with its group's sampler at that row's own step, as the one-sequence verify
     // draws its rows (see batched_forward), through the packed rows' sampler.
@@ -6231,6 +6232,73 @@ int Qwen35Model::spec_group_join(const std::vector<int>& prompt, int max_new, in
     return next;
 }
 
+int Qwen35Model::spec_group_join_body(const std::vector<int>& prompt, int max_new, int slot,
+                                      const SpecHooks& hooks, int* body) {
+    Impl& s = *p_;
+    if (!s.dflash_draft || prompt.empty() || !body) return -1;
+    DFlashDraftModel& draft = *s.dflash_draft;
+    const DFlashDraftConfig& dc = draft.config();
+    const int depth = spec_group_depth();
+    const int n = (int)prompt.size();
+    const int b = n & ~7;
+    // Only a fresh prompt (no cached prefix, no checkpoints to take) with a partial last group of
+    // eight and a body the batched prefill takes in one aligned pass.
+    if (hooks.prefill_start != 0 || hooks.n_ckpts > 0 || b < 8 || b == n ||
+        (long)n + max_new + 2L * (depth + 1) > dc.max_seq ||
+        !batched_prefill_windowed_enabled(s.gguf, s.cfg, b, s.kv))
+        return -1;
+    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+    if (!draft.use_slot(slot, n + max_new + 2 * (depth + 1))) return -1;
+    const int capture_start = n >= 12288 ? n - 4096 : 0;
+    set_dflash_capture(true, dc.target_layer_ids, kQwen35MaxPackedRows, capture_start,
+                       std::min(s.cfg.max_seq, n + max_new + depth + 1));
+    if (!dflash_context_buffer() || !dflash_hidden_buffer()) return -1;
+    invalidate_decode_graph();
+    if (!s.kv->allocate(hooks.seq_id, session_token_budget(prompt.size(), max_new + depth + 1, s.cfg.max_seq)))
+        return -1;
+    activate_session(hooks.seq_id);
+    s.final_seqlen_hint = -1;
+    int done = 0;
+    const int r = prefill_batched_chunked(prompt.data(), b, false, &done);
+    if (r < 0 && done == 0) return -1;   // nothing landed
+    // A pass that landed part of the body: the rest token by token, as spec_group_join does.
+    for (int i = (r < 0 ? done : b); i < b; ++i) {
+        set_dflash_capture_row(0);
+        forward_token(prompt[(size_t)i], i, false);
+        dflash_stash_capture(i);
+    }
+    *body = b;
+    return 0;
+}
+
+bool Qwen35Model::spec_group_join_finish(int slot, int n, int tail_len, const void* tail_hidden, int seed,
+                                         float temperature, unsigned long long seed_rng, int top_k,
+                                         float top_p, int* proposals) {
+    Impl& s = *p_;
+    if (!s.dflash_draft || !proposals || !tail_hidden || tail_len < 1) return false;
+    DFlashDraftModel& draft = *s.dflash_draft;
+    const int depth = spec_group_depth();
+    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+    const size_t row = (size_t)s.dflash_n_cap * s.cfg.hidden;
+    const int at = n - tail_len - s.dflash_ctx_start;
+    if (!s.dflash_context || at < 0 || n - s.dflash_ctx_start > s.dflash_ctx_cap) return false;
+    // The tail's captured rows, from the verify that ingested them, join the body's in the context.
+    if (cudaMemcpyAsync(s.dflash_context + (size_t)at * row, tail_hidden, (size_t)tail_len * row * sizeof(bf16),
+                        cudaMemcpyDeviceToDevice, s.stream) != cudaSuccess ||
+        cudaStreamSynchronize(s.stream) != cudaSuccess)
+        return false;
+    if (!draft.use_slot(slot)) return false;
+    std::vector<int> block((size_t)depth + 1, draft.config().mask_token_id), ids((size_t)depth + 2, -1);
+    block[0] = seed;
+    draft.reset();
+    draft.set_sampling(temperature, seed_rng, 1ull, top_k, top_p);
+    if (!draft.forward_block(dflash_context_buffer(), n, block.data(), n, ids.data(), nullptr, depth, nullptr,
+                             s.dflash_ctx_start))
+        return false;
+    for (int i = 0; i < depth; ++i) proposals[i] = ids[(size_t)i + 1];
+    return true;
+}
+
 bool Qwen35Model::spec_group_draft(int slot, const void* target_hidden, int th_len, int seed, int pos,
                                    float temperature, unsigned long long seed_rng,
                                    unsigned long long step0, int top_k, float top_p, int* proposals) {
@@ -6289,10 +6357,11 @@ bool Qwen35Model::spec_group_draft_multi(int n, const int* slots, const void* co
 
 bool Qwen35Model::spec_group_verify(int n, const uint64_t* seq_ids, const int* const* blocks,
                                     const int* lens, const int* start_pos,
-                                    const PackedSampling* sampling, int* out_ids, int* keep) {
+                                    const PackedSampling* sampling, int* out_ids, int* keep,
+                                    const bool* commit_all) {
     Impl& s = *p_;
     std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
-    if (n == 1) {
+    if (n == 1 && !(commit_all && commit_all[0])) {
         // One member: the single-sequence verify, which is lossless against ordinary decode as
         // dflash_generate's is. That takes the KV split count ordinary decode uses at each row's
         // position (adaptive_nsplits_for(p + 1)); a different count flips argmax near-ties on long
@@ -6327,7 +6396,7 @@ bool Qwen35Model::spec_group_verify(int n, const uint64_t* seq_ids, const int* c
         return true;
     }
     return verify_grouped(n, seq_ids, blocks, lens, start_pos, sampling, out_ids, keep,
-                          dflash_hidden_buffer());
+                          dflash_hidden_buffer(), commit_all);
 }
 
 bool Qwen35Model::batched_forward(const int* token_ids, int n, int start_pos, bool /*resume_gdn*/,

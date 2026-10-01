@@ -5192,11 +5192,14 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // SPARKINFER_PROJ_GEMM_MIN_ROWS raises or disables the threshold for an A/B in one binary.
     // Which full-attention projections take the GEMM arm: bit 0 = wq, bit 1 = wo, bit 2 = wk/wv
     // (bit 2 requires bit 0, since it rides wq's quantize of xn). All by default; the bits exist
-    // so each can be measured against the others out of ONE binary.
+    // so each can be measured against the others out of ONE binary. Bit 2 was off: at 32 rows k/v
+    // then ran as 8-row GEMV chunks, four reads of each weight (~1 ms of a speculating c8 step).
+    // On, c8 speculation at T=1.0 went 1001/1005 -> 1017/1013 tok/s, and plain packed decode stayed
+    // flat (AIPerf chat c16 / c32 per-user 52.95 / 37.51 -> 53.00 / 38.50 tok/s).
     static const int kAttnGemm = [] {
         const char* e = getenv("SPARKINFER_ATTN_GEMM");
-        const int v = e ? atoi(e) : 3;
-        return (v >= 0 && v <= 7) ? v : 3;
+        const int v = e ? atoi(e) : 7;
+        return (v >= 0 && v <= 7) ? v : 7;
     }();
     // Rows at which the packed projections leave the row-GEMVs for the block-scaled GEMM. 8 is
     // the smallest width its A-quantizer takes (m % 8 == 0); since the transposed orientation
@@ -7680,6 +7683,7 @@ verify_forward_done:
             const int o = s.group_off[g], len = s.group_len[g];
             int k = 1;
             while (k < len && token_ids[o + k] == out_argmax[o + k - 1]) ++k;
+            if (s.group_commit_all && s.group_commit_all[g]) k = len;
             s.group_keep[g] = k;
             units.push_back({(size_t)o, k, s.group_lin_conv[g], s.group_lin_state[g]});
         }
