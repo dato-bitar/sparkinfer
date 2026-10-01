@@ -734,7 +734,13 @@ ContinuousBatchEngine::Result ContinuousBatchEngine::wait_locked(uint64_t reques
     out.cached_tokens = it->second->cached_tokens;
     jobs_.erase(it);
     // The worker may have produced a token or two past the one the callback stopped on.
-    if (cut > 0 && out.tokens.size() > cut) out.tokens.resize(cut);
+    // The callback stopped the request, as it would have synchronously: whatever the worker reached
+    // after that (EOS, the token limit) is not what ended it.
+    if (cut > 0) {
+        if (out.tokens.size() > cut) out.tokens.resize(cut);
+        out.cancelled = true;
+        out.reached_token_limit = false;
+    }
     return out;
 }
 
