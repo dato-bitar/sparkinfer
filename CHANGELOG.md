@@ -81,6 +81,22 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Performance
 
+- **Tokens are streamed off the engine thread** (long answers c32 1,600 -> 1,986 tok/s, ITL p50
+  19.7 -> 15.9 ms on Qwen3.8-27B).
+  - **Before:** every emitted token ran the caller's callback on the worker thread, one row after
+    another -- for a streamed chat, incremental detokenization, the stop-sequence filter, the
+    SSE JSON and a socket write -- while the device idled: p50 4.0 ms of a 19 ms step at 32 rows.
+  - **Now:** the worker only queues each token. The request's own thread, which was already
+    blocked waiting for its result, runs the callbacks as tokens arrive, all requests in
+    parallel. A callback that returns false (a stop sequence, a closed connection) is seen by
+    the worker at that request's next token, and the result is cut back to the tokens the
+    callback took, so output and usage are unchanged. `SPARKINFER_ASYNC_EMIT=0` restores
+    emission on the worker.
+  - **Measured** (AIPerf, RTX 5090, ModelOpt NVFP4, one binary): longanswer 128/1024 c32 1,599.5
+    -> 1,986.0 tok/s (vLLM 0.30: 1,785); chat 1024/256 c32 1,176 tok/s. Six streamed and
+    non-streamed requests (stop sequences, logprobs, the completions endpoint) give identical
+    text, finish reasons and token counts either way.
+
 - **A chat prompt's last few tokens after its prefix-cache checkpoint take one forward** (chat c32
   TTFT p50 1,527 -> 875 ms, 1,082 -> 1,111 tok/s on Qwen3.8-27B).
   - **Before:** a chat prompt's final checkpoint sits at the start of its assistant turn, 1-7

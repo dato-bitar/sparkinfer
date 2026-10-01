@@ -4,6 +4,8 @@
 #include "sparkinfer/device_health.h"
 
 #include <mutex>
+#include <deque>
+#include <memory>
 
 #include <algorithm>
 #include <chrono>
@@ -77,6 +79,28 @@ struct ContinuousBatchEngine::Job {
     std::vector<int> output;
     std::string error;
     std::function<bool(int)> on_token;  // false return = cancel
+    // ASYNC EMISSION (SPARKINFER_ASYNC_EMIT, on unless =0). The caller's callbacks -- for a
+    // streamed chat, incremental detokenization, the stop filter, the SSE JSON and a socket write
+    // -- ran on the worker thread, one row after another, while the device idled: ~4 ms of every
+    // 19 ms step at 32 rows. With a queue, on_token/on_token_logprob only enqueue, and the
+    // request's own thread (wait_locked) runs the callbacks, all requests in parallel. A callback
+    // that returns false sets `stop`, which on_token reports to the worker on its next token; the
+    // result is cut back to the tokens the callback took.
+    struct EmitQueue {
+        struct Event {
+            bool is_logprob = false;
+            int token = -1;
+            Qwen35Model::TokenLogprob lp;
+        };
+        std::mutex mu;
+        std::condition_variable cv;
+        std::deque<Event> events;
+        bool stop = false;     // the caller's on_token returned false
+        bool closed = false;   // the job is done: nothing more will be queued
+        std::function<bool(int)> user_token;
+        std::function<void(const Qwen35Model::TokenLogprob&)> user_logprob;
+    };
+    std::shared_ptr<EmitQueue> emit;
     // Optional. Delivered one step_job() call AFTER forward_token() actually computed it -- see
     // step_job()'s implementation for why (worker_loop() interleaves step_job() across jobs
     // sharing one Qwen35Model instance, so the logprobs data must be read out of the model's
@@ -598,8 +622,38 @@ uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(
 
     job.request_id = next_req_id_.fetch_add(1);
     job.seq_id = seq_id;
-    job.on_token = on_token;
-    job.on_token_logprob = on_token_logprob;
+    static const bool async_emit = [] {
+        const char* e = getenv("SPARKINFER_ASYNC_EMIT");
+        return !(e && e[0] == '0');
+    }();
+    if (async_emit && on_token) {
+        auto q = std::make_shared<Job::EmitQueue>();
+        q->user_token = on_token;
+        q->user_logprob = on_token_logprob;
+        job.emit = q;
+        job.on_token = [q](int t) {
+            std::lock_guard<std::mutex> g(q->mu);
+            if (q->stop) return false;
+            Job::EmitQueue::Event ev;
+            ev.token = t;
+            q->events.push_back(std::move(ev));
+            q->cv.notify_one();
+            return true;
+        };
+        if (on_token_logprob)
+            job.on_token_logprob = [q](const Qwen35Model::TokenLogprob& lp) {
+                std::lock_guard<std::mutex> g(q->mu);
+                if (q->stop) return;
+                Job::EmitQueue::Event ev;
+                ev.is_logprob = true;
+                ev.lp = lp;
+                q->events.push_back(std::move(ev));
+                q->cv.notify_one();
+            };
+    } else {
+        job.on_token = on_token;
+        job.on_token_logprob = on_token_logprob;
+    }
     job.prefill_pos = job.req.prefill_start;
     job.t_submit = std::chrono::steady_clock::now();
     auto ptr = std::make_unique<Job>(std::move(job));
@@ -613,6 +667,52 @@ uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(
 }
 
 ContinuousBatchEngine::Result ContinuousBatchEngine::wait_locked(uint64_t request_id) {
+    // Async emission: run the caller's callbacks here, on its own thread, as the worker queues
+    // them, until the job closes its queue. Never under mu_ or the queue's lock.
+    std::shared_ptr<Job::EmitQueue> q;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto it = jobs_.find(request_id);
+        if (it != jobs_.end()) q = it->second->emit;
+    }
+    size_t taken = 0, cut = 0;
+    if (q) {
+        bool stopped = false;
+        std::deque<Job::EmitQueue::Event> batch;
+        for (;;) {
+            bool closed = false;
+            {
+                std::unique_lock<std::mutex> lk(q->mu);
+                q->cv.wait_for(lk, std::chrono::milliseconds(100),
+                               [&] { return !q->events.empty() || q->closed; });
+                batch.swap(q->events);
+                closed = q->closed;
+            }
+            for (auto& ev : batch) {
+                if (stopped) continue;
+                if (ev.is_logprob) {
+                    if (q->user_logprob) q->user_logprob(ev.lp);
+                    continue;
+                }
+                ++taken;
+                if (!q->user_token(ev.token)) {
+                    stopped = true;
+                    cut = taken;
+                    std::lock_guard<std::mutex> g(q->mu);
+                    q->stop = true;
+                }
+            }
+            batch.clear();
+            if (closed) break;
+            // Belt and braces: a job finished by a path that did not close its queue.
+            std::lock_guard<std::mutex> lock(mu_);
+            auto it = jobs_.find(request_id);
+            if (it == jobs_.end() || it->second->done) {
+                std::lock_guard<std::mutex> g(q->mu);
+                if (q->events.empty()) break;
+            }
+        }
+    }
     std::unique_lock<std::mutex> lock(mu_);
     cv_.wait(lock, [&] {
         auto it = jobs_.find(request_id);
@@ -633,6 +733,8 @@ ContinuousBatchEngine::Result ContinuousBatchEngine::wait_locked(uint64_t reques
     out.decode_tps = it->second->decode_tps;
     out.cached_tokens = it->second->cached_tokens;
     jobs_.erase(it);
+    // The worker may have produced a token or two past the one the callback stopped on.
+    if (cut > 0 && out.tokens.size() > cut) out.tokens.resize(cut);
     return out;
 }
 
@@ -878,8 +980,14 @@ void ContinuousBatchEngine::finish_job_impl(Job& j) {
     // finish notifies cv_ -- and erase the Job while the worker was still inside the prefix-cache
     // insert and close_session above: a use-after-free that segfaulted the server in finish_job_impl
     // under concurrent load with the cache on. Nothing may touch j after this line.
+    std::shared_ptr<Job::EmitQueue> q = j.emit;   // j may be gone once done is set
     std::lock_guard<std::mutex> lock(mu_);
     j.done = true;
+    if (q) {
+        std::lock_guard<std::mutex> g(q->mu);
+        q->closed = true;
+        q->cv.notify_all();
+    }
 }
 
 // Packed decode: one forward for the whole decode batch.
@@ -1232,8 +1340,14 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
         job.error = "CUDA context lost (unrecoverable device error) -- request aborted; "
                     "the server requires a restart";
         {
+            std::shared_ptr<Job::EmitQueue> q = job.emit;
             std::lock_guard<std::mutex> lock(mu_);   // done lets the waiting thread destroy the Job
             job.done = true;
+            if (q) {
+                std::lock_guard<std::mutex> g(q->mu);
+                q->closed = true;
+                q->cv.notify_all();
+            }
         }
         cv_.notify_all();
         return true;
