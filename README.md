@@ -162,6 +162,40 @@ Sampled requests through the server (`eval/spec_sampled_check.py`, 6 prompts × 
 T=0.7 175.9 tok/s against DSpark's 154.2, T=1.0 177.0 against 154.8, plain decode ~98.7. The
 8K–32K prompts are this repository's own docs and sources, so their τ is higher than prose.
 
+Concurrent requests speculate together: up to eight share one draft pass and one verify forward
+(`SPARKINFER_SPEC_GROUP`, default 8). Aggregate decode tok/s with DFlash2 on real chat prompts
+(256-token answers, top_k 20, top_p 0.95), against vLLM 0.30.0 serving the same checkpoint and
+draft:
+
+| | 1 request | 2 | 4 | 8 |
+|---|---:|---:|---:|---:|
+| **sparkinfer, T=0.7** | **212** | **410** | **714** | **1,040** |
+| **sparkinfer, T=1.0** | **215** | **402** | **675** | **1,011** |
+| vLLM + DFlash2, T=0.7 | 191 | 276 | 341 | 345 |
+
+A request speculating alone is bit-identical to speculation off; a group uses batch arithmetic,
+as packed decode does.
+
+### Serving against vLLM
+
+[AIPerf](https://github.com/ai-dynamo/aiperf), streaming chat completions, no draft, RTX 5090,
+the ModelOpt NVFP4 checkpoint on both engines (sparkinfer int8 KV, `--ctx 131072`; vLLM 0.30.0
+fp8 KV, `--gpu-memory-utilization 0.90`), one server per engine, the same cells and seed.
+Output tok/s, sparkinfer / vLLM:
+
+| cell (prompt / answer tokens) | 1 request | 4 | 16 | 32 |
+|---|---:|---:|---:|---:|
+| chat (1024 / 256) | **94.7** / 82.8 | **308.6** / 260.8 | **858.8** / 752.7 | **1,069.7** / 1,030.5 |
+| long answer (128 / 1024) | **99.8** / 85.2 | **352.1** / 290.8 | **1,239.3** / 1,092.1 | **2,001.9** / 1,785.4 |
+| long prompt (8192 / 128) | **66.8** / 59.5 | 127.5 / **147.2** | 165.0 / **170.8** | 165.6 / **167.7** |
+
+Inter-token latency p50 is lower than vLLM's in every cell. Two places are still behind:
+- **Time to first token at 16 and 32 concurrent chats:** p50 553 / 1,121 ms against 360 / 356.
+  The opt-in mixed prefill + decode steps (`SPARKINFER_MIXED_CHUNK`) bring it to ~330 ms at 32,
+  for ~15% less throughput.
+- **The 8K-prompt cells at 4+ requests:** AIPerf re-sends earlier cells' prompts, and vLLM's
+  larger KV pool keeps them in its prefix cache (a 35% hit rate there).
+
 ### Same weights, GGUF on both sides
 
 To make the engine comparison fair, the same `Q4_K_M` GGUF

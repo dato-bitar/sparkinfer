@@ -5,38 +5,40 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
-### Changed
+## [0.6.0] — 2026-10-01
 
-- **A request speculating alone verifies the depth that pays** (single-stream decode,
-  Qwen3.8-27B: 14.5K-token prose 96 -> 119 tok/s; spec_group_check DFlash2 T=0/0.7/1.0
-  226/198/192 -> 231/210/205, DSpark 178/155/151 -> 191/170/169; 4-turn ~7K-token chats with
-  DSpark +16-20%). The group path verified every proposal of every block. A lone member now
-  verifies the depth with the most tokens per ms: its acceptance record against the
-  single-sequence verify's measured cost curve (rows 1-4 nearly free, 5-8 ~0.75 ms each), scaled
-  by the run's own verify and draft times. Groups keep whole blocks, since rows are nearly free
-  there. Outputs stay identical to speculation off. `SPARKINFER_SPEC_ADAPTIVE_ROWS=0` verifies
-  every block whole.
+**Concurrent requests speculate together.** Up to eight requests share one draft pass and one
+verify forward, so speculative decoding now pays at every load up to eight requests, not only for a
+request that is alone. Qwen3.8-27B NVFP4 with the DFlash2 draft, real prompts, RTX 5090, aggregate
+decode tok/s:
 
-- **The prefix cache is sized by memory, not by a count** (AIPerf chat 1024/256 at 32 concurrent:
-  971 -> 1,070 tok/s, TTFT p50 1,575 -> 1,121 ms; at 16: TTFT p50 792 -> 553 ms; Qwen3.8-27B NVFP4).
-  - **Limits:** at most 32 entries in half the KV pool held about 32 chat prompts. The defaults
-    are now 256 entries, recurrent-state snapshots up to a quarter of RAM (8-32 GB,
-    `SPARKINFER_PREFIX_CACHE_HOST_MB`), and up to three quarters of the KV pool
-    (`SPARKINFER_PREFIX_CACHE_KV_PCT`). Least-recently-used entries are evicted when a request
-    needs the room, as before.
-  - **Capacity:** `/v1/capacity` and `sparkinfer_free_kv_blocks` count blocks only the cache holds
-    as free, since admission evicts them on demand. A full cache no longer reads as a full server.
-  - **Speculation:** a speculative join evicts a few blocks before growing its session, so a full
-    cache cannot stop it speculating.
+| | 1 request | 2 | 4 | 8 |
+|---|---:|---:|---:|---:|
+| **0.6.0, T=0.7** | **212** | **410** | **714** | **1,040** |
+| **0.6.0, T=1.0** (the checkpoint's default) | **215** | **402** | **675** | **1,011** |
+| before concurrent speculation, T=0.7 | 177 | 178 | 319 | 633 |
+| vLLM 0.30 with the same draft, T=0.7 | 191 | 276 | 341 | 345 |
 
-- **A short prompt prefills ~3x faster when its length is not a multiple of 8** (time to first
-  token at 9-100 prompt tokens, 81-88 -> 25-31 ms, Qwen3.8-27B NVFP4). The aligned-body split
-  (`SPARKINFER_PREFILL_ALIGN8_MIN`) applied only from a 128-token body, a threshold set while the
-  1-7 leftover tokens ran as decode steps; they now take one verify forward, so the split pays
-  from an 8-token body and the default is 8. A prompt under 128 tokens no longer runs every layer
-  on the unaligned fallback.
+A request speculating alone stays bit-identical to speculation off, greedy or seeded; a group uses
+batch arithmetic, as packed decode does.
 
-### Added
+**Serving without a draft**, against vLLM 0.30.0 on the same card (AIPerf, Qwen3.8-27B NVFP4, one
+server per engine, the same cells and seeds):
+- chat (1024/256) and long answers (128/1024) at 1, 4, 16 and 32 concurrent requests: 1.04-1.21x
+  vLLM's throughput, with a lower inter-token latency in every cell;
+- 8K prompts (8192/128): 1.12x at one request, 0.87x / 0.97x / 0.99x at 4 / 16 / 32. AIPerf
+  re-sends earlier cells' prompts, and vLLM's larger KV pool keeps them in its prefix cache;
+  ours is sized from `--ctx`;
+- time to first token at 16 and 32 concurrent chats is still behind (p50 553 / 1,121 ms against
+  360 / 356). The opt-in mixed steps below bring it to ~330 ms at a throughput cost.
+
+**Against 0.5.14** (same box, engine benches, every model's teacher-forced scores identical):
+Qwen3.8-27B NVFP4 decodes 5-8% faster at every context (97.2 -> 102.5 tok/s at 128 tokens, 86.9
+-> 94.3 at 32K) and Ternary-Bonsai-2-27B 8-13%; continuous batching at 32 requests is +4% on
+Qwen3.8 and +23% on Bonsai. This release also carries the eight eval-bot speedups prepared as
+0.5.15, which was never tagged (see Kernels).
+
+### Speculative decoding
 
 - **8 concurrent requests speculate at over 1,000 tok/s at default sampling** (T=1.0, top_k 20,
   top_p 0.95; c8 ~965 -> 1,013-1,017 tok/s, Qwen3.8-27B + DFlash2, real prompts).
@@ -51,19 +53,15 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
     default 3 -> 7). At 32 rows they ran as 8-row GEMV chunks, reading each weight four times.
     Measured: c8 1001/1005 -> 1017/1013 tok/s; plain packed decode is unchanged.
 
-- **A batched draft walks every member's selector in one launch** (c8 ~960 -> 982-998 tok/s,
-  Qwen3.8-27B + DFlash2, real prompts at T=0.7). DFlash2's candidate selector ran one single-block
-  ~90 us launch per group member, eight in series at c8. `launch_selector_walks` runs them as one
-  grid, through the same per-walk code: pick for pick identical, greedy and coupled to a sampler.
-
-- **A grouped verify runs its sequences' GDN work in one launch per layer** (c4/c8 652/864 ->
-  691/962 tok/s, Qwen3.8-27B + DFlash2, real prompts at T=0.7).
-  - **Before:** each speculating sequence's compact GDN conv and scan was its own launch, at every
-    one of the 48 GDN layers. A scan steps its few rows one by one, so it is latency-bound, and
-    at 8 sequences that was ~800 such launches a step.
-  - **Now:** `launch_dflash_gdn_{conv,scan}_compact_grouped` run every sequence in one launch each,
-    through the same per-sequence code. `grouped_verify_check` stays bit-identical.
-  - `SPARKINFER_GROUPED_GDN_ONE_LAUNCH=0` keeps the per-sequence launches.
+- **A request speculating alone verifies the depth that pays** (single-stream decode,
+  Qwen3.8-27B: 14.5K-token prose 96 -> 119 tok/s; spec_group_check DFlash2 T=0/0.7/1.0
+  226/198/192 -> 231/210/205, DSpark 178/155/151 -> 191/170/169; 4-turn ~7K-token chats with
+  DSpark +16-20%). The group path verified every proposal of every block. A lone member now
+  verifies the depth with the most tokens per ms: its acceptance record against the
+  single-sequence verify's measured cost curve (rows 1-4 nearly free, 5-8 ~0.75 ms each), scaled
+  by the run's own verify and draft times. Groups keep whole blocks, since rows are nearly free
+  there. Outputs stay identical to speculation off. `SPARKINFER_SPEC_ADAPTIVE_ROWS=0` verifies
+  every block whole.
 
 - **Speculating groups draft in one pass, and take up to 8 requests** (DFlash2): aggregate decode
   on real prompts at T=0.7, c4/c6/c8: 485/~405/633 -> 573/669/733 tok/s on Qwen3.8-27B.
@@ -89,17 +87,32 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
     A 30K-token prompt prefills at the same speed after the batched operands are built, with
     no fallback.
 
-- **Concurrent requests speculate together** (`SPARKINFER_SPEC_GROUP`, default 4): aggregate
+- **A grouped verify runs its sequences' GDN work in one launch per layer** (c4/c8 652/864 ->
+  691/962 tok/s, Qwen3.8-27B + DFlash2, real prompts at T=0.7).
+  - **Before:** each speculating sequence's compact GDN conv and scan was its own launch, at every
+    one of the 48 GDN layers. A scan steps its few rows one by one, so it is latency-bound, and
+    at 8 sequences that was ~800 such launches a step.
+  - **Now:** `launch_dflash_gdn_{conv,scan}_compact_grouped` run every sequence in one launch each,
+    through the same per-sequence code. `grouped_verify_check` stays bit-identical.
+  - `SPARKINFER_GROUPED_GDN_ONE_LAUNCH=0` keeps the per-sequence launches.
+
+- **A batched draft walks every member's selector in one launch** (c8 ~960 -> 982-998 tok/s,
+  Qwen3.8-27B + DFlash2, real prompts at T=0.7). DFlash2's candidate selector ran one single-block
+  ~90 us launch per group member, eight in series at c8. `launch_selector_walks` runs them as one
+  grid, through the same per-walk code: pick for pick identical, greedy and coupled to a sampler.
+
+- **Concurrent requests speculate together** (`SPARKINFER_SPEC_GROUP`): aggregate
   decode on real prompts with DFlash2 at T=0.7, c1/c2/c4: 177/178/319 -> 208/349/485 tok/s, on
   Qwen3.8-27B (vLLM 0.30 with the same draft: 191/276/341); c6 and c8 unchanged.
   - **Before:** speculation ran only for a request that was alone, and stopped as soon as a
     second one arrived.
-  - **Now:** up to four fresh prompts form a group. Each drafts its own block from its own draft
+  - **Now:** fresh prompts form a group (four at first, eight
+    since the batched draft above). Each drafts its own block from its own draft
     state (`DFlashDraftModel::use_slot`), and one forward verifies every block
     (`Qwen35Model::verify_grouped`): per-row attention tables as packed decode has, the compact GDN
     scan and an accepted-prefix commit per sequence, and the block-scaled GEMMs a wide pass takes
     (4 x 8 rows: 16.6 ms against 56 on the row kernels). A new prompt joins between steps. One
-    the group cannot take, or a fifth, hands every member to ordinary decode.
+    the group cannot take, or one past its size, hands every member to ordinary decode.
   - **Single requests:** they now take the group path too: spec_bench T=0/0.7, DFlash2
     207/193 -> 227/227 tok/s, DSpark 174/170 -> 187/175. The verify uses the KV split count
     ordinary decode uses at each position, and a block stops at the next split tier.
@@ -108,26 +121,22 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
     identical to the same launch with speculation off, at T=0, 0.7 and 1.0 and over 4-turn
     ~7K-token cached conversations, with both drafts.
 
-- **Mixed prefill + decode steps, opt-in** (`SPARKINFER_MIXED_CHUNK=<tokens>`): a latency mode.
-  At 32 concurrent chats, TTFT p50 1,240 -> 332 ms for 1,113 -> 948 tok/s, on Qwen3.8-27B.
-  - **What it does:** while requests decode and a prompt waits, the decode step carries the next
-    chunk of that prompt in the same forward (`Qwen35Model::mixed_step`). The norms, projections,
-    FFN and LM head run once over rows + chunk; the decode rows take packed decode's own GDN
-    step, per-row KV append and split-KV attention, and the chunk the prefill's. A prompt is
-    split into equal chunks of at most the budget, a prefix-cache checkpoint is reached with one
-    verify forward and snapshotted as the ordinary prefill does, and the last <= 32 tokens take
-    that forward too (`ingest_tail_rows` now takes up to 32 rows).
-  - **The trade, measured** (AIPerf, RTX 5090, ModelOpt NVFP4, budget 2048), off -> on:
-    - chat 1024/256 c32: 1,113 -> 948 tok/s, TTFT p50 1,240 -> 332 ms, ITL p50 21.4 -> 31.3 ms;
-    - chat c16: TTFT p50 299 ms at 714 tok/s;
-    - 8K prompts c4: 128 -> 118 tok/s, TTFT p50 1,528 -> 1,078 ms.
-
-    Decode no longer stalls behind a prompt's whole prefill, and arrivals stop coming in
-    synchronized waves. But one prompt per mixed pass does not amortize its weight reads the
-    way a packed prefill of many prompts does, so it is off by default.
-  - **Tested:** `mixed_step_check` (two decoding sessions plus a chunk, against `decode_packed` and
-    a separate prefill): the decode rows agree for every token at 254-, 1022- and 2046-token
-    chunks, and the chunk's continuation diverges only at late near-ties.
+- **Sampled requests decode speculatively** with DSpark (1.5x at T=0.7 and T=1.0 on Qwen3.8-27B).
+  - **Before:** only greedy requests speculated, and a request that sets no temperature takes
+    generation_config's T=1.0, so almost no chat traffic did.
+  - **Now:** the first token and every verified position are drawn with the request's own
+    sampler at that token's step -- top_k/top_p mask, temperature, Gumbel noise from Philox(seed,
+    vocab id, step), argmax -- and a proposal is kept while it equals that draw. A seeded request
+    gives the same tokens speculated or not, so this is lossless in the same sense greedy
+    speculation is. The draft proposes with the same sampler over its own logits (coupled), so its
+    proposals land on the target's draws more often. Penalties, logit bias and logprobs still
+    decode per token. `SPARKINFER_SPEC_SAMPLED=0` keeps speculation greedy-only;
+    `SPARKINFER_DFLASH_COUPLED=0` makes the draft propose argmaxes.
+  - **Measured** through `sparkinfer_server` (`eval/spec_sampled_check.py`: ModelOpt NVFP4 with
+    the DSpark draft, 6 prompts x 256 tokens, one request at a time, `SPARKINFER_DETERMINISTIC=1`),
+    against the same launch decoding sampled requests token by token: T=0.7 97.9 -> 152.9 tok/s,
+    T=1.0 98.8 -> 153.7 tok/s, every completion identical at T=0, 0.7 and 1.0. Greedy speculation
+    is unchanged (dspark_tau_check at 16K: tau 1.4713 and LOSSLESS on both).
 
 - **A multi-turn chat speculates on every turn and reuses its cached prefix** (time to first
   token 487 -> 120 ms on ~7K-token conversations, Qwen3.8-27B with DSpark).
@@ -144,20 +153,6 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
     request at a time, ModelOpt NVFP4 + DSpark): ~7K-token prompts, TTFT p50 483-491 -> 120-148
     ms, decode 134-140 -> 127-131 tok/s on a hit (the draft sees only the uncached part); ~1.6K
     prompts, TTFT unchanged. Every completion identical to the same launch with speculation off.
-
-### Fixed
-
-- **A speculated prompt prefilled on the slow path, and not with ordinary decode's arithmetic.**
-  Hidden-state capture kept a prompt off the 8-aligned body + tail split, so a prompt of 128+
-  tokens whose length is not a multiple of 8 ran every layer on the unaligned NVFP4 fallback
-  (TTFT 282 vs 83 ms at ~1.4K tokens), and a prompt with a checkpoint segment under 16 tokens
-  skipped the per-segment split the ordinary prefill takes. Either made greedy and seeded
-  speculative output differ from ordinary decode after a few hundred tokens. Capture now takes
-  both, a pass that starts past zero records its rows at their positions, and the tail's verify
-  forward writes its rows straight into the draft's context.
-- `SPARKINFER_SPECULATIVE=0` keeps the draft loaded but decodes every request token by token (the
-  A/B reference), and `SPARKINFER_PREFIX_CACHE=1` keeps the prefix cache on under
-  `SPARKINFER_DETERMINISTIC=1`.
 
 - **DFlash2 drafter** (z-lab `Qwen3.8-27B-DFlash2`), opt-in beside DSpark: sampled requests
   1.78x plain decode against DSpark's 1.57x on Qwen3.8-27B.
@@ -180,22 +175,19 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
     cos >= 0.9998, selector paths identical, at 1K and 8K. `sample_rows_topk_gpu_test` checks
     `launch_topk_rows` against a sorted top-k.
 
-### Performance
+### Serving
 
-- **A long prompt's prefill scratch is given back** (chat c32 after an 8K-prompt cell 1,073 ->
-  1,183 tok/s on Qwen3.8-27B, the same as on a fresh server).
-  - **Before:** the batched prefill keeps its scratch arenas across calls and only ever grows
-    them, releasing them only past 1 GB. An 8K pass (~0.9 GB) stayed resident for every later
-    chat-sized pass, as did the GDN scan workspace it grew. A c32 server has ~1 GB free beside
-    its KV pool and 32 sessions' recurrent state, and that headroom is what the packed prefill
-    needs: its passes ran 278 ms instead of 207.
-  - **Now:** a pass gives the arenas back -- and the GDN scan workspaces and the attention V plane
-    -- when they hold more than twice the largest use of the last 8 passes. A one-off long prompt
-    ages out after a few ordinary passes, and a mix of sizes does not churn.
-    `SPARKINFER_PREFILL_ARENA_SHRINK=0` keeps them.
-  - **Measured** (AIPerf, RTX 5090, one server per run): chat 1024/256 c32 on a fresh server
-    1,175.8 tok/s; after an 8192/128 c16 cell 1,183.0 (shrink off: 1,072.9); the 8K cell itself
-    unchanged at 168.3.
+- **The prefix cache is sized by memory, not by a count** (AIPerf chat 1024/256 at 32 concurrent:
+  971 -> 1,070 tok/s, TTFT p50 1,575 -> 1,121 ms; at 16: TTFT p50 792 -> 553 ms; Qwen3.8-27B NVFP4).
+  - **Limits:** at most 32 entries in half the KV pool held about 32 chat prompts. The defaults
+    are now 256 entries, recurrent-state snapshots up to a quarter of RAM (8-32 GB,
+    `SPARKINFER_PREFIX_CACHE_HOST_MB`), and up to three quarters of the KV pool
+    (`SPARKINFER_PREFIX_CACHE_KV_PCT`). Least-recently-used entries are evicted when a request
+    needs the room, as before.
+  - **Capacity:** `/v1/capacity` and `sparkinfer_free_kv_blocks` count blocks only the cache holds
+    as free, since admission evicts them on demand. A full cache no longer reads as a full server.
+  - **Speculation:** a speculative join evicts a few blocks before growing its session, so a full
+    cache cannot stop it speculating.
 
 - **Tokens are streamed off the engine thread** (long answers c32 1,600 -> 1,986 tok/s, ITL p50
   19.7 -> 15.9 ms on Qwen3.8-27B).
@@ -213,48 +205,20 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
     non-streamed requests (stop sequences, logprobs, the completions endpoint) give identical
     text, finish reasons and token counts either way.
 
-- **A chat prompt's last few tokens after its prefix-cache checkpoint take one forward** (chat c32
-  TTFT p50 1,527 -> 875 ms, 1,082 -> 1,111 tok/s on Qwen3.8-27B).
-  - **Before:** a chat prompt's final checkpoint sits at the start of its assistant turn, 1-7
-    tokens before the end -- under the in-pass split's 16-token segment minimum -- so its
-    prefill ran a pass per segment, and those last tokens got a whole prefill pass of their own:
-    169 ms per 1K-token chat prompt under load instead of ~96.
-  - **Now:** a resumed range of 8 tokens or fewer goes through the verify path's single forward
-    (`ingest_tail_rows`), as the tail of an aligned pass does.
-  - **Measured** (AIPerf chat 1024/256, RTX 5090, ModelOpt NVFP4): c32 per-prompt prefill p50
-    169 -> 99 ms; c1 unchanged (TTFT 103 ms). `prefix_resume_check`: a hit still reproduces the
-    uncached split exactly.
-
-- **A prompt's last 1-7 tokens take one forward instead of one decode step each** (a 1,076-token
-  chat prompt prefills in 96 ms instead of 131, on Qwen3.8-27B).
-  - **Before:** the NVFP4 prefill takes a multiple of 8 rows, so the aligned body ran as one
-    pass and the 1-7 tokens left over ran as decode steps (#1207), each a full weight read: ~40
-    ms for a 4-token tail. A small prefill pass for the tail was slower still, because it
-    displaced the cached whole-prefill graph.
-  - **Now:** the tail runs through the verify path -- the path greedy speculation relies on to
-    reproduce decode exactly -- in one forward, eagerly and outside the verify graph cache so the
-    packed decode's graphs are never evicted, committing every row
-    (`Qwen35Model::ingest_tail_rows`). A seed whose logprob is wanted, or a session with a logit
-    bias, keeps the decode steps. It has its own 149 MB arena, so it never re-allocates the
-    buffers the packed decode's graphs point at. `SPARKINFER_PREFILL_TAIL_VERIFY=0` restores them.
-  - **Tested:** through `sparkinfer_server` under `SPARKINFER_DETERMINISTIC=1`, 18/18 completions
-    (T=0, 0.7, 1.0) identical with the tail on and off; `pack_ckpt_check` gives the same seeds and
-    snapshots either way.
-
-### Fixed
-
-- **A wide packed-decode graph no longer outlives the NVFP4 LM head it reads.** A prefill of 1,024+
-  tokens gives the head back (`release_lm_head_fp4`) to fit its scratch arena, but the verify
-  graph cache was not keyed on it, so a graph recorded at 16+ rows while the head was resident
-  kept replaying against the freed buffer -- correct only while nothing reused that memory.
-  The cache now drops its graphs when the head changes. A prefill or a session whose allocation
-  fails beside the head also gives it back and retries.
-
-- **A verify pass that did not record a CUDA graph began one anyway.** `dflash_verify_short_run`'s
-  `if (recording)` guarded the FP8 memset loop instead of `cudaStreamBeginCapture`, so a
-  non-recording pass left the stream capturing and every later call on it failed ("operation not
-  permitted when stream is capturing"). DSpark never reached it because it warms every width
-  first; the eager tail above is the first caller that does not record.
+- **A long prompt's prefill scratch is given back** (chat c32 after an 8K-prompt cell 1,073 ->
+  1,183 tok/s on Qwen3.8-27B, the same as on a fresh server).
+  - **Before:** the batched prefill keeps its scratch arenas across calls and only ever grows
+    them, releasing them only past 1 GB. An 8K pass (~0.9 GB) stayed resident for every later
+    chat-sized pass, as did the GDN scan workspace it grew. A c32 server has ~1 GB free beside
+    its KV pool and 32 sessions' recurrent state, and that headroom is what the packed prefill
+    needs: its passes ran 278 ms instead of 207.
+  - **Now:** a pass gives the arenas back -- and the GDN scan workspaces and the attention V plane
+    -- when they hold more than twice the largest use of the last 8 passes. A one-off long prompt
+    ages out after a few ordinary passes, and a mix of sizes does not churn.
+    `SPARKINFER_PREFILL_ARENA_SHRINK=0` keeps them.
+  - **Measured** (AIPerf, RTX 5090, one server per run): chat 1024/256 c32 on a fresh server
+    1,175.8 tok/s; after an 8192/128 c16 cell 1,183.0 (shrink off: 1,072.9); the 8K cell itself
+    unchanged at 168.3.
 
 - **Chat prompts that arrive together are prefilled together** (chat c16 TTFT p50 2.04 -> 1.08 s,
   696 -> 765 tok/s on Qwen3.8-27B).
@@ -289,22 +253,40 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
     `prefix_resume_check` under `SPARKINFER_DETERMINISTIC=1`: a hit still reproduces the uncached
     split exactly.
 
-- **Sampled requests decode speculatively** with DSpark (1.5x at T=0.7 and T=1.0 on Qwen3.8-27B).
-  - **Before:** only greedy requests speculated, and a request that sets no temperature takes
-    generation_config's T=1.0, so almost no chat traffic did.
-  - **Now:** the first token and every verified position are drawn with the request's own
-    sampler at that token's step -- top_k/top_p mask, temperature, Gumbel noise from Philox(seed,
-    vocab id, step), argmax -- and a proposal is kept while it equals that draw. A seeded request
-    gives the same tokens speculated or not, so this is lossless in the same sense greedy
-    speculation is. The draft proposes with the same sampler over its own logits (coupled), so its
-    proposals land on the target's draws more often. Penalties, logit bias and logprobs still
-    decode per token. `SPARKINFER_SPEC_SAMPLED=0` keeps speculation greedy-only;
-    `SPARKINFER_DFLASH_COUPLED=0` makes the draft propose argmaxes.
-  - **Measured** through `sparkinfer_server` (`eval/spec_sampled_check.py`: ModelOpt NVFP4 with
-    the DSpark draft, 6 prompts x 256 tokens, one request at a time, `SPARKINFER_DETERMINISTIC=1`),
-    against the same launch decoding sampled requests token by token: T=0.7 97.9 -> 152.9 tok/s,
-    T=1.0 98.8 -> 153.7 tok/s, every completion identical at T=0, 0.7 and 1.0. Greedy speculation
-    is unchanged (dspark_tau_check at 16K: tau 1.4713 and LOSSLESS on both).
+- **A chat prompt's last few tokens after its prefix-cache checkpoint take one forward** (chat c32
+  TTFT p50 1,527 -> 875 ms, 1,082 -> 1,111 tok/s on Qwen3.8-27B).
+  - **Before:** a chat prompt's final checkpoint sits at the start of its assistant turn, 1-7
+    tokens before the end -- under the in-pass split's 16-token segment minimum -- so its
+    prefill ran a pass per segment, and those last tokens got a whole prefill pass of their own:
+    169 ms per 1K-token chat prompt under load instead of ~96.
+  - **Now:** a resumed range of 8 tokens or fewer goes through the verify path's single forward
+    (`ingest_tail_rows`), as the tail of an aligned pass does.
+  - **Measured** (AIPerf chat 1024/256, RTX 5090, ModelOpt NVFP4): c32 per-prompt prefill p50
+    169 -> 99 ms; c1 unchanged (TTFT 103 ms). `prefix_resume_check`: a hit still reproduces the
+    uncached split exactly.
+
+- **A prompt's last 1-7 tokens take one forward instead of one decode step each** (a 1,076-token
+  chat prompt prefills in 96 ms instead of 131, on Qwen3.8-27B).
+  - **Before:** the NVFP4 prefill takes a multiple of 8 rows, so the aligned body ran as one
+    pass and the 1-7 tokens left over ran as decode steps (#1207), each a full weight read: ~40
+    ms for a 4-token tail. A small prefill pass for the tail was slower still, because it
+    displaced the cached whole-prefill graph.
+  - **Now:** the tail runs through the verify path -- the path greedy speculation relies on to
+    reproduce decode exactly -- in one forward, eagerly and outside the verify graph cache so the
+    packed decode's graphs are never evicted, committing every row
+    (`Qwen35Model::ingest_tail_rows`). A seed whose logprob is wanted, or a session with a logit
+    bias, keeps the decode steps. It has its own 149 MB arena, so it never re-allocates the
+    buffers the packed decode's graphs point at. `SPARKINFER_PREFILL_TAIL_VERIFY=0` restores them.
+  - **Tested:** through `sparkinfer_server` under `SPARKINFER_DETERMINISTIC=1`, 18/18 completions
+    (T=0, 0.7, 1.0) identical with the tail on and off; `pack_ckpt_check` gives the same seeds and
+    snapshots either way.
+
+- **A short prompt prefills ~3x faster when its length is not a multiple of 8** (time to first
+  token at 9-100 prompt tokens, 81-88 -> 25-31 ms, Qwen3.8-27B NVFP4). The aligned-body split
+  (`SPARKINFER_PREFILL_ALIGN8_MIN`) applied only from a 128-token body, a threshold set while the
+  1-7 leftover tokens ran as decode steps; they now take one verify forward, so the split pays
+  from an 8-token body and the default is 8. A prompt under 128 tokens no longer runs every layer
+  on the unaligned fallback.
 
 - **Packed decode samples its rows in one launch** (1.13x sampled cb-decode @c32 on Qwen3.8-27B).
   - **Before:** each sampled row ran forward_token's sampler on its own: a full-vocabulary radix
@@ -321,6 +303,101 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
     as greedy; aggregate at 32 rows 1,568-1,607 -> 1,792-1,803 tok/s.
   - **Tested:** `sample_rows_topk_gpu_test` compares 896 rows against the per-row path (ties at the
     top_k boundary, signed zeros, -inf entries, heavily duplicated logits): 0 mismatches.
+
+- **Mixed prefill + decode steps, opt-in** (`SPARKINFER_MIXED_CHUNK=<tokens>`): a latency mode.
+  At 32 concurrent chats, TTFT p50 1,240 -> 332 ms for 1,113 -> 948 tok/s, on Qwen3.8-27B.
+  - **What it does:** while requests decode and a prompt waits, the decode step carries the next
+    chunk of that prompt in the same forward (`Qwen35Model::mixed_step`). The norms, projections,
+    FFN and LM head run once over rows + chunk; the decode rows take packed decode's own GDN
+    step, per-row KV append and split-KV attention, and the chunk the prefill's. A prompt is
+    split into equal chunks of at most the budget, a prefix-cache checkpoint is reached with one
+    verify forward and snapshotted as the ordinary prefill does, and the last <= 32 tokens take
+    that forward too (`ingest_tail_rows` now takes up to 32 rows).
+  - **The trade, measured** (AIPerf, RTX 5090, ModelOpt NVFP4, budget 2048), off -> on:
+    - chat 1024/256 c32: 1,113 -> 948 tok/s, TTFT p50 1,240 -> 332 ms, ITL p50 21.4 -> 31.3 ms;
+    - chat c16: TTFT p50 299 ms at 714 tok/s;
+    - 8K prompts c4: 128 -> 118 tok/s, TTFT p50 1,528 -> 1,078 ms.
+
+    Decode no longer stalls behind a prompt's whole prefill, and arrivals stop coming in
+    synchronized waves. But one prompt per mixed pass does not amortize its weight reads the
+    way a packed prefill of many prompts does, so it is off by default.
+  - **Tested:** `mixed_step_check` (two decoding sessions plus a chunk, against `decode_packed` and
+    a separate prefill): the decode rows agree for every token at 254-, 1022- and 2046-token
+    chunks, and the chunk's continuation diverges only at late near-ties.
+
+### Kernels
+
+Merged by the eval bots. Each gain is on the RTX 5090 eval box against the same-box `main` of its round.
+
+- **Ternary-Bonsai-2-27B**:
+  - **single-row decode** overlaps its launch chain (#1210; 1.09x decode @128, 1.07x @32k). Outputs are bit-identical to main:
+    - the FFN GEMVs load their weights before their input is ready;
+    - k/v run beside q on the side stream;
+    - the layer tail writes the next layer's rotated input, so the next layer skips its own rotation;
+    - the GDN conv sums the qkv split partials itself, and conv and scan launch programmatic;
+    - the hd256 int8-KV attention input takes one fused launch.
+
+    `SPARKINFER_PTQ1_DP4A_PDL`, `SPARKINFER_PTQ1_RQ_PDL`, `SPARKINFER_BONSAI_KV_SIDE`, `SPARKINFER_BONSAI_TAIL_ROTQ`, `SPARKINFER_BONSAI_GDN_PDL`, `SPARKINFER_BONSAI_QKV_PART`, `SPARKINFER_BONSAI_QK_FUSE` and `SPARKINFER_PTQ1_ROW1_TILES` `=0` restore main's launches one by one.
+  - **long prefill**: the attention and GDN projections read the decode shadow's ternary blocks as NVFP4 and run on the FP4 tensor cores, like the long-prefill FFN (#1188; 1.20x prefill @4k). `SPARKINFER_PREFILL_TERNARY_NVFP4_PROJ=0` keeps the int8 projections.
+  - **continuous batch** (#1197; 1.13x cb-decode @c32):
+    - a prompt pack reads the decode shadow's legs, as a lone prompt does (`SPARKINFER_BONSAI_PACK_SHADOW=0` restores the folded legs);
+    - a pack's GDN segments scan on three streams, which applies to every model's packed prompts (`SPARKINFER_PACK_GDN_STREAMS=1` restores one stream);
+    - packed rows take their B fragments by `ldmatrix`, and the tile's last CTA sums a split's partials instead of a second launch (`SPARKINFER_ROWS_SPLIT_FUSED=0`);
+    - rotations launch programmatic (`SPARKINFER_ROTQ_PDL=0`).
+- **Qwen3.8-27B**: past the fused GEMM's row limit, the long prompt runs the eight FP8-stored FFN layers (56–63) on the NVFP4 tensor cores. Their Q4_K decode legs are converted to NVFP4 once per layer pass, into the int8 weight cache's buffers (#1213; 1.06x prefill @16k). `SPARKINFER_Q38_FFN8_NVFP4=0` keeps the int8 legs.
+- **Qwen3.8-27B**: long-prompt prefill moves fewer bytes per MAC, bit-identical to main (#1211; 1.07x prefill @16k):
+  - the GDN projections' fp8 GEMM runs on 64x64 warp tiles, 451–455 → 527–536 TOPS (`SPARKINFER_FP8_GEMM_W64=0`);
+  - the GDN out_proj adds the residual in its epilogue (`SPARKINFER_Q38_FP8_RESID=0`);
+  - the gated norm and the GDN input norm write e4m3 for their GEMMs themselves (`SPARKINFER_Q38_GATED_NORM_FP8=0`, `SPARKINFER_Q38_XN_FP8=0`);
+  - the attention gate folds into the o-proj row-quantize (`SPARKINFER_Q38_GATE_QUANT=0`);
+  - the 8-bit FFN layers (56–63) keep their int8 weights across 4096-token chunks (`SPARKINFER_PREFILL_FFN_WCACHE_FP4=0`);
+  - ssm_alpha and ssm_beta run in one pass (`SPARKINFER_PREFILL_SKINNY_PAIR=0`).
+- **Qwen3.8-27B**: single-row NVFP4 decode overlaps its launch chain, bit-identical to main (#1196; ModelOpt 1.04x decode @256k, 1.02x @128):
+  - the dp4a GEMVs launch programmatic and stream their first weights while their producer runs (`SPARKINFER_DECODE_PDL=0`);
+  - the post-attention and closing norms write the NVFP4 dp4a input themselves, so the standalone quantizes are gone (`SPARKINFER_DECODE_NORM_NV=0`);
+  - FFN down runs two rows per warp-group (`SPARKINFER_DECODE_DOWN_NR2=0`);
+  - 6:1 decode attention loads V ahead for splits of 256 tokens or more (`SPARKINFER_FA6_VPRE_MINCHUNK=0`).
+- **Qwen3.8-27B and Ternary-Bonsai-2-27B**: the hd256 6:1 int8-KV split decode attention reads K and V with wide loads and runs QK and PV on `mma.sync`. The partials are bit-identical (#1198; Qwen3.8 ModelOpt 1.07x decode @256k, Bonsai 1.06x decode @32k). `SPARKINFER_FA6_WIDE=0` keeps the wmma form.
+- **Muse Glimmer**: the 128-token prefill keeps `ffn_down` and `o` on the narrow NVFP4 tile, with the stream cache paying their conversion once (#1209; 1.18x prefill @128). `SPARKINFER_MUSE_NVFP4_{DOWN,WO}_MINN=512` restores the int8 legs.
+
+### Fixed
+
+- **Muse Glimmer at 32 concurrent requests no longer falls to a fifth of its speed in some runs**
+  (#1236; `qwen3_gguf_cb_bench` c32: 2,140 or ~380 tok/s from run to run -> 2,117-2,126 every
+  run). v0.5.14 does the same.
+  - **Cause:** the partial ffn_down fill left a flat 1 GB for the runtime's own allocations after
+    load. At 33 sessions those need about that much, and peak use varied by 16 MB between runs.
+    When it fell short, the verify scratch and every decode graph capture failed with out of
+    memory, and the whole run decoded uncaptured (mean ITL 13 -> 82 ms).
+  - **Fix:** the room left grows by 16 MB per session past 17, so 33 sessions keep 1.25 GB
+    (12/52 down layers instead of 15). 16 concurrent requests and fewer are unchanged.
+    `SPARKINFER_MUSE_NVFP4_DOWN_KEEP_MB` still overrides.
+
+- **A wide packed-decode graph no longer outlives the NVFP4 LM head it reads.** A prefill of 1,024+
+  tokens gives the head back (`release_lm_head_fp4`) to fit its scratch arena, but the verify
+  graph cache was not keyed on it, so a graph recorded at 16+ rows while the head was resident
+  kept replaying against the freed buffer -- correct only while nothing reused that memory.
+  The cache now drops its graphs when the head changes. A prefill or a session whose allocation
+  fails beside the head also gives it back and retries.
+
+- **A verify pass that did not record a CUDA graph began one anyway.** `dflash_verify_short_run`'s
+  `if (recording)` guarded the FP8 memset loop instead of `cudaStreamBeginCapture`, so a
+  non-recording pass left the stream capturing and every later call on it failed ("operation not
+  permitted when stream is capturing"). DSpark never reached it because it warms every width
+  first; the eager tail above is the first caller that does not record.
+
+- **A speculated prompt prefilled on the slow path, and not with ordinary decode's arithmetic.**
+  Hidden-state capture kept a prompt off the 8-aligned body + tail split, so a prompt of 128+
+  tokens whose length is not a multiple of 8 ran every layer on the unaligned NVFP4 fallback
+  (TTFT 282 vs 83 ms at ~1.4K tokens), and a prompt with a checkpoint segment under 16 tokens
+  skipped the per-segment split the ordinary prefill takes. Either made greedy and seeded
+  speculative output differ from ordinary decode after a few hundred tokens. Capture now takes
+  both, a pass that starts past zero records its rows at their positions, and the tail's verify
+  forward writes its rows straight into the draft's context.
+
+- `SPARKINFER_SPECULATIVE=0` keeps the draft loaded but decodes every request token by token (the
+  A/B reference), and `SPARKINFER_PREFIX_CACHE=1` keeps the prefix cache on under
+  `SPARKINFER_DETERMINISTIC=1`.
 
 ## [0.5.14] — 2026-09-29
 
