@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <type_traits>
 
 namespace sparkinfer {
 namespace dflash_kernels {
