@@ -44,38 +44,44 @@ export SPARKINFER_ROOT="$(pwd)"
 ./build/server/sparkinfer_server -m models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf --port 8080
 ```
 
-### Serve Qwen3.8 with DSpark
+### Serve Qwen3.8 with speculative decoding
 
-The release container downloads both blessed checkpoints and starts the OpenAI-compatible server
-with DSpark enabled:
+The release container speculates by default: it downloads the target and z-lab's DFlash2 drafter
+and starts the OpenAI-compatible server with both (`-e SPEC_DRAFT=none` serves without one;
+`serve-dspark` uses the DSpark drafter instead):
 
 ```bash
 docker run --gpus all -p 8080:8080 -v qwen38:/models \
-  ghcr.io/gittensor-ai-lab/sparkinfer-qwen38:latest serve-dspark
+  ghcr.io/gittensor-ai-lab/sparkinfer-qwen38:latest
 ```
 
-For a source build, pass the downloaded drafter directory explicitly:
+For a source build, pass the drafter directory explicitly:
 
 ```bash
 ./build/server/sparkinfer_server \
   -m models/Qwen3.8-27B-NVFP4-RTX5090 \
   --tokenizer models/Qwen3.8-27B-NVFP4-RTX5090/tokenizer.json \
-  --draft-model models/Qwen3.8-27B-DSpark-NVFP4 \
+  --draft-model models/Qwen3.8-27B-DFlash2 \
   --ctx 131072 --host 0.0.0.0 --port 8080
 ```
 
 The KV pool is sized for the whole `--ctx` before the drafter loads. On a 32 GB card, 262,144 tokens
-leaves no device memory for the drafter, which is why this example and `serve-dspark` use
-131,072.
+leaves no device memory for the drafter, which is why this example and the container use 131,072.
 
-An explicitly requested drafter is a startup requirement: a missing or incompatible checkpoint, or
-one that does not fit in device memory, terminates the server rather than quietly changing
-performance. DSpark is selected only for
-greedy, plain-text requests while they are the sole active request. Vision, sampling, penalties,
-logprobs, forced-token paths, prefix resumes, and requests that overlap another request stay on or
-hand off to lossless autoregressive decoding. `/metrics` exposes
-`sparkinfer_speculative_runs_total`, `sparkinfer_speculative_tokens_total`, and
-`sparkinfer_speculative_handoffs_total` so this is observable in production.
+- **A drafter you ask for is required:** a missing or incompatible checkpoint, or one that does
+  not fit in device memory, terminates the server rather than quietly changing performance. The
+  container's default drafter is the exception: if it cannot be downloaded the container serves
+  without it.
+- **What speculates:** up to `SPARKINFER_SPEC_GROUP` (8) fresh requests at a time, greedy or
+  sampled. A request speculates from its start up to the end of the drafter's context
+  (`SPARKINFER_DSPARK_MAX_CTX`, 16,384 positions), then decodes on as usual.
+- **What does not:** requests with tools, `response_format` JSON schemas or other constraints,
+  vision, penalties, logit bias, logprobs, forced tokens or a prefix session take the ordinary
+  path, as do all requests while more are live than a group takes.
+- **Same tokens:** a request speculating alone gives the tokens ordinary decode gives (greedy, or
+  sampled with a seed). A group verifies with batch arithmetic, as packed decode does.
+- **Observability:** `/metrics` exposes `sparkinfer_speculative_runs_total`,
+  `sparkinfer_speculative_tokens_total` and `sparkinfer_speculative_handoffs_total`.
 
 ### Serve a GGUF instead of NVFP4
 
@@ -540,7 +546,7 @@ Prior requests cannot leak decode context into later ones (KV is freed after eac
 | `SPARKINFER_PREFILL_ALIGN8_MIN` | `8` | On a model with NVFP4 prefill, a pass whose length is not a multiple of 8 prefills its aligned body in one pass and the last 1–7 tokens in one more forward, because the NVFP4 GEMMs take multiples of 8 rows (up to 3x faster for a short prompt, 1.9x for a long one). The smallest body split this way; `0` turns it off. |
 | `SPARKINFER_DETERMINISTIC` | `0` | `1` = bit-reproducible output (see **Determinism** above). Decode speed unchanged; TTFT +2–8%. |
 | `SPARKINFER_MAX_OUTPUT_TOKENS` | `4096` (container: `16384`) | Per-request generation cap. A request without `max_tokens` generates until the model stops, up to this cap or the room its prompt leaves in the context; a larger `max_tokens` is clamped to this cap. Each request reserves KV blocks for its prompt plus `max_tokens` when it is admitted, so a cap near the full context lets one long request hold the whole pool while other requests wait for it (see `SPARKINFER_ADMISSION_WAIT_S`). |
-| `SPARKINFER_DRAFT_MODEL` | — | DSpark drafter directory, same as `--draft-model`. The server exits if the drafter cannot be loaded, including when it does not fit in device memory. |
+| `SPARKINFER_DRAFT_MODEL` | — | Drafter directory (DFlash2 or DSpark), same as `--draft-model`. The server exits if the drafter cannot be loaded, including when it does not fit in device memory. |
 | `SPARKINFER_DSPARK_MAX_CTX` | `16384` | Context the DSpark drafter attends over (its own KV cache), capped at `--ctx`. |
 | `SPARKINFER_DRAFT_OFFLOAD_MS` | `1000` | With a drafter loaded, how long live requests must stay more than a speculation group takes before the drafter's device memory (~3 GB for DFlash2) moves to pinned host memory. Nothing reads it while no group can form, and on a 32 GB card it is the headroom concurrent prefill and decode need. It comes back (~0.1 s) at the same addresses when a group can form again and the device has room for it. A prefill or a new session that runs out of memory beside an idle drafter moves it at once, whatever this is set to. `-1` turns off only the timed move; `SPARKINFER_DRAFT_OFFLOAD=0` keeps the drafter on the device always. It needs pinned host memory of ~1.25x the drafter (~3.8 GB for DFlash2). |
 | `SPARKINFER_DRAFT_OFFLOAD` | `1` | `0` allocates the drafter with plain `cudaMalloc`, so it can never leave the device (the behaviour before the offload). |

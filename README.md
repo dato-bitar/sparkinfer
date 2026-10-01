@@ -21,15 +21,19 @@ docker run --gpus all -p 8080:8080 -v qwen38:/models \
 ```
 
 Speculative decoding is on by default. The first run also downloads z-lab's
-[`Qwen3.8-27B-DFlash2`](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) drafter (3.7 GB,
-Apache-2.0) into the named volume:
+[`Qwen3.8-27B-DFlash2`](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) drafter (3.8 GB,
+Apache-2.0) into the named volume; if that download fails, the container serves without it. It
+needs ~3.8 GB of pinned host memory for the drafter to step off the device under load.
 - **Up to eight concurrent requests speculate together:** 1.2-2.2x the throughput of the same
   server without a drafter at 1-4 concurrent requests.
 - **At 16-32 the drafter's device memory steps aside while it cannot be used,** so the throughput
   is the same.
-- **It is lossless:** greedy and seeded requests give the same tokens as without it.
-- **What does not speculate:** requests with vision, penalties, logit bias or logprobs take the
-  ordinary path.
+- **Same tokens:** a request speculating alone gives the tokens it would without the drafter
+  (greedy, or sampled with a seed). A group verifies with batch arithmetic, as packed decode does.
+- **What speculates:** a request, from its start up to the end of the drafter's 16,384-position
+  context, after which it decodes on as usual.
+- **What does not:** requests with tools, `response_format` JSON schemas, vision, penalties,
+  logit bias or logprobs take the ordinary path.
 - **Turning it off:** `-e SPEC_DRAFT=none` serves without a drafter. `serve-dspark` (appended
   after the image name) uses the
   [DSpark](https://huggingface.co/gittensor-model-hub/Qwen3.8-27B-DSpark-NVFP4) drafter instead.

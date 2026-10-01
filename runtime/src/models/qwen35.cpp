@@ -6170,6 +6170,15 @@ int Qwen35Model::spec_group_depth() const {
     return std::max(1, std::min(B, 7));
 }
 
+// The furthest committed position a group member can speculate from: its draft writes and its
+// verify captures reach two blocks past it, inside the draft's context (SPARKINFER_DSPARK_MAX_CTX).
+// A member past this hands off (run_spec_group); it no longer bars the request from speculating.
+int Qwen35Model::spec_group_reach() const {
+    const Impl& s = *p_;
+    if (!s.dflash_draft) return -1;
+    return s.dflash_draft->config().max_seq - 2 * (spec_group_depth() + 1);
+}
+
 int Qwen35Model::spec_group_join(const std::vector<int>& prompt, int max_new, int slot,
                                  const SpecHooks& hooks, SpecResume* resume, int* proposals) {
     Impl& s = *p_;
@@ -6187,7 +6196,11 @@ int Qwen35Model::spec_group_join(const std::vector<int>& prompt, int max_new, in
     const int depth = spec_group_depth();
     const int n = (int)prompt.size();
     const int prefill_from = std::max(0, hooks.prefill_start);
-    if (prefill_from >= n || (long)n + max_new + 2L * (depth + 1) > dc.max_seq) return fail("too long");
+    // Speculate as far as the draft's context reaches, then hand off (run_spec_group). Requiring
+    // prompt + max_tokens to fit it barred every request that left max_tokens to the server's cap
+    // (16,384 in the release container, the draft's whole context): the OpenAI SDK's default.
+    const int reach = (int)std::min<long>((long)n + max_new, (long)spec_group_reach());
+    if (prefill_from >= n || reach < n + 64) return fail("too long");
     std::unique_lock<std::recursive_mutex> device_lock(s.device_mu);
     const auto t_join0 = std::chrono::steady_clock::now();
     auto ms_at = [&] {
@@ -6211,9 +6224,9 @@ int Qwen35Model::spec_group_join(const std::vector<int>& prompt, int max_new, in
             const size_t rows = (size_t)(n - prefill_from);
             const size_t arena = ((size_t)64 << 20) + std::min<size_t>(rows, 16384) * ((size_t)128 << 10);
             const int cap_from = std::max(prefill_from, n >= 12288 ? n - 4096 : 0);
-            const size_t cap_rows = (size_t)std::max(0, std::min(s.cfg.max_seq, n + max_new + depth + 1) - cap_from);
+            const size_t cap_rows = (size_t)std::max(0, std::min(s.cfg.max_seq, reach + depth + 1) - cap_from);
             const size_t capture = cap_rows * dc.target_layer_ids.size() * (size_t)s.cfg.hidden * sizeof(bf16);
-            const size_t slot_bytes = (size_t)draft.slot_rows(n + max_new + 2 * (depth + 1)) *
+            const size_t slot_bytes = (size_t)draft.slot_rows(reach + 2 * (depth + 1)) *
                 (2 * (size_t)dc.n_layers * dc.n_kv_heads * dc.head_dim + dc.hidden) * sizeof(bf16);
             const size_t verify = (size_t)320 << 20, margin = (size_t)256 << 20;
             // The capture buffer this join replaces is freed before the new one is allocated.
@@ -6228,13 +6241,13 @@ int Qwen35Model::spec_group_join(const std::vector<int>& prompt, int max_new, in
     // The slot holds what this request can reach (the bound checked above), not the draft's whole
     // context -- and for DFlash2, whose layers all attend a 2,048-token window, at most ~4K rows that
     // slide (DFlashDraftModel::slot_rows): ~130 MB rather than ~0.5 GB for a request that can reach 16K.
-    if (!draft.use_slot(slot, n + max_new + 2 * (depth + 1))) return fail("draft slot");
+    if (!draft.use_slot(slot, reach + 2 * (depth + 1))) return fail("draft slot");
     int capture_start = std::max(0, n >= 12288 ? n - 4096 : 0);
     capture_start = std::max(capture_start, prefill_from);
     // Hidden rows for a verify of every member's block (kQwen35MaxPackedRows), and this prompt's
     // context rows for its first draft block.
     set_dflash_capture(true, dc.target_layer_ids, kQwen35MaxPackedRows, capture_start,
-                       std::min(s.cfg.max_seq, n + max_new + depth + 1));
+                       std::min(s.cfg.max_seq, reach + depth + 1));
     if (!dflash_context_buffer() || !dflash_hidden_buffer()) return fail("capture buffers");
     const uint64_t sid = hooks.seq_id;
     invalidate_decode_graph();
@@ -6351,15 +6364,15 @@ int Qwen35Model::spec_group_join_body(const std::vector<int>& prompt, int max_ne
     const int b = n & ~7;
     // Only a fresh prompt (no cached prefix, no checkpoints to take) with a partial last group of
     // eight and a body the batched prefill takes in one aligned pass.
-    if (hooks.prefill_start != 0 || hooks.n_ckpts > 0 || b < 8 || b == n ||
-        (long)n + max_new + 2L * (depth + 1) > dc.max_seq ||
+    const int reach = (int)std::min<long>((long)n + max_new, (long)spec_group_reach());   // see spec_group_join
+    if (hooks.prefill_start != 0 || hooks.n_ckpts > 0 || b < 8 || b == n || reach < n + 64 ||
         !batched_prefill_windowed_enabled(s.gguf, s.cfg, b, s.kv))
         return -1;
     std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
-    if (!draft.use_slot(slot, n + max_new + 2 * (depth + 1))) return -1;
+    if (!draft.use_slot(slot, reach + 2 * (depth + 1))) return -1;
     const int capture_start = n >= 12288 ? n - 4096 : 0;
     set_dflash_capture(true, dc.target_layer_ids, kQwen35MaxPackedRows, capture_start,
-                       std::min(s.cfg.max_seq, n + max_new + depth + 1));
+                       std::min(s.cfg.max_seq, reach + depth + 1));
     if (!dflash_context_buffer() || !dflash_hidden_buffer()) return -1;
     invalidate_decode_graph();
     if (!s.kv->allocate(hooks.seq_id, session_token_budget(prompt.size(), max_new + depth + 1, s.cfg.max_seq)))

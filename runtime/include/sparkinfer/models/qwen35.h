@@ -785,6 +785,7 @@ public:
     bool spec_group_begin();
     void spec_group_end();
     int spec_group_depth() const;
+    int spec_group_reach() const;
     int spec_group_join(const std::vector<int>& prompt, int max_new, int slot, const SpecHooks& hooks,
                         SpecResume* resume, int* proposals);
     bool spec_group_draft(int slot, const void* target_hidden, int th_len, int seed, int pos,

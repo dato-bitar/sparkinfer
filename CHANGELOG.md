@@ -68,15 +68,20 @@ clients, which omit it by default, get whole answers again.
 
 - **The release container speculates by default.** `serve` downloads z-lab's
   [`Qwen3.8-27B-DFlash2`](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) drafter on first run
-  (3.7 GB, Apache-2.0) and loads it. With the draft offload below, that is 1.2-2.2x the throughput
-  at 1-4 concurrent requests and the same at 16-32, and greedy or seeded requests give the same
-  tokens.
+  (3.8 GB, Apache-2.0) and loads it. With the draft offload below, that is 1.2-2.2x the throughput
+  at 1-4 concurrent requests and the same at 16-32.
   - `-e SPEC_DRAFT=none` serves without a drafter.
   - `serve-dspark`, `SPARKINFER_DRAFT_MODEL` and `--draft-model` keep choosing their drafter.
   - Past a 131,072-token context (`CTX` or `--ctx`) the default skips the drafter: a 32 GB card
     has no room for it beside a pool that size.
-  - With `SPARKINFER_NO_DOWNLOAD=1` and no staged drafter it serves without one instead of failing,
-    so pre-staged deployments that never staged it keep starting.
+  - With `SPARKINFER_NO_DOWNLOAD=1` and no staged drafter, or when its download fails, it serves
+    without one instead of failing, so a deployment that cannot reach the Hub keeps starting.
+
+- **A request speculates up to the end of the draft's context, then decodes on.** Speculation
+  required prompt + `max_tokens` to fit the draft's 16,384 positions, so a request that left
+  `max_tokens` to the server's cap (16,384 in the release container; the OpenAI SDK's default)
+  never speculated. A group member now speculates as far as the draft reaches and hands off there,
+  and the draft slot and capture buffer are sized to that reach rather than to `max_tokens`.
 
 - **A server with a draft loaded is as fast as one without at 16 and 32 concurrent requests, and
   up to 2.2x faster at 1-4** (Qwen3.8-27B NVFP4 + DFlash2, AIPerf, RTX 5090). Before, a loaded

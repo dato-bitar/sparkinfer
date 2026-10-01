@@ -543,7 +543,19 @@ void ContinuousBatchEngine::run_spec_group() {
     // A lone member's verify (8-row equivalent) and draft times, for its depth choice.
     float single_v8 = 14.f, single_draft = 1.8f;
     bool leave = false;
+    const int reach = model_->spec_group_reach();
     for (;;) {
+        // 0. A member that has reached the end of the draft's context hands off with the rest:
+        //    its next block would draft and capture past it. Speculation covered the request up to
+        //    there; it decodes on from its committed position.
+        for (const Member& m : members) {
+            if (m.done || m.pos <= reach) continue;
+            if (spec_group_trace())
+                fprintf(stderr, "[spec-group] leave: a member reached the draft's context (%d)\n", m.pos);
+            leave = true;
+            break;
+        }
+        if (leave) break;
         // 1. Drafts, from the hidden rows each member's last verify captured (consumed before a
         //    join below re-arms the capture buffers).
         auto t_draft = std::chrono::steady_clock::now();
