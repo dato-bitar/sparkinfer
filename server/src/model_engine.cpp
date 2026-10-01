@@ -415,9 +415,18 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
                             "request's output may not depend on what earlier requests cached)\n");
         } else if (wanted) {
             sparkinfer::PrefixCache::Limits lim;
-            lim.max_entries = (size_t)std::max(1LL, env_int("SPARKINFER_PREFIX_CACHE_ENTRIES", 32));
-            lim.max_host_bytes = (size_t)std::max(0LL, env_int("SPARKINFER_PREFIX_CACHE_HOST_MB", 8192)) << 20;
-            lim.max_blocks = impl_->kv->num_total_blocks() / 2;
+            // Sized by memory, not by a count: a quarter of the machine's RAM (8-32 GB) for the
+            // recurrent-state snapshots and three quarters of the KV pool for the blocks, with the
+            // cache evicted least-recently-used on demand when a request needs the room. A count
+            // of 32 and half the pool held ~32 chat prompts: AIPerf chat at 32 concurrent ran 971
+            // tok/s with TTFT p50 1,575 ms, and 1,222 tok/s / 1,378 ms with room for 62.
+            const long long ram_mb = (long long)sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGE_SIZE) >> 20;
+            const long long host_mb = std::max(8192LL, std::min(32768LL, ram_mb > 0 ? ram_mb / 4 : 8192LL));
+            lim.max_entries = (size_t)std::max(1LL, env_int("SPARKINFER_PREFIX_CACHE_ENTRIES", 256));
+            lim.max_host_bytes = (size_t)std::max(0LL, env_int("SPARKINFER_PREFIX_CACHE_HOST_MB", host_mb)) << 20;
+            const long long kv_pct =
+                std::max(1LL, std::min(100LL, env_int("SPARKINFER_PREFIX_CACHE_KV_PCT", 75)));
+            lim.max_blocks = (int)((long long)impl_->kv->num_total_blocks() * kv_pct / 100);
             impl_->prefix_cache_min_tokens =
                 (int)std::max(1LL, env_int("SPARKINFER_PREFIX_CACHE_MIN_TOKENS", 1024));
             impl_->batch_engine->enable_prefix_cache(lim);

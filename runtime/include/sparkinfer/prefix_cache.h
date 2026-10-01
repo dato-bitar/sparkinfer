@@ -78,6 +78,9 @@ public:
     // short.
     bool evict_for(int need_blocks);
 
+    // Blocks that evicting every entry would return to the pool: those only cache entries hold.
+    int evictable_blocks() const;
+
     Stats stats() const;
 
 private:

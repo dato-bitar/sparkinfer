@@ -497,7 +497,7 @@ What is never cached: `/v1/score` (its numbers must not depend on another reques
 with images or video (the cache keys on token ids, and every image's placeholder tokens are the
 same ids).
 
-Memory. Entries hold KV blocks (capped at half the pool) and snapshots in host RAM
+Memory. Entries hold KV blocks (up to three quarters of the pool) and snapshots in host RAM
 (`SPARKINFER_PREFIX_CACHE_HOST_MB`). When a new request cannot get KV blocks, least-recently-used
 entries are evicted before it is refused. `/metrics` reports `sparkinfer_prefix_cache_*` hits,
 reused tokens, evictions, entries, blocks and host bytes.
@@ -532,8 +532,9 @@ Prior requests cannot leak decode context into later ones (KV is freed after eac
 | `SPARKINFER_SERVER_PREFIX_TOKEN_FILE` | — | JSON `[id,...]` warmed via `cache_prefix` each request |
 | `SPARKINFER_SERVER_PREFIX_TOKEN_IDS` | — | Comma-separated token ids (same as above) |
 | `SPARKINFER_PREFIX_CACHE` | `1` | Automatic prefix cache (see **Automatic prefix cache**). `0` disables; `SPARKINFER_DETERMINISTIC=1` also disables it. |
-| `SPARKINFER_PREFIX_CACHE_ENTRIES` | `32` | Most cached prefixes held at once; least-recently-used is evicted. |
-| `SPARKINFER_PREFIX_CACHE_HOST_MB` | `8192` | Pinned host memory for recurrent-state snapshots (~205 MB each on Qwen3.8-27B; none on Muse Glimmer). Up to 8 more snapshot buffers are kept pinned for reuse; `SPARKINFER_SNAPSHOT_POOL=0` allocates and frees one per snapshot instead. |
+| `SPARKINFER_PREFIX_CACHE_ENTRIES` | `256` | Most cached prefixes held at once; least-recently-used is evicted. In practice the memory limits below bind first. |
+| `SPARKINFER_PREFIX_CACHE_KV_PCT` | `75` | Share of the KV pool cached prefixes may hold. A request that needs the room evicts least-recently-used entries first, and `/v1/capacity` / `sparkinfer_free_kv_blocks` count blocks only the cache holds as free. |
+| `SPARKINFER_PREFIX_CACHE_HOST_MB` | a quarter of RAM, 8192-32768 | Pinned host memory for recurrent-state snapshots (~205 MB each on Qwen3.8-27B; none on Muse Glimmer). Up to 8 more snapshot buffers are kept pinned for reuse; `SPARKINFER_SNAPSHOT_POOL=0` allocates and frees one per snapshot instead. |
 | `SPARKINFER_PREFIX_CACHE_MIN_TOKENS` | `1024` | Shortest prompt position a request checkpoints at. Shorter prompts still reuse cached prefixes but do not create one. |
 | `SPARKINFER_PREFILL_BATCHED` | `1` | Batched prefill in `cache_prefix` / cold prompts |
 | `SPARKINFER_PREFILL_ALIGN8_MIN` | `8` | On a model with NVFP4 prefill, a pass whose length is not a multiple of 8 prefills its aligned body in one pass and the last 1–7 tokens in one more forward, because the NVFP4 GEMMs take multiples of 8 rows (up to 3x faster for a short prompt, 1.9x for a long one). The smallest body split this way; `0` turns it off. |

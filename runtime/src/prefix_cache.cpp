@@ -74,6 +74,14 @@ bool PrefixCache::evict_for(int need_blocks) {
     return evicted;
 }
 
+int PrefixCache::evictable_blocks() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    int n = 0;
+    for (const auto& kv : held_)
+        if (kv_->block_refs(kv.first) == kv.second) ++n;
+    return n;
+}
+
 PrefixCache::Stats PrefixCache::stats() const {
     std::lock_guard<std::mutex> lock(mu_);
     Stats s = stats_;

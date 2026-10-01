@@ -189,6 +189,9 @@ public:
     int max_blocks_per_seq() const;
     int num_free_blocks() const;
     int num_total_blocks() const;
+    // Holders of physical block b (sequences and non-sequence holders such as the prefix cache);
+    // 0 for a free or unknown block.
+    int block_refs(int physical_id) const;
 
 private:
     struct Impl;

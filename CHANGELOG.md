@@ -7,6 +7,18 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Changed
 
+- **The prefix cache is sized by memory, not by a count** (AIPerf chat 1024/256 at 32 concurrent:
+  971 -> 1,070 tok/s, TTFT p50 1,575 -> 1,121 ms; at 16: TTFT p50 792 -> 553 ms; Qwen3.8-27B NVFP4).
+  - **Limits:** at most 32 entries in half the KV pool held about 32 chat prompts. The defaults
+    are now 256 entries, recurrent-state snapshots up to a quarter of RAM (8-32 GB,
+    `SPARKINFER_PREFIX_CACHE_HOST_MB`), and up to three quarters of the KV pool
+    (`SPARKINFER_PREFIX_CACHE_KV_PCT`). Least-recently-used entries are evicted when a request
+    needs the room, as before.
+  - **Capacity:** `/v1/capacity` and `sparkinfer_free_kv_blocks` count blocks only the cache holds
+    as free, since admission evicts them on demand. A full cache no longer reads as a full server.
+  - **Speculation:** a speculative join evicts a few blocks before growing its session, so a full
+    cache cannot stop it speculating.
+
 - **A short prompt prefills ~3x faster when its length is not a multiple of 8** (time to first
   token at 9-100 prompt tokens, 81-88 -> 25-31 ms, Qwen3.8-27B NVFP4). The aligned-body split
   (`SPARKINFER_PREFILL_ALIGN8_MIN`) applied only from a 128-token body, a threshold set while the

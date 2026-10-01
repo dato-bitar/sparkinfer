@@ -468,6 +468,9 @@ size_t KVCacheManager::scale_layer_stride_elems() const { return impl_->scale_la
 int    KVCacheManager::block_size() const { return impl_->cfg.block_size; }
 int    KVCacheManager::max_blocks_per_seq() const { return impl_->max_blocks_per_seq; }
 int    KVCacheManager::num_free_blocks() const { return (int)impl_->free_list.size(); }
+int    KVCacheManager::block_refs(int b) const {
+    return (b >= 0 && b < (int)impl_->refs.size()) ? impl_->refs[b] : 0;
+}
 int    KVCacheManager::num_total_blocks() const { return impl_->total_blocks; }
 
 } // namespace sparkinfer
