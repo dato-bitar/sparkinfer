@@ -882,6 +882,11 @@ bool ModelEngine::load_draft(const std::string& dir, std::string& err) {
               " -- if the log above shows CUDA out-of-memory errors, lower --ctx (131072 fits a 32 GB card)";
         return false;
     }
+    // Build the quantized copies now rather than at the first speculative request: for DFlash2
+    // that releases the 2.7 GB bf16 MLP before any request needs the room, instead of holding it
+    // until something speculates -- forever, on a server whose load never drops to a group --
+    // and it moves the ~1 GB transient of building them from the middle of serving to load.
+    draft->ensure_quant();
     impl_->model->set_dflash_draft(draft.get());
     impl_->draft = std::move(draft);
     impl_->batch_engine->enable_speculative(true);

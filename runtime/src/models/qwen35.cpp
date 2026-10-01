@@ -1265,7 +1265,7 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->swa_vtbl); cudaFree(p_->swa_vlen); cudaFree(p_->emb_norm_ones);
     cudaFree(p_->aq8); cudaFree(p_->aq8_d); cudaFree(p_->aq8_s); cudaFree(p_->aq81);
     cudaFree(p_->dflash_hidden); cudaFree(p_->dflash_context);
-    // spec_lin_snap / spec_conv_snap are in owned[] (allocated via Impl::alloc)
+    cudaFree(p_->spec_lin_snap); cudaFree(p_->spec_conv_snap);
     for (auto& kv : p_->sessions) {
         if (kv.first == 0) continue;
         if (kv.second.lin_state) cudaFree(kv.second.lin_state);
@@ -5844,13 +5844,6 @@ void Qwen35Model::set_dflash_capture(bool on, const std::vector<int>& target_lay
         s.dflash_context = nullptr;
         fprintf(stderr, "[dflash] capture context (%d positions): out of device memory\n", s.dflash_ctx_cap);
     }
-    if (s.cfg.hybrid && !s.spec_lin_snap) {
-        const size_t ls = (size_t)gdn_state_slots(s.cfg) * s.cfg.linear_v_heads *
-                          s.cfg.linear_head_dim * s.cfg.linear_head_dim;
-        const size_t cs = (size_t)s.cfg.n_layers * (s.cfg.linear_conv_kernel - 1) * s.linear_qkvdim;
-        s.spec_lin_snap = s.alloc<float>(ls);
-        s.spec_conv_snap = s.alloc<bf16>(cs);
-    }
     if (const char* e = getenv("SPARKINFER_DFLASH_CAPTURE"); e && e[0] == '1')
         fprintf(stderr, "[dflash] capture on n_cap=%d max_rows=%d\n", s.dflash_n_cap, s.dflash_max_rows);
 }
@@ -5881,9 +5874,13 @@ int Qwen35Model::dflash_context_len() const { return p_->dflash_ctx_len; }
 void Qwen35Model::save_spec_snapshot() {
     Impl& s = *p_;
     const Qwen35Config& c = s.cfg;
-    if (!s.spec_lin_snap || !c.hybrid) return;
+    if (!c.hybrid) return;
     const size_t ls = (size_t)gdn_state_slots(c) * c.linear_v_heads * c.linear_head_dim * c.linear_head_dim;
     const size_t cs = (size_t)c.n_layers * (c.linear_conv_kernel - 1) * s.linear_qkvdim;
+    // Allocated here, on first use, rather than with every capture: no serving path snapshots,
+    // and 155 MB held for nothing beside a loaded draft is part of what concurrent serving lacks.
+    if (!s.spec_lin_snap) s.spec_lin_snap = s.alloc<float>(ls);
+    if (!s.spec_conv_snap) s.spec_conv_snap = s.alloc<bf16>(cs);
     cu(cudaMemcpyAsync(s.spec_lin_snap, s.lin_state, ls * sizeof(float), cudaMemcpyDeviceToDevice, s.stream),
        "spec snap lin");
     cu(cudaMemcpyAsync(s.spec_conv_snap, s.lin_conv_state, cs * sizeof(bf16), cudaMemcpyDeviceToDevice, s.stream),
