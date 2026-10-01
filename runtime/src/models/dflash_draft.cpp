@@ -2643,6 +2643,11 @@ bool DFlashDraftModel::forward_blocks(const BlockJob* jobs, int n_jobs, int prop
         dflash_kernels::launch_add_rms(b.h, b.down, b.x, next_norm, b.xn, R, H, c.rms_eps, st);
     }
     // Head over every row (rows 1..depth of each block are read), then each block's selector walk.
+    // The draft scores the first Vd ids, so the GEMM takes the head's first Vd rows as its whole B
+    // operand: the data is row-major, and the CUTLASS SF layout tiles 128-row blocks with K fastest
+    // (tile_to_shape, Step<_2,_1,_3>), so the first Vd / 128 row tiles' scales are a prefix of the
+    // full head's with the same strides. Checked on the box: these logits equal the first Vd columns
+    // of the same GEMM at n = vocab exactly (max |diff| 0, every row's argmax the same).
     if (head4) {
         if (!(kernels::launch_prefill_nvfp4_quant_a(b.xn, s.f4_a, s.f4_asf, R, H, st) &&
               kernels::launch_prefill_nvfp4_gemm_f32(s.f4_a, s.f4_asf, head_fp4, head_fp4_sf, b.logits, R, Vd, H,
