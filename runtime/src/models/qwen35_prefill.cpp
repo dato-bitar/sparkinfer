@@ -5050,7 +5050,25 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // per row instead of broadcast, the GDN block runs the batched per-row AR step instead of the
     // compact scan, the KV-append uses the per-row-table kernel instead of the single-sequence
     // one, and there is no accepted-prefix commit because every row is already a real step.
-    const bool packed = s.packed_rows != nullptr;
+    // A grouped verify (several sequences' blocks, Qwen35PrefillCtx::group_n) takes packed decode's
+    // per-row tables and positions for its attention, but the compact GDN scan and the commit of
+    // an accepted prefix per group; `packed` keeps meaning independent one-token rows.
+    const bool per_row = s.packed_rows != nullptr;
+    const bool grouped = per_row && s.group_n > 0;
+    if (grouped && (!s.group_off || !s.group_len || !s.group_lin_state || !s.group_lin_conv ||
+                    !s.group_keep || !s.verify_eager || capture_only))
+        return -1;
+    const bool packed = per_row && !grouped;
+    // Many rows at once, packed or grouped: the width-driven choices below (the block-scaled GEMM
+    // arms, the attention split count, the multi-row head) are the same for both. Without them a
+    // grouped verify reads every weight once per 8 rows (4 x 8 rows: 56 ms against 16.6).
+    // SPARKINFER_GROUPED_WIDE=0 keeps a grouped verify on the row kernels, which is bit-identical
+    // per group to verifying that sequence alone (grouped_verify_check).
+    static const bool grouped_wide = [] {
+        const char* e = getenv("SPARKINFER_GROUPED_WIDE");
+        return !(e && e[0] == '0');
+    }();
+    const bool wide = packed || (grouped && grouped_wide);
     if (packed) {
         muse_stream_cache_packed_seen() = true;
         muse_stream_cache().release();
@@ -5075,7 +5093,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // seqlen > 512 and mma_chunk >= 32). Packed rows have independent lengths, so take the
     // longest: the per-row lengths the kernel actually reads still come from `seq`.
     int packed_seq_hint = 0;
-    if (packed)
+    if (per_row)
         for (int i = 0; i < N; i++)
             if (s.packed_pos[i] + 1 > packed_seq_hint) packed_seq_hint = s.packed_pos[i] + 1;
     // Every arena buffer below is sized for the WIDEST verify tier, not for this call's N.
@@ -5145,7 +5163,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     float* f8_sw[2] = {nullptr, nullptr};
     float* f8_p[2] = {nullptr, nullptr};
     size_t f8_p_bytes = 0;
-    if (packed && fp8_ckpt && kFp8GemmMinRows > 0) {
+    if (wide && fp8_ckpt && kFp8GemmMinRows > 0) {
         const int f8_kwide = std::max(H, lvdim);
         const int f8_nwide = std::max(std::max(lqkv, lvdim), H);
         for (int i = 0; i < 2; ++i) {
@@ -5192,7 +5210,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // [NA, qkvg_n] bf16 landing pad for the fused q|gate|k|v block-scaled GEMM below.
     bf16* fp4_qkv = nullptr;
     const int qkvg_n = 2 * qdim + 2 * kvdim;
-    if (packed && c.dense_ffn) {
+    if (wide && c.dense_ffn) {
         const size_t ab = kernels::prefill_nvfp4_data_bytes(NA, fp4_kwide);
         const size_t sb = kernels::prefill_nvfp4_scale_bytes_a(NA, fp4_kwide);
         size_t wb = kernels::prefill_nvfp4_workspace_bytes(NA, c.moe_ffn, H);
@@ -5361,7 +5379,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     float* moe_h = a.alloc<float>((size_t)NA * topk * ffn);
     // Gate accumulator for the tensor-core gate/up a wide packed step takes on a dense Q4_K FFN.
     // Only for a stack that has one: an all-NVFP4 FFN never reads it, and Muse takes its own body.
-    const bool gu_acc_needed = packed && dense && !muse && [&] {
+    const bool gu_acc_needed = wide && dense && !muse && [&] {
         for (int L = 0; L < c.n_layers; ++L) {
             const Qwen35LayerWeights& lw = s.w.layers[L];
             if (lw.gate_q && lw.gate_qtype == 12 && !(lw.gate_nv && lw.up_nv && lw.down_nv))
@@ -5383,7 +5401,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     }();
     // A stack whose gate/up are ternary (the default Ternary-Bonsai-2 load) still runs a Q4_K down
     // and Q4_K in-projections, so it keeps the same floor without needing gu_acc.
-    const bool ternary_gu_stack = packed && dense && !muse && [&] {
+    const bool ternary_gu_stack = wide && dense && !muse && [&] {
         for (int L = 0; L < c.n_layers; ++L) {
             const Qwen35LayerWeights& lw = s.w.layers[L];
             if (lw.gate_q && lw.gate_qtype == kPtq1GgmlType && lw.down_qtype == 12) return true;
@@ -5562,7 +5580,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     for (int i = 0; i < N; ++i) {
         ph_ids[i] = token_ids[i];
         // Packed rows each sit at their OWN sequence's next position; verify rows are consecutive.
-        ph_pos[i] = packed ? s.packed_pos[i] : start_pos + i;
+        ph_pos[i] = per_row ? s.packed_pos[i] : start_pos + i;
         ph_seq[i] = ph_pos[i] + 1;
     }
 
@@ -5879,7 +5897,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // a few KB) so the 10 full-attention layers each run ONE split + ONE combine instead of one per
     // row. That removes 2*(N-1) graph nodes per attention layer, and the graph is ~1000 nodes deep
     // against only ~5.6 ms of kernel time, so node count is itself a real cost here.
-    int* btab_rows = (N > 1 || packed) ? a.alloc<int>((size_t)NA * mbs) : nullptr;
+    int* btab_rows = (N > 1 || per_row) ? a.alloc<int>((size_t)NA * mbs) : nullptr;
     // The same per-row gather for the windowed layers' tables. Only allocated when this pool
     // actually caps them, so an uncapped pool carries neither the buffer nor the extra gather.
     int* btab_rows_win = (btab_rows && s.kv->windowed()) ? a.alloc<int>((size_t)NA * mbs) : nullptr;
@@ -5965,7 +5983,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         const char* e = getenv("SPARKINFER_MUSE_CB_Q4K_F16_MINROWS");
         return e ? atoi(e) : 8;
     }();
-    muse_f16 = muse && packed && muse_f16_min > 0 && N >= muse_f16_min &&
+    muse_f16 = muse && wide && muse_f16_min > 0 && N >= muse_f16_min &&
                kernels::q4k_f16_rows_enabled() && kernels::q4k_f16_rows_reserve(st);
     // The hd256 checkpoints' Q4_K matmuls on the fp16 tensor cores at packed widths
     // (launch_mmvq_q4k_f16_rows and friends): the attention q|gate, k/v and o projections, the
@@ -5979,7 +5997,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         const char* e = getenv("SPARKINFER_CB_Q4K_F16_MINROWS");
         return e ? atoi(e) : 8;
     }();
-    q4k_f16 = !muse && packed && c.head_dim == 256 && dense && !s.bonsai_sign_hidden &&
+    q4k_f16 = !muse && wide && c.head_dim == 256 && dense && !s.bonsai_sign_hidden &&
               q4k_f16_min > 0 && N >= q4k_f16_min && kernels::q4k_f16_rows_enabled() &&
               kernels::q4k_f16_rows_reserve(st) && kernels::q4k_f16_rows_reserve(s.stream_k);
     // Packed decode always records. `recording` gates both the BeginCapture below and the
@@ -6022,13 +6040,13 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // grows instead of baking in the mapping from capture time. One kernel node rather than N
     // memcpy nodes -- same reason as the capture copies above.
     if (btab_rows) {
-        if (packed)
+        if (per_row)
             dflash_kernels::launch_gather_rows_i32(s.packed_rows, btab_rows, mbs, N, st);
         else
             dflash_kernels::launch_broadcast_rows_i32(btable, btab_rows, mbs, N, st);
     }
     if (btab_rows_win) {
-        if (packed && s.packed_rows_win)
+        if (per_row && s.packed_rows_win)
             dflash_kernels::launch_gather_rows_i32(s.packed_rows_win, btab_rows_win, mbs, N, st);
         else
             dflash_kernels::launch_broadcast_rows_i32(btable_win, btab_rows_win, mbs, N, st);
@@ -6364,7 +6382,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // this model already holds for prefill and hand the pair to the call below, which then
             // does only the SwiGLU and the GGUF down GEMV.
             const bool gu_gemm =
-                packed && topk == 1 && N >= gu_gemm_min_rows() &&
+                wide && topk == 1 && N >= gu_gemm_min_rows() &&
                 packed_gate_up_nvfp4(w, hn, Ng, ffn, H, fp4_a, fp4_asf, fp4_ws, sg, su, st);
             // ...and down through its FP4 copy when it is resident, or a streamed Q6_K convert
             // into the persistent operand when it is not -- the Q4_K MMA was a quarter of the step.
@@ -6448,7 +6466,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 bonsai_rot_k = H;
             }
             // One quantize of xn feeds both in-projections, exactly as gate/up share theirs.
-            const bool gdn_in_gemm = packed && fp4_a && fp4_asf && N >= kProjGemmMinRows &&
+            const bool gdn_in_gemm = wide && fp4_a && fp4_asf && N >= kProjGemmMinRows &&
                                      w.gdn_qkv_fp4 && w.gdn_qkv_fp4_sf &&
                                      w.gdn_z_fp4 && w.gdn_z_fp4_sf;
             // Issued BEFORE the fork deliberately. Both in-projections read fp4_a/fp4_asf, and
@@ -6508,7 +6526,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 return e ? atoi(e) : 16;
             }();
             const bool ab_fused = w.ssm_alpha_type == 0 && w.ssm_beta_type == 0 &&
-                ((packed && ab_mma_min > 0 && N >= ab_mma_min &&
+                ((wide && ab_mma_min > 0 && N >= ab_mma_min &&
                   kernels::launch_gemv_rows2_mma(xn, w.ssm_alpha, w.ssm_beta, ra, rb, N, vh, vh, H,
                                                  gst)) ||
                  kernels::launch_gemv_rows2(xn, w.ssm_alpha, w.ssm_beta, ra, rb, N, vh, vh, H, gst));
@@ -6564,6 +6582,23 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                     vfail_L = L;
                     break;
                 }
+            } else if (grouped) {
+                // Each group against its own session's conv window and state, read-only: the
+                // commit after the verify writes each group's accepted prefix.
+                if (split_ok) pf_cu(cudaStreamWaitEvent(st, ev_join_ab, 0), "grouped gdn ab wait");
+                const size_t lq = (size_t)s.linear_qdim;
+                for (int g = 0; g < s.group_n; ++g) {
+                    const size_t o = (size_t)s.group_off[g];
+                    const int len = s.group_len[g];
+                    const bf16* conv_live = static_cast<const bf16*>(s.group_lin_conv[g]) + conv_off;
+                    kernels::launch_dflash_gdn_conv_compact(rq + o * lqkv, w.ssm_conv, conv_live,
+                        gq + o * lq, rk + o * lq, rv + o * lvdim, len, c.linear_q_heads, vh,
+                        c.linear_head_dim, c.linear_conv_kernel, c.rms_eps, st);
+                    kernels::launch_dflash_gdn_scan_compact(gq + o * lq, rk + o * lq, rv + o * lvdim,
+                        ra + o * vh, rb + o * vh, w.ssm_dt, w.ssm_a, s.group_lin_state[g] + state_off,
+                        att + o * lvdim, len, c.linear_q_heads, vh, c.linear_head_dim,
+                        c.gdn_qh_block, st);
+                }
             } else {
             const bf16* conv_live = static_cast<const bf16*>(s.lin_conv_state) + conv_off;
             kernels::launch_dflash_gdn_conv_compact(rq, w.ssm_conv, conv_live, gq, rk, rv,
@@ -6600,7 +6635,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh,
                                                     c.linear_head_dim, c.rms_eps, st);
             }
-            const bool gdn_out_gemm = packed && fp4_a && fp4_asf && N >= kProjGemmMinRows &&
+            const bool gdn_out_gemm = wide && fp4_a && fp4_asf && N >= kProjGemmMinRows &&
                                       w.gdn_out_fp4 && w.gdn_out_fp4_sf;
             if (out_t)
                 supported = kernels::launch_gemm_ptq1_i8_rows_bf16(
@@ -6627,7 +6662,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             const bool attn_t = tw && s.bonsai_sign_hidden && tw->wq_type == kPtq1GgmlType &&
                                 tw->wk_type == kPtq1GgmlType && tw->wv_type == kPtq1GgmlType;
             const bool fork_attn = !attn_t && fork_shared && q81_src == xn && q81_k == H &&
-                                   !((kAttnGemm & 4) && (kAttnGemm & 1) && packed && fp4_a &&
+                                   !((kAttnGemm & 4) && (kAttnGemm & 1) && wide && fp4_a &&
                                      fp4_asf && N >= kProjGemmMinRows &&
                                      w.wq_fp4 && w.wk_fp4 && w.wv_fp4);
             cudaStream_t ast = fork_attn ? s.stream_k : st;
@@ -6645,7 +6680,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // eight CTAs of a 128-wide tile -- 5% of the machine -- so the GEMM would be far
             // slower than the GEMV there even reading the weights once. They are also only
             // 2.78 MB apiece, a twentieth of what wq and wo move.
-            const bool attn_q_gemm = !attn_t && (kAttnGemm & 1) && packed && fp4_a && fp4_asf &&
+            const bool attn_q_gemm = !attn_t && (kAttnGemm & 1) && wide && fp4_a && fp4_asf &&
                                      N >= kProjGemmMinRows && w.wq_fp4 && w.wq_fp4_sf;
             // quant_nv_rows(xn, H) above still runs unconditionally, so the int8 staging that
             // proj_pair_nv_on expects to find already cached is there whether or not wq took the
@@ -6738,7 +6773,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             char* vs = kv8 ? static_cast<char*>(s.kv->v_scale_pool()) +
                              s.kv->scale_layer_base_elems(L) * 2 : nullptr;
             if (kv8) {
-                if (packed)
+                if (per_row)
                     kernels::launch_qknorm_rope_kv_partial_int8_gated(
                         b8, qb, qg, kf, vf, w.q_norm, w.k_norm, kp, vp, ks, vs, btab_rows, pos,
                         N, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta,
@@ -6750,7 +6785,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                         c.rms_eps, bs, mbs, st);
             } else {
                 kernels::launch_prefill_split_q_gate(b8, qb, qg, N, c.n_q_heads, c.head_dim, st);
-                if (packed)
+                if (per_row)
                     kernels::launch_qknorm_rope_kv_partial(
                         qb, kf, vf, w.q_norm, w.k_norm, kp, vp, btab_rows, pos,
                         N, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta,
@@ -6778,7 +6813,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             }();
             const int cb_attn_splits = cb_attn_env >= 0 ? cb_attn_env
                                                         : (s.bonsai_sign_hidden ? 8 : 16);
-            const int ns_attn = (packed && N >= 24 && cb_attn_splits > 0 &&
+            const int ns_attn = (wide && N >= 24 && cb_attn_splits > 0 &&
                                  cb_attn_splits < ns)
                               ? cb_attn_splits : ns;
             kernels::launch_flash_decode_split(
@@ -6795,7 +6830,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 // computing what has to be the same number is precisely how the batched path
                 // drifts from AR at long context (#712). start_pos + N is the largest row
                 // length in this batch, matching what AR would report at the last row.
-                1.f / sqrtf((float)c.head_dim), st, nullptr, packed ? packed_seq_hint : start_pos + N,
+                1.f / sqrtf((float)c.head_dim), st, nullptr, per_row ? packed_seq_hint : start_pos + N,
                 ks, vs, kv8 ? 1 : 0, int8_gate_fused ? qg : nullptr);
             // att/qg rows are contiguous at stride qdim, and the gate is elementwise, so one
             // launch covers the whole block. N separate nodes cost N times the graph-node
@@ -6805,7 +6840,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             if (!int8_gate_fused && !wo_t) {
                 kernels::launch_qwen36_mul_sigmoid(att, qg, N * qdim, st);
             }
-            const bool attn_o_gemm = (kAttnGemm & 2) && packed && fp4_a && fp4_asf &&
+            const bool attn_o_gemm = (kAttnGemm & 2) && wide && fp4_a && fp4_asf &&
                                      N >= kProjGemmMinRows && w.wo_fp4 && w.wo_fp4_sf;
             if (wo_t)
                 supported = kernels::launch_ptq1_gate_rotq_bf16(
@@ -6910,7 +6945,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 const int v = e ? atoi(e) : 8;
                 return v < 1 ? 1 : v;
             }();
-            const bool ffn_gemm = packed && topk == 1 && fp4_a && fp4_asf &&
+            const bool ffn_gemm = wide && topk == 1 && fp4_a && fp4_asf &&
                                   N >= kFfnGemmMinRows && w.gate_fp4 && w.gate_fp4_sf &&
                                   w.up_fp4 && w.up_fp4_sf && w.down_fp4 && w.down_fp4_sf;
             // Packed decode against the Bonsai decode shadow: the ternary legs single-row decode
@@ -7378,7 +7413,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         const int v = e ? atoi(e) : 16;
         return v < 1 ? 1 : v;
     }();
-    if (packed && N >= kHeadGemmMinRows && !(N & 7) && s.w.lm_head_fp4 && s.w.lm_head_fp4_sf &&
+    if (wide && N >= kHeadGemmMinRows && !(N & 7) && s.w.lm_head_fp4 && s.w.lm_head_fp4_sf &&
         fp4_a && fp4_asf) {
         head_ok = kernels::launch_prefill_nvfp4_quant_a(xn, fp4_a, fp4_asf, N, H, st) &&
                   kernels::launch_prefill_nvfp4_gemm_f32(fp4_a, fp4_asf, s.w.lm_head_fp4,
@@ -7491,10 +7526,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         if (q4k_f16 &&
             kernels::launch_mmvq_q4k_f16_rows(xn, s.w.lm_head, logits, true, N, c.vocab, H, st))
             mr_done = true;
-        if (!mr_done && packed && N > 1 &&
+        if (!mr_done && wide && N > 1 &&
             kernels::launch_mmvq_q4k_mma_head_f32(q81, s.w.lm_head, logits, N, c.vocab, H, st))
             mr_done = true;
-        if (!mr_done && cb_head_mr && packed && N > 1) {
+        if (!mr_done && cb_head_mr && wide && N > 1) {
             const size_t q81_row_bytes = kernels::llama_q8_1_bytes(H);
             bool mr_ok = true;
             for (int r0 = 0; r0 < N && mr_ok; r0 += 8) {
@@ -7612,6 +7647,20 @@ verify_forward_done:
     int keep = 1;
     if (s.verify_commit_all) keep = N;
     while (keep < N && token_ids[keep] == out_argmax[keep - 1]) ++keep;
+    // A grouped verify: each group's accepted prefix, within its own rows.
+    struct CommitUnit { size_t off; int keep; void* conv; float* state; };
+    std::vector<CommitUnit> units;
+    if (grouped) {
+        for (int g = 0; g < s.group_n; ++g) {
+            const int o = s.group_off[g], len = s.group_len[g];
+            int k = 1;
+            while (k < len && token_ids[o + k] == out_argmax[o + k - 1]) ++k;
+            s.group_keep[g] = k;
+            units.push_back({(size_t)o, k, s.group_lin_conv[g], s.group_lin_state[g]});
+        }
+    } else {
+        units.push_back({0, keep, s.lin_conv_state, s.lin_state});
+    }
     if (getenv("SPARKINFER_DFLASH_VERIFY_DUMP_ROW")) {
         fprintf(stderr, "[dflash-verify-debug] start_pos=%d N=%d keep=%d out_argmax=[", start_pos, N, keep);
         for (int i = 0; i < N; i++) fprintf(stderr, "%d ", out_argmax[i]);
@@ -7656,31 +7705,37 @@ verify_forward_done:
             gdn_tbl_key = &s.w;
         }
     }
-    if (commit_layers && n_gdn > 0) {
-        dflash_kernels::launch_gdn_conv_commit_layers(
-            rec_qkv, (size_t)N * lqkv, s.lin_conv_state,
-            (size_t)(c.linear_conv_kernel - 1) * lqkv, d_gdn_layers, n_gdn, keep,
-            c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel, st);
-        dflash_kernels::launch_gdn_scan_commit_layers(
-            rec_k, (size_t)N * s.linear_qdim, rec_v, (size_t)N * lvdim,
-            rec_a, (size_t)N * vh, rec_b, d_gdn_w,
-            s.lin_state, (size_t)vh * c.linear_head_dim * c.linear_head_dim,
-            n_gdn, keep, c.linear_q_heads, vh, c.linear_head_dim, c.gdn_qh_block, st);
-    } else {
-        for (int L = 0; L < c.n_layers; ++L) if (s.w.layers[L].linear_attn) {
-            bf16* rq = rec_qkv + (size_t)L * N * lqkv;
-            bf16* rk = rec_k + (size_t)L * N * s.linear_qdim;
-            bf16* rv = rec_v + (size_t)L * N * lvdim;
-            bf16* ra = rec_a + (size_t)L * N * vh;
-            bf16* rb = rec_b + (size_t)L * N * vh;
-            bf16* conv_live = static_cast<bf16*>(s.lin_conv_state) +
-                (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
-            float* state = s.lin_state + (size_t)gdn_state_slot(c, L) * vh * c.linear_head_dim * c.linear_head_dim;
-            kernels::launch_dflash_gdn_conv_commit(rq, conv_live, keep, c.linear_q_heads, vh,
-                c.linear_head_dim, c.linear_conv_kernel, st);
-            kernels::launch_dflash_gdn_scan_commit(rk, rv, ra, rb, s.w.layers[L].ssm_dt,
-                s.w.layers[L].ssm_a, state, keep, c.linear_q_heads, vh, c.linear_head_dim,
-                c.gdn_qh_block, st);
+    for (const CommitUnit& u : units) {
+        const size_t uo = u.off;
+        const int ukeep = u.keep;
+        if (commit_layers && n_gdn > 0) {
+            dflash_kernels::launch_gdn_conv_commit_layers(
+                rec_qkv + uo * lqkv, (size_t)N * lqkv, u.conv,
+                (size_t)(c.linear_conv_kernel - 1) * lqkv, d_gdn_layers, n_gdn, ukeep,
+                c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel, st);
+            dflash_kernels::launch_gdn_scan_commit_layers(
+                rec_k + uo * s.linear_qdim, (size_t)N * s.linear_qdim,
+                rec_v + uo * lvdim, (size_t)N * lvdim,
+                rec_a + uo * vh, (size_t)N * vh, rec_b + uo * vh, d_gdn_w,
+                u.state, (size_t)vh * c.linear_head_dim * c.linear_head_dim,
+                n_gdn, ukeep, c.linear_q_heads, vh, c.linear_head_dim, c.gdn_qh_block, st);
+        } else {
+            for (int L = 0; L < c.n_layers; ++L) if (s.w.layers[L].linear_attn) {
+                bf16* rq = rec_qkv + (size_t)L * N * lqkv + uo * lqkv;
+                bf16* rk = rec_k + (size_t)L * N * s.linear_qdim + uo * s.linear_qdim;
+                bf16* rv = rec_v + (size_t)L * N * lvdim + uo * lvdim;
+                bf16* ra = rec_a + (size_t)L * N * vh + uo * vh;
+                bf16* rb = rec_b + (size_t)L * N * vh + uo * vh;
+                bf16* conv_live = static_cast<bf16*>(u.conv) +
+                    (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
+                float* state = u.state +
+                    (size_t)gdn_state_slot(c, L) * vh * c.linear_head_dim * c.linear_head_dim;
+                kernels::launch_dflash_gdn_conv_commit(rq, conv_live, ukeep, c.linear_q_heads, vh,
+                    c.linear_head_dim, c.linear_conv_kernel, st);
+                kernels::launch_dflash_gdn_scan_commit(rk, rv, ra, rb, s.w.layers[L].ssm_dt,
+                    s.w.layers[L].ssm_a, state, ukeep, c.linear_q_heads, vh, c.linear_head_dim,
+                    c.gdn_qh_block, st);
+            }
         }
     }
     // The next draft block consumes only the captured target hidden rows and the draft model's
@@ -7700,8 +7755,8 @@ verify_forward_done:
     // calibration. The explicit environment setting still wins for cross-context testing.
     const bool async_commit = async_commit_env >= 0 ? async_commit_env != 0
                                                     : (start_pos >= 2048 && start_pos < 6144);
-    if (!async_commit) pf_cu(cudaStreamSynchronize(st), "verify commit");
-    return keep;
+    if (!async_commit || grouped) pf_cu(cudaStreamSynchronize(st), "verify commit");
+    return grouped ? N : keep;
 }
 
 } // namespace sparkinfer

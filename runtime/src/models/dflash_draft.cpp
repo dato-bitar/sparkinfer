@@ -454,6 +454,37 @@ struct DFlashDraftModel::Impl {
     // Per-layer contiguous KV cache: [max_seq, n_kv, d]
     std::vector<bf16*> k_cache, v_cache;
     int seq_len = 0;
+    // Slots (DFlashDraftModel::use_slot): the members above are the current slot's; the others
+    // are parked here. Slot 0's buffers come from alloc_scratch (in `owned`); the rest are this
+    // struct's own.
+    // `cap` is the positions the slot's buffers hold: cfg.max_seq for slot 0, what its request can
+    // reach for the others (use_slot's `need`). forward_block checks against the current one.
+    struct Slot {
+        std::vector<bf16*> k, v;
+        bf16* tp = nullptr;
+        int seq_len = 0, ctx_floor = 0, cap = 0;
+        bool live = false;
+    };
+    std::vector<Slot> slots;
+    int cur_slot = 0;
+    int cap = 0;
+    void park_current() {
+        Slot& sl = slots[(size_t)cur_slot];
+        sl.k = k_cache; sl.v = v_cache; sl.tp = target_proj;
+        sl.seq_len = seq_len; sl.ctx_floor = ctx_floor; sl.cap = cap;
+    }
+    void load_slot(int i) {
+        Slot& sl = slots[(size_t)i];
+        k_cache = sl.k; v_cache = sl.v; target_proj = sl.tp;
+        seq_len = sl.seq_len; ctx_floor = sl.ctx_floor; cap = sl.cap;
+        cur_slot = i;
+    }
+    void free_slot_buffers(Slot& sl) {
+        for (bf16* b : sl.k) if (b) cudaFree(b);
+        for (bf16* b : sl.v) if (b) cudaFree(b);
+        if (sl.tp) cudaFree(sl.tp);
+        sl = Slot{};
+    }
 
     // The draft's quantized weight copies are built on first use, not at load. Constructing them
     // is what makes merely loading the draft tax the TARGET's decode: measured on RTX 5090 with
@@ -602,6 +633,11 @@ struct DFlashDraftModel::Impl {
             v_cache[L] = alloc<bf16>((size_t)cfg.max_seq * kvdim);
         }
         seq_len = 0;
+        cap = cfg.max_seq;
+        slots.assign(1, Slot{});
+        slots[0].live = true;
+        cur_slot = 0;
+        park_current();
     }
 
     // NVFP4 -> BF16 at load, decoded on the host.
@@ -680,6 +716,8 @@ DFlashDraftModel::DFlashDraftModel(const DFlashDraftConfig& cfg) : p_(new Impl()
 
 DFlashDraftModel::~DFlashDraftModel() {
     if (!p_) return;
+    for (size_t i = 1; i < p_->slots.size(); ++i)
+        if (p_->slots[i].live) p_->free_slot_buffers(p_->slots[i]);
     for (void* p : p_->owned) cudaFree(p);
     if (p_->h_out) cudaFreeHost(p_->h_out);
     if (p_->h_ids) cudaFreeHost(p_->h_ids);
@@ -756,6 +794,54 @@ void DFlashDraftModel::set_shared_weights(const void* embed, const void* lm_head
 }
 
 void DFlashDraftModel::reset() { p_->seq_len = 0; p_->ctx_floor = 0; }
+
+bool DFlashDraftModel::use_slot(int i, int need) {
+    Impl& s = *p_;
+    if (i < 0 || s.slots.empty()) return false;
+    // need <= 0: a live slot as it is, a new one at max_seq.
+    const bool any = need <= 0;
+    need = (any || need > s.cfg.max_seq) ? s.cfg.max_seq : need;
+    if (i == s.cur_slot && (any || s.cap >= need)) return true;
+    s.park_current();
+    if ((size_t)i >= s.slots.size()) s.slots.resize((size_t)i + 1);
+    Impl::Slot& sl = s.slots[(size_t)i];
+    if (sl.live && !any && sl.cap < need) {
+        if (i == 0) return false;   // slot 0 is load-time state at cfg.max_seq already
+        s.free_slot_buffers(sl);    // cudaFree waits for any block still reading it
+    }
+    if (!sl.live) {
+        const int H = s.cfg.hidden, kvdim = s.cfg.n_kv_heads * s.cfg.head_dim;
+        const size_t n = (size_t)need;
+        sl.k.assign(s.cfg.n_layers, nullptr);
+        sl.v.assign(s.cfg.n_layers, nullptr);
+        bool ok = cudaMalloc(reinterpret_cast<void**>(&sl.tp), n * H * sizeof(bf16)) == cudaSuccess;
+        for (int L = 0; ok && L < s.cfg.n_layers; ++L)
+            ok = cudaMalloc(reinterpret_cast<void**>(&sl.k[L]), n * kvdim * sizeof(bf16)) == cudaSuccess &&
+                 cudaMalloc(reinterpret_cast<void**>(&sl.v[L]), n * kvdim * sizeof(bf16)) == cudaSuccess;
+        if (!ok) {
+            cudaGetLastError();
+            s.free_slot_buffers(sl);
+            return false;
+        }
+        sl.live = true;
+        sl.cap = need;
+    }
+    s.load_slot(i);
+    return true;
+}
+
+void DFlashDraftModel::free_slot(int i) {
+    Impl& s = *p_;
+    if (i <= 0 || (size_t)i >= s.slots.size() || !s.slots[(size_t)i].live) return;
+    if (s.cur_slot == i) {
+        s.park_current();
+        s.load_slot(0);
+    }
+    cudaDeviceSynchronize();   // nothing may still be reading the slot's caches
+    s.free_slot_buffers(s.slots[(size_t)i]);
+}
+
+int DFlashDraftModel::current_slot() const { return p_->cur_slot; }
 
 
 void DFlashDraftModel::crop(int keep) {
@@ -1204,7 +1290,7 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     Impl& s = *p_;
     s.ensure_quant();
     if (!s.fc || !s.embed || !s.lm_head || !noise_ids || !out_argmax) return false;
-    if (ctx_len < 0 || ctx_len + s.cfg.block_size > s.cfg.max_seq + s.cfg.block_size) return false;
+    if (ctx_len < 0 || ctx_len > s.cap) return false;
     cudaStream_t st = stream ? stream : s.stream;
     const auto& c = s.cfg;
     const int H = c.hidden;
@@ -1534,8 +1620,8 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     // the same size). Project straight into the cache slice instead; the RoPE then runs in place
     // there. Same values written to the same addresses in the same order.
     const int new_len_all = ctx_len + BW;
-    if (past + new_len_all > c.max_seq) {
-        fprintf(stderr, "[dflash] KV overflow past=%d new=%d max=%d\n", past, new_len_all, c.max_seq);
+    if (past + new_len_all > s.cap) {
+        fprintf(stderr, "[dflash] KV overflow past=%d new=%d max=%d\n", past, new_len_all, s.cap);
         return false;
     }
     // Attention geometry for this block, hoisted: the context ingestion below needs the layer's

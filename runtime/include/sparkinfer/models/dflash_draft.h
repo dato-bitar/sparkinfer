@@ -85,6 +85,18 @@ public:
     // Crop draft KV to the first `keep` tokens (speculative accept boundary).
     void crop(int keep);
 
+    // Slots: independent per-generation draft state -- the KV cache, the projected target
+    // context, the position and context floor -- sharing the weights and block scratch, one per
+    // request speculated concurrently. Slot 0 is the state allocated at load. use_slot(i, need)
+    // makes slot i current, allocating it for `need` positions (~(2 * layers * kv_dim + hidden) *
+    // need bf16) on first use or when it holds fewer; need 0 takes a live slot as it is and a new
+    // one at max_seq. It returns false, leaving the current slot as it was, when that allocation
+    // fails. reset/crop/forward_block act on the current slot, and forward_block declines past its
+    // positions. free_slot(i) gives slot i back (not 0).
+    bool use_slot(int i, int need = 0);
+    void free_slot(int i);
+    int current_slot() const;
+
     int seq_len() const;
 
     // One parallel block forward.

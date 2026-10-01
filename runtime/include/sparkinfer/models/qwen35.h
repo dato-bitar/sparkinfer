@@ -744,9 +744,47 @@ public:
     // Batched verify entry (may fall back to verify_block). Same contract as verify_block.
     bool batched_forward(const int* token_ids, int n, int start_pos, bool resume_gdn,
                          int* out_argmax, const void* dflash_capture_dst = nullptr);
+    // GROUPED SPECULATIVE VERIFY: one forward over n_groups sequences' verify blocks. Group g's
+    // tokens[g][0..lens[g]) sit at positions start_pos[g].. of session seq_ids[g]; out_ids gets
+    // each row's token (argmax, or drawn with the group's sampler at step sampling->step[g] + i),
+    // rows of all groups laid end to end, and keep[g] the length of group g's accepted prefix,
+    // which is committed into its session (KV and recurrent state) -- the same contract
+    // batched_forward has for one sequence. Hidden-state capture rows (when capture is on) go to
+    // capture_dst in the same row order. Sessions must hold fp32 recurrent state (never packed-
+    // decoded). False, with nothing committed, when the batch cannot be served.
+    // SPEC GROUP: the pieces ContinuousBatchEngine's concurrent speculation drives, one request
+    // per draft slot (DFlashDraftModel::use_slot). spec_group_begin/end bracket a group run
+    // (capture on, a verify-wide hidden-row buffer; then everything released). spec_group_join
+    // prefills one request from prefill_from with hidden-state capture -- taking hooks' prefix-
+    // cache checkpoints as dflash_generate does -- and runs its slot's first draft block over the
+    // prompt context: returns the seed token (drawn with hooks' sampler when it samples; handed to
+    // hooks.on_tokens before that block, which is skipped -- resume->finished -- when on_tokens
+    // returns false) and fills proposals[0..spec_group_depth()), or -1: with resume->engaged the prompt was
+    // prefilled and decodes on from resume->position / next_token; with resume->failed the state
+    // moved and is not trustworthy; with neither, nothing ran.
+    // spec_group_draft runs a slot's next block from the hidden rows its last verify captured.
+    // spec_group_verify verifies every member's block in one pass (verify_grouped; one member
+    // takes the single-sequence graph-cached verify) and commits each accepted prefix.
+    bool spec_group_begin();
+    void spec_group_end();
+    int spec_group_depth() const;
+    int spec_group_join(const std::vector<int>& prompt, int max_new, int slot, const SpecHooks& hooks,
+                        SpecResume* resume, int* proposals);
+    bool spec_group_draft(int slot, const void* target_hidden, int th_len, int seed, int pos,
+                          float temperature, unsigned long long seed_rng, unsigned long long step0,
+                          int top_k, float top_p, int* proposals);
+    bool spec_group_verify(int n, const uint64_t* seq_ids, const int* const* blocks, const int* lens,
+                           const int* start_pos, const PackedSampling* sampling, int* out_ids,
+                           int* keep);
+    bool verify_grouped(int n_groups, const uint64_t* seq_ids, const int* const* tokens,
+                        const int* lens, const int* start_pos, const PackedSampling* sampling,
+                        int* out_ids, int* keep, const void* capture_dst = nullptr);
 
 private:
     void invalidate_decode_graph();
+    // Points the draft at the target's embedding and the head it drafts with (dflash_generate and
+    // spec_group_begin, before the draft's first block).
+    void bind_draft_shared_weights();
     // Frees every decode graph parked under a non-active session id (see the parking lot in
     // qwen35.cpp's Impl). Called by invalidate_decode_graph(), which is the "something global
     // changed" path, and as a size backstop.

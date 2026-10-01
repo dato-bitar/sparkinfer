@@ -609,6 +609,10 @@ struct Qwen35Model::Impl {
         int out[kQwen35MaxPackedRows];
     };
     PackedSampleRows* packed_samp_host = nullptr;
+    // verify_grouped's per-row block-table pointer arrays (device) and their pinned staging.
+    const int** grp_dev_tables = nullptr;
+    const int** grp_dev_tables_win = nullptr;
+    const int** grp_host_tables = nullptr;   // [2 * kQwen35MaxPackedRows]: tables, then ring tables
     // mixed_step's scratch, allocated on first use for kQwen35MaxPackedRows decode rows: the
     // gathered block tables, device positions/lengths, the split-KV attention partials, the Q8_1
     // rows and logits of the LM head, and the argmax (device + pinned host).
@@ -1277,6 +1281,9 @@ Qwen35Model::~Qwen35Model() {
     if (p_->packed_dev_tables_win) cudaFree(p_->packed_dev_tables_win);
     if (p_->packed_host_tables_win) cudaFreeHost(p_->packed_host_tables_win);
     if (p_->packed_samp_host) cudaFreeHost(p_->packed_samp_host);
+    if (p_->grp_dev_tables) cudaFree(p_->grp_dev_tables);
+    if (p_->grp_dev_tables_win) cudaFree(p_->grp_dev_tables_win);
+    if (p_->grp_host_tables) cudaFreeHost(p_->grp_host_tables);
     if (p_->mix_btab) cudaFree(p_->mix_btab);
     if (p_->mix_pos_d) cudaFree(p_->mix_pos_d);
     if (p_->mix_seq_d) cudaFree(p_->mix_seq_d);
@@ -5930,6 +5937,359 @@ void Qwen35Model::dflash_warm_verify(int n, int start_pos) {
                             s.dflash_hidden, argmax.data(), /*capture_only=*/true);
 }
 
+bool Qwen35Model::verify_grouped(int n_groups, const uint64_t* seq_ids, const int* const* tokens,
+                                 const int* lens, const int* start_pos, const PackedSampling* sampling,
+                                 int* out_ids, int* keep, const void* capture_dst) {
+    Impl& s = *p_;
+    if (n_groups < 1 || n_groups > 8 || !seq_ids || !tokens || !lens || !start_pos || !out_ids || !keep)
+        return false;
+    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+    constexpr int kRows = kQwen35MaxPackedRows;
+    int N = 0;
+    for (int g = 0; g < n_groups; ++g) {
+        if (lens[g] < 1) return false;
+        N += lens[g];
+    }
+    if (N > kRows) return false;
+    std::vector<float*> g_state((size_t)n_groups);
+    std::vector<void*> g_conv((size_t)n_groups);
+    std::vector<int> g_off((size_t)n_groups), g_keep((size_t)n_groups, 0);
+    if (!s.grp_dev_tables) {
+        if (cudaMalloc(&s.grp_dev_tables, kRows * sizeof(int*)) != cudaSuccess ||
+            cudaMalloc(&s.grp_dev_tables_win, kRows * sizeof(int*)) != cudaSuccess ||
+            cudaHostAlloc(&s.grp_host_tables, 2 * kRows * sizeof(int*), cudaHostAllocDefault) != cudaSuccess)
+            return false;
+    }
+    const int** h_tab = s.grp_host_tables;
+    const int** h_win = s.grp_host_tables + kRows;
+    std::vector<int> ids((size_t)N), pos((size_t)N);
+    for (int g = 0, r = 0; g < n_groups; ++g) {
+        auto it = s.sessions.find(seq_ids[g]);
+        if (seq_ids[g] == 0 || it == s.sessions.end() || !it->second.lin_state ||
+            !it->second.lin_conv_state || it->second.lin_state_b16)
+            return false;
+        const int* tbl = s.kv->block_table(seq_ids[g]);
+        const int* win = s.kv->block_table_win(seq_ids[g]);
+        if (!tbl || !win) return false;
+        g_state[(size_t)g] = it->second.lin_state;
+        g_conv[(size_t)g] = it->second.lin_conv_state;
+        g_off[(size_t)g] = r;
+        for (int i = 0; i < lens[g]; ++i, ++r) {
+            ids[(size_t)r] = tokens[g][i];
+            pos[(size_t)r] = start_pos[g] + i;
+            h_tab[r] = tbl;
+            h_win[r] = win;
+        }
+    }
+    cu(cudaMemcpyAsync(s.grp_dev_tables, h_tab, (size_t)N * sizeof(int*), cudaMemcpyHostToDevice, s.stream),
+       "grouped tables");
+    cu(cudaMemcpyAsync(s.grp_dev_tables_win, h_win, (size_t)N * sizeof(int*), cudaMemcpyHostToDevice, s.stream),
+       "grouped ring tables");
+    Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.stream_k, s.stream_v, seq_ids[0],
+                          g_state[0], g_conv[0], s.logits, s.d_out_id, s.h_out_id, s.gguf,
+                          s.emb_norm_ones,
+                          s.bonsai_embed_native,
+                          s.bonsai_sign_dev.count(s.cfg.hidden)
+                              ? s.bonsai_sign_dev.at(s.cfg.hidden) : nullptr,
+                          s.bonsai_sign_ffn,
+                          (int)s.bonsai_block,
+                          s.bonsai_rot,
+                          s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
+                          s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
+                          nullptr, 0, nullptr, 0 };
+    ctx.packed_pos = pos.data();
+    ctx.packed_rows = reinterpret_cast<const int* const*>(s.grp_dev_tables);
+    ctx.packed_rows_win = reinterpret_cast<const int* const*>(s.grp_dev_tables_win);
+    ctx.group_n = n_groups;
+    ctx.group_off = g_off.data();
+    ctx.group_len = lens;
+    ctx.group_lin_state = g_state.data();
+    ctx.group_lin_conv = g_conv.data();
+    ctx.group_keep = g_keep.data();
+    ctx.verify_eager = true;
+    // Each row drawn with its group's sampler at that row's own step, as the one-sequence verify
+    // draws its rows (see batched_forward), through the packed rows' sampler.
+    struct GroupSampler {
+        Impl* m;
+        const PackedSampling* samp;
+        const int* lens;
+        int n_groups;
+    } gs{&s, sampling, lens, n_groups};
+    bool any_sampled = false;
+    if (sampling)
+        for (int g = 0; g < n_groups; ++g) any_sampled = any_sampled || sampling->temperature[g] > 0.f;
+    if (any_sampled) {
+        if (!ensure_packed_samp(s)) return false;
+        ctx.verify_sample = [](void* user, float* logits, int n_rows, int* out) -> bool {
+            const GroupSampler& G = *static_cast<const GroupSampler*>(user);
+            Impl& m = *G.m;
+            auto* h = m.packed_samp_host;
+            for (int g = 0, r = 0; g < G.n_groups; ++g)
+                for (int i = 0; i < G.lens[g]; ++i, ++r) {
+                    h->temp[r] = G.samp->temperature[g];
+                    h->seed[r] = G.samp->seed[g];
+                    h->step[r] = G.samp->step[g] + (unsigned long long)i;
+                    h->top_k[r] = G.samp->top_k[g];
+                    h->top_p[r] = G.samp->top_p[g];
+                }
+            if (!sample_rows_packed(m, logits, n_rows)) return false;
+            for (int r = 0; r < n_rows; ++r)
+                if (h->temp[r] > 0.f) out[r] = h->out[r];
+            return true;
+        };
+        ctx.verify_sample_user = &gs;
+    }
+    const int consumed = dflash_verify_short_run(ctx, ids.data(), N, pos[0],
+                                                  s.dflash_capture ? s.dflash_layer_ids.data() : nullptr,
+                                                  s.dflash_capture ? s.dflash_n_cap : 0,
+                                                  const_cast<void*>(capture_dst), out_ids);
+    if (consumed != N) return false;
+    for (int g = 0; g < n_groups; ++g) keep[g] = g_keep[(size_t)g];
+    return true;
+}
+
+void Qwen35Model::bind_draft_shared_weights() {
+    Impl& s = *p_;
+    if (!s.dflash_draft) return;
+    // Head for the draft. The dual-head path keeps a native Q6_K copy so the draft's multi-row
+    // MMVQ has something to chew on, but that kernel runs near HBM peak, so its runtime is just
+    // its weight bytes -- and the target's own Q4_K copy is ~280 MB against the Q6_K's ~417 MB.
+    // With a multi-row Q4_K MMVQ the draft prefers the smaller one. SPARKINFER_DFLASH_HEAD_Q4=0
+    // restores the Q6_K copy (A/B).
+    static const int head_q4 = []{ const char* e = getenv("SPARKINFER_DFLASH_HEAD_Q4");
+                                   return (e && e[0] == '0') ? 0 : 1; }();
+    const bool use_q4_head = head_q4 && lm_head_quant_type() == 12 && lm_head_weights();
+    const void* draft_head = use_q4_head ? lm_head_weights()
+                           : (s.dflash_lm_head ? s.dflash_lm_head : lm_head_weights());
+    const int draft_head_type = use_q4_head ? lm_head_quant_type()
+                              : (s.dflash_lm_head ? s.dflash_lm_head_type : lm_head_quant_type());
+    s.dflash_draft->set_shared_weights(embed_weights(), draft_head, draft_head_type,
+                             s.cfg.vocab, s.cfg.hidden);
+}
+
+bool Qwen35Model::spec_group_begin() {
+    Impl& s = *p_;
+    if (!s.dflash_draft) return false;
+    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+    bind_draft_shared_weights();
+    s.dflash_draft->ensure_quant();
+    return true;
+}
+
+void Qwen35Model::spec_group_end() {
+    Impl& s = *p_;
+    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+    s.vsamp.on = false;
+    dflash_release_verify_cache();
+    set_dflash_capture(false, {}, 0);
+    if (s.dflash_draft) {
+        s.dflash_draft->use_slot(0);
+        for (int i = 1; i < 8; ++i) s.dflash_draft->free_slot(i);
+    }
+    // Capture-on graphs may not be replayed by the decode that takes over.
+    invalidate_decode_graph();
+}
+
+int Qwen35Model::spec_group_depth() const {
+    const Impl& s = *p_;
+    if (!s.dflash_draft) return 0;
+    const DFlashDraftConfig& dc = s.dflash_draft->config();
+    const int B = dc.dflash2 ? dc.block_size - 1 : dc.block_size;
+    return std::max(1, std::min(B, 7));
+}
+
+int Qwen35Model::spec_group_join(const std::vector<int>& prompt, int max_new, int slot,
+                                 const SpecHooks& hooks, SpecResume* resume, int* proposals) {
+    Impl& s = *p_;
+    static const bool trace = [] {
+        const char* e = getenv("SPARKINFER_SPEC_GROUP_TRACE");
+        return e && e[0] == '1';
+    }();
+    auto fail = [&](const char* why) {
+        if (trace) fprintf(stderr, "[spec-group] join declined: %s\n", why);
+        return -1;
+    };
+    if (!s.dflash_draft || prompt.empty() || !proposals) return fail("no draft");
+    DFlashDraftModel& draft = *s.dflash_draft;
+    const DFlashDraftConfig& dc = draft.config();
+    const int depth = spec_group_depth();
+    const int n = (int)prompt.size();
+    const int prefill_from = std::max(0, hooks.prefill_start);
+    if (prefill_from >= n || (long)n + max_new + 2L * (depth + 1) > dc.max_seq) return fail("too long");
+    std::unique_lock<std::recursive_mutex> device_lock(s.device_mu);
+    const auto t_join0 = std::chrono::steady_clock::now();
+    auto ms_at = [&] {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_join0).count();
+    };
+    double t_setup = 0, t_prefill = 0, t_seed = 0;
+    // The slot holds what this request can reach (the bound checked above), not the draft's whole
+    // context: a group of four at 16K would otherwise borrow ~1.5 GB.
+    if (!draft.use_slot(slot, n + max_new + 2 * (depth + 1))) return fail("draft slot");
+    int capture_start = std::max(0, n >= 12288 ? n - 4096 : 0);
+    capture_start = std::max(capture_start, prefill_from);
+    // Hidden rows for a verify of every member's block (kQwen35MaxPackedRows), and this prompt's
+    // context rows for its first draft block.
+    set_dflash_capture(true, dc.target_layer_ids, kQwen35MaxPackedRows, capture_start,
+                       std::min(s.cfg.max_seq, n + max_new + depth + 1));
+    if (!dflash_context_buffer() || !dflash_hidden_buffer()) return fail("capture buffers");
+    const uint64_t sid = hooks.seq_id;
+    invalidate_decode_graph();
+    if (!s.kv->allocate(sid, session_token_budget(prompt.size(), max_new + depth + 1, s.cfg.max_seq)))
+        return fail("kv allocate");
+    activate_session(sid);
+    s.final_seqlen_hint = -1;
+    if (trace) { cudaDeviceSynchronize(); t_setup = ms_at(); }
+    // The same prefill dflash_generate runs (see there): batched from zero or resumed past it, the
+    // token loop for what a pass leaves, and the caller's checkpoints one pass or per segment.
+    auto prefill_range = [&](int a, int b) -> int {
+        int r = -1, done = a;
+        if (a == 0 && batched_prefill_windowed_enabled(s.gguf, s.cfg, b, s.kv)) {
+            int d = 0;
+            r = prefill_batched_chunked(prompt.data(), b, false, &d);
+            done = d;
+        } else if (a > 0 && batched_prefill_windowed_enabled(s.gguf, s.cfg, b - a, s.kv)) {
+            int d = 0;
+            r = prefill_batched_resume(prompt.data(), a, b, false, &d);
+            done = a + d;
+        }
+        if (r < 0)
+            for (int i = done; i < b; i++) {
+                set_dflash_capture_row(0);
+                const bool sample = (i + 1 == b);
+                const int t = forward_token(prompt[i], i, sample);
+                dflash_stash_capture(i);
+                if (sample) r = t;
+            }
+        return r;
+    };
+    int next = -1;
+    bool ckpts_taken = false;
+    if (hooks.n_ckpts > 0 && hooks.ckpts && hooks.snaps) {
+        int done = prefill_from;
+        next = ingest_prompt_checkpointed(prompt.data(), prefill_from, n, hooks.ckpts, hooks.n_ckpts,
+                                          hooks.snaps, &done, false);
+        if (next >= 0 && done == n) {
+            ckpts_taken = true;
+        } else {
+            int pos = prefill_from;
+            ckpts_taken = true;
+            for (int i = 0; i < hooks.n_ckpts; ++i) {
+                const int ck = hooks.ckpts[i];
+                if (prefill_range(pos, ck) < 0 || !snapshot_recurrent_state(sid, hooks.snaps[i]))
+                    ckpts_taken = false;
+                pos = ck;
+            }
+            next = prefill_range(pos, n);
+        }
+    } else {
+        next = prefill_range(prefill_from, n);
+    }
+    if (trace) t_prefill = ms_at();
+    if (next >= 0 && next < s.cfg.vocab && hooks.temperature > 0.f)
+        next = sample_seed_token(hooks.temperature, hooks.seed, 0, hooks.top_k, hooks.top_p);
+    if (next < 0 || next >= s.cfg.vocab) {
+        if (resume && prefill_from > 0) resume->failed = true;
+        return fail("prefill");
+    }
+    if (resume) {
+        // Prefilled: from here a failure still leaves the prompt consistent, and the caller
+        // decodes it from `position` with `next_token` instead of prefilling it again.
+        resume->engaged = true;
+        resume->position = n;
+        resume->next_token = next;
+        resume->ckpts_taken = ckpts_taken;
+    }
+    // The seed is final: hand it over before the draft reads the prompt's context. A caller that
+    // stops here (EOS, its limit) needs no draft block.
+    if (trace) t_seed = ms_at();
+    // Not under the device lock: the caller may finish the request here, which takes the engine's
+    // lock, and admission takes that one before this (dflash_generate releases it the same way).
+    if (hooks.on_tokens) {
+        device_lock.unlock();
+        const bool go = hooks.on_tokens(&next, 1);
+        device_lock.lock();
+        if (!go) {
+            if (resume) resume->finished = true;
+            return next;
+        }
+    }
+    // The first draft block, over the prompt's captured context.
+    std::vector<int> block((size_t)depth + 1, dc.mask_token_id), ids((size_t)depth + 2, -1);
+    block[0] = next;
+    draft.reset();
+    draft.set_sampling(hooks.temperature, hooks.seed, 1ull, hooks.top_k, hooks.top_p);
+    if (!draft.forward_block(dflash_context_buffer(), n, block.data(), n, ids.data(), nullptr, depth,
+                             nullptr, s.dflash_ctx_start))
+        return fail("first draft block");
+    for (int i = 0; i < depth; ++i) proposals[i] = ids[(size_t)i + 1];
+    if (trace)
+        fprintf(stderr, "[spec-group] join %d tokens: setup %.1f, prefill %.1f, seed %.1f, draft %.1f ms\n", n,
+                t_setup, t_prefill - t_setup, t_seed - t_prefill, ms_at() - t_seed);
+    return next;
+}
+
+bool Qwen35Model::spec_group_draft(int slot, const void* target_hidden, int th_len, int seed, int pos,
+                                   float temperature, unsigned long long seed_rng,
+                                   unsigned long long step0, int top_k, float top_p, int* proposals) {
+    Impl& s = *p_;
+    if (!s.dflash_draft || !proposals) return false;
+    DFlashDraftModel& draft = *s.dflash_draft;
+    const int depth = spec_group_depth();
+    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+    if (!draft.use_slot(slot)) return false;
+    std::vector<int> block((size_t)depth + 1, draft.config().mask_token_id), ids((size_t)depth + 2, -1);
+    block[0] = seed;
+    draft.set_sampling(temperature, seed_rng, step0, top_k, top_p);
+    if (!draft.forward_block(target_hidden, th_len, block.data(), pos, ids.data(), nullptr, depth,
+                             nullptr, 0))
+        return false;
+    for (int i = 0; i < depth; ++i) proposals[i] = ids[(size_t)i + 1];
+    return true;
+}
+
+bool Qwen35Model::spec_group_verify(int n, const uint64_t* seq_ids, const int* const* blocks,
+                                    const int* lens, const int* start_pos,
+                                    const PackedSampling* sampling, int* out_ids, int* keep) {
+    Impl& s = *p_;
+    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+    if (n == 1) {
+        // One member: the single-sequence verify, which is lossless against ordinary decode as
+        // dflash_generate's is. That takes the KV split count ordinary decode uses at each row's
+        // position (adaptive_nsplits_for(p + 1)); a different count flips argmax near-ties on long
+        // contexts. So the count is set for the first row, and the block is cut where a row would
+        // reach the next tier -- the next step starts in that tier.
+        activate_session(seq_ids[0]);
+        int len = lens[0];
+        if (s.adaptive_splits) {
+            const int want = adaptive_nsplits_for(start_pos[0] + 1);
+            while (len > 1 && adaptive_nsplits_for(start_pos[0] + len) != want) --len;
+            if (want != s.n_splits) {
+                s.n_splits = want;
+                invalidate_decode_graph();
+            }
+        }
+        const bool sampled = sampling && sampling->temperature[0] > 0.f;
+        s.vsamp.on = sampled;
+        if (sampled) {
+            s.vsamp.temp = sampling->temperature[0];
+            s.vsamp.seed = sampling->seed[0];
+            s.vsamp.top_k = sampling->top_k[0];
+            s.vsamp.top_p = sampling->top_p[0];
+            s.vsamp.step0 = sampling->step[0];
+        }
+        const bool ok = batched_forward(blocks[0], len, start_pos[0], false, out_ids,
+                                        dflash_hidden_buffer());
+        s.vsamp.on = false;
+        if (!ok) return false;
+        int k = 1;
+        while (k < len && blocks[0][k] == out_ids[k - 1]) ++k;
+        keep[0] = k;
+        return true;
+    }
+    return verify_grouped(n, seq_ids, blocks, lens, start_pos, sampling, out_ids, keep,
+                          dflash_hidden_buffer());
+}
+
 bool Qwen35Model::batched_forward(const int* token_ids, int n, int start_pos, bool /*resume_gdn*/,
                                   int* out_argmax, const void* dflash_capture_dst) {
     Impl& s = *p_;
@@ -6178,20 +6538,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         return out;
     }
 
-    // Head for the draft. The dual-head path keeps a native Q6_K copy so the draft's multi-row
-    // MMVQ has something to chew on, but that kernel runs near HBM peak, so its runtime is just
-    // its weight bytes -- and the target's own Q4_K copy is ~280 MB against the Q6_K's ~417 MB.
-    // With a multi-row Q4_K MMVQ the draft prefers the smaller one. SPARKINFER_DFLASH_HEAD_Q4=0
-    // restores the Q6_K copy (A/B).
-    static const int head_q4 = []{ const char* e = getenv("SPARKINFER_DFLASH_HEAD_Q4");
-                                   return (e && e[0] == '0') ? 0 : 1; }();
-    const bool use_q4_head = head_q4 && lm_head_quant_type() == 12 && lm_head_weights();
-    const void* draft_head = use_q4_head ? lm_head_weights()
-                           : (s.dflash_lm_head ? s.dflash_lm_head : lm_head_weights());
-    const int draft_head_type = use_q4_head ? lm_head_quant_type()
-                              : (s.dflash_lm_head ? s.dflash_lm_head_type : lm_head_quant_type());
-    draft.set_shared_weights(embed_weights(), draft_head, draft_head_type,
-                             s.cfg.vocab, s.cfg.hidden);
+    bind_draft_shared_weights();
     // Build the draft's quantized weights here, before prefill and well before the decode clock,
     // so this generation pays exactly what it did when load() built them eagerly. The point of
     // deferring them is the branch above: a generation that takes the autoregressive path returns

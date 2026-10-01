@@ -299,6 +299,10 @@ private:
     void finish_job_impl(Job& j);
     // Runs job speculatively until it finishes or another request arrives; see enable_speculative.
     void run_speculative(Job& job);
+    // Concurrent speculation (SPARKINFER_SPEC_GROUP, default 4): up to that many live requests speculate
+    // together, one verify pass for all of them (Qwen35Model::spec_group_*). Returns when no member
+    // is left, or hands every member to ordinary decode when a request it cannot take arrives.
+    void run_spec_group();
     static bool spec_eligible(const Request& r);
 
     Qwen35Model* model_;

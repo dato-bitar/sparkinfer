@@ -221,6 +221,21 @@ struct Qwen35PrefillCtx {
     // rejection) can tell "worth retrying" from "give up now". Null is fine; nothing is recorded.
     bool*                scratch_oom_out  = nullptr;
 
+    // GROUPED SPECULATIVE VERIFY (Qwen35Model::verify_grouped). group_n > 0 makes
+    // dflash_verify_short_run's N rows group_n sequences' verify blocks laid end to end: group g is
+    // rows [group_off[g], group_off[g] + group_len[g]), consecutive positions of its own session.
+    // Attention takes the per-row tables and positions packed decode takes (packed_rows /
+    // packed_rows_win / packed_pos must be set for every row); the GDN conv and scan run per group
+    // against group_lin_conv[g] / group_lin_state[g] without touching them, and each group's
+    // accepted prefix is then committed into its own state, its length written to group_keep[g].
+    // HOST arrays of group_n entries. Run with verify_eager (no graph cache).
+    int                  group_n          = 0;
+    const int*           group_off        = nullptr;
+    const int*           group_len        = nullptr;
+    float* const*        group_lin_state  = nullptr;
+    void* const*         group_lin_conv   = nullptr;
+    int*                 group_keep       = nullptr;
+
     // MIXED STEP (Qwen35Model::mixed_step). mix_n > 0 puts mix_n packed DECODE rows at rows
     // [0, mix_n) of prefill_batched_run's pass, ahead of the prompt chunk it was called for, which
     // then occupies rows [mix_n, n) at positions pos0.. of seq_id. Everything row-wise -- the

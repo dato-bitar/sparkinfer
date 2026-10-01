@@ -7,6 +7,25 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Added
 
+- **Concurrent requests speculate together** (`SPARKINFER_SPEC_GROUP`, default 4): aggregate
+  decode on real prompts with DFlash2 at T=0.7, c1/c2/c4: 177/178/319 -> 208/349/485 tok/s, on
+  Qwen3.8-27B (vLLM 0.30 with the same draft: 191/276/341); c6 and c8 unchanged.
+  - **Before:** speculation ran only for a request that was alone, and stopped as soon as a
+    second one arrived.
+  - **Now:** up to four fresh prompts form a group. Each drafts its own block from its own draft
+    state (`DFlashDraftModel::use_slot`), and one forward verifies every block
+    (`Qwen35Model::verify_grouped`): per-row attention tables as packed decode has, the compact GDN
+    scan and an accepted-prefix commit per sequence, and the block-scaled GEMMs a wide pass takes
+    (4 x 8 rows: 16.6 ms against 56 on the row kernels). A new prompt joins between steps. One
+    the group cannot take, or a fifth, hands every member to ordinary decode.
+  - **Single requests:** they now take the group path too: spec_bench T=0/0.7, DFlash2
+    207/193 -> 227/227 tok/s, DSpark 174/170 -> 187/175. The verify uses the KV split count
+    ordinary decode uses at each position, and a block stops at the next split tier.
+  - **Tested:** `grouped_verify_check` (two sessions verified together match each verified
+    alone, bit for bit, with `SPARKINFER_GROUPED_WIDE=0`); every single-request completion is
+    identical to the same launch with speculation off, at T=0, 0.7 and 1.0 and over 4-turn
+    ~7K-token cached conversations, with both drafts.
+
 - **Mixed prefill + decode steps, opt-in** (`SPARKINFER_MIXED_CHUNK=<tokens>`): a latency mode.
   At 32 concurrent chats, TTFT p50 1,240 -> 332 ms for 1,113 -> 948 tok/s, on Qwen3.8-27B.
   - **What it does:** while requests decode and a prompt waits, the decode step carries the next
