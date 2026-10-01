@@ -3984,6 +3984,27 @@ double Qwen35Model::bench_ttft(const std::vector<int>& prompt) {
 // Give the NVFP4 LM-head operand back. It exists only to serve a packed decode wide enough to
 // want a GEMM, and it is the one piece of weight residency in this model that a run can decide it
 // does not need.
+// Bring an offloaded draft back, but only into room it leaves room beside: right after a busy
+// stretch, or another thread's out-of-memory offload, the device is still full, and a draft restored
+// there -- then pinned for a whole group -- leaves the group's prefills and every new session no
+// arena (AIPerf 8K prompts at c16 after a chat cell: 0.37x). The join's own room check covers what
+// a join needs; this keeps SPARKINFER_DRAFT_RESTORE_HEADROOM_MB beside the draft itself. False,
+// still offloaded, when there is no room. Callers hold the device mutex.
+template <class Impl>
+static bool restore_draft_with_room(Impl& s) {
+    if (!s.dflash_draft) return false;
+    if (!s.dflash_draft->offloaded()) return true;
+    static const size_t headroom = [] {
+        const char* e = getenv("SPARKINFER_DRAFT_RESTORE_HEADROOM_MB");
+        const long long mb = e ? atoll(e) : 1024LL;
+        return (size_t)(mb < 0 ? 0 : mb) << 20;
+    }();
+    size_t fb = 0, tb = 0;
+    if (cudaMemGetInfo(&fb, &tb) != cudaSuccess || fb < s.dflash_draft->footprint_bytes() + headroom)
+        return false;
+    return s.dflash_draft->restore();
+}
+
 // A loaded draft is the one large allocation that can step aside at no cost to a request in
 // flight: it is not reading anything unless a speculative prefill (capture on) or group is
 // running, and it comes back at the same addresses (DFlashDraftModel::offload). On a 32 GB card a
@@ -5846,23 +5867,7 @@ size_t Qwen35Model::dflash_draft_offload() {
 bool Qwen35Model::dflash_draft_restore() {
     if (!p_->dflash_draft) return false;
     std::lock_guard<std::recursive_mutex> lock(device_mutex());
-    // Only into room it leaves room beside: right after a busy stretch the device is still full of
-    // that load's arenas and graphs, and a draft restored there leaves a speculative 8K prefill no
-    // arena -- it then runs the token loop for ~80 s with every other request behind it (AIPerf
-    // 8K prompts at c16 after a chat cell: 0.37x). spec_group_join checks the room a join needs;
-    // this keeps a margin beside the draft itself (SPARKINFER_DRAFT_RESTORE_HEADROOM_MB).
-    static const size_t headroom = [] {
-        const char* e = getenv("SPARKINFER_DRAFT_RESTORE_HEADROOM_MB");
-        const long long mb = e ? atoll(e) : 1024LL;
-        return (size_t)(mb < 0 ? 0 : mb) << 20;
-    }();
-    if (p_->dflash_draft->offloaded()) {
-        size_t fb = 0, tb = 0;
-        if (cudaMemGetInfo(&fb, &tb) != cudaSuccess ||
-            fb < p_->dflash_draft->footprint_bytes() + headroom)
-            return false;
-    }
-    return p_->dflash_draft->restore();
+    return restore_draft_with_room(*p_);
 }
 
 bool Qwen35Model::dflash_draft_offloaded() const {
@@ -6135,7 +6140,7 @@ bool Qwen35Model::spec_group_begin() {
     // The worker restored the draft before deciding to speculate, but a session opened on another
     // thread may have offloaded it again since (offload_idle_draft). Bring it back or decline, and
     // pin it for the group: nothing may take it off the device while a member can read it.
-    if (s.dflash_draft->offloaded() && !s.dflash_draft->restore()) return false;
+    if (!restore_draft_with_room(s)) return false;
     s.dflash_draft->pin(true);
     bind_draft_shared_weights();
     s.dflash_draft->ensure_quant();
@@ -6625,7 +6630,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // an empty result sends the request down the ordinary path.
     {
         std::lock_guard<std::recursive_mutex> dl(s.device_mu);
-        if (draft.offloaded() && !draft.restore()) return out;
+        if (!restore_draft_with_room(s)) return out;
         draft.pin(true);
     }
     struct Unpin {
