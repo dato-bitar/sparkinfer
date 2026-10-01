@@ -478,24 +478,33 @@ struct DFlashDraftModel::Impl {
     // struct's own.
     // `cap` is the positions the slot's buffers hold: cfg.max_seq for slot 0, what its request can
     // reach for the others (use_slot's `need`). forward_block checks against the current one.
+    // `base` is the absolute position of a windowed slot's row 0 (see win_rows): its caches hold
+    // positions [base, base + cap). Always 0 for a slot that holds every position.
     struct Slot {
         std::vector<bf16*> k, v;
         bf16* tp = nullptr;
-        int seq_len = 0, ctx_floor = 0, cap = 0;
+        int seq_len = 0, ctx_floor = 0, cap = 0, base = 0;
         bool live = false;
     };
     std::vector<Slot> slots;
     int cur_slot = 0;
     int cap = 0;
+    int base = 0;
+    // Window-sized slots. DFlash2 attends a sliding window on every layer, so no block reads a key
+    // older than pos0 - sliding_window + 1, and positions only grow: a slot need hold only the
+    // window, the block and room to slide, not all the context the request can reach. 0 = every
+    // slot holds its whole reach (DSpark, whose layers attend everything).
+    int win_rows = 0;
+    int slot_rows(int need) const { return win_rows > 0 ? std::min(need, win_rows) : need; }
     void park_current() {
         Slot& sl = slots[(size_t)cur_slot];
         sl.k = k_cache; sl.v = v_cache; sl.tp = target_proj;
-        sl.seq_len = seq_len; sl.ctx_floor = ctx_floor; sl.cap = cap;
+        sl.seq_len = seq_len; sl.ctx_floor = ctx_floor; sl.cap = cap; sl.base = base;
     }
     void load_slot(int i) {
         Slot& sl = slots[(size_t)i];
         k_cache = sl.k; v_cache = sl.v; target_proj = sl.tp;
-        seq_len = sl.seq_len; ctx_floor = sl.ctx_floor; cap = sl.cap;
+        seq_len = sl.seq_len; ctx_floor = sl.ctx_floor; cap = sl.cap; base = sl.base;
         cur_slot = i;
     }
     void free_slot_buffers(Slot& sl) {
@@ -661,8 +670,20 @@ struct DFlashDraftModel::Impl {
         const int max_ctx = cfg.max_seq;
         const int qdim = cfg.n_q_heads * cfg.head_dim;
         const int kvdim = cfg.n_kv_heads * cfg.head_dim;
+        // SPARKINFER_DFLASH_SLOT_WINDOW: rows a windowed slot holds (default two windows and two
+        // blocks: a compaction then copies at most a window, never onto itself); 0 keeps full slots.
+        {
+            bool all_sliding = cfg.dflash2 && cfg.sliding_window > 0 && !cfg.sliding_layers.empty();
+            for (bool sl : cfg.sliding_layers) all_sliding = all_sliding && sl;
+            const char* e = getenv("SPARKINFER_DFLASH_SLOT_WINDOW");
+            const int def = 2 * cfg.sliding_window + 2 * B;
+            const int want = e ? atoi(e) : def;
+            win_rows = (all_sliding && want > 0) ? std::max(want, cfg.sliding_window + 2 * B) : 0;
+            if (win_rows >= max_ctx) win_rows = 0;
+        }
+        const int rows0 = slot_rows(max_ctx);
         noise = alloc<bf16>((size_t)B * H);
-        target_proj = alloc<bf16>((size_t)max_ctx * H);
+        target_proj = alloc<bf16>((size_t)rows0 * H);
         x = alloc<bf16>((size_t)B * H);
         xn = alloc<bf16>((size_t)B * H);
         h = alloc<bf16>((size_t)B * H);
@@ -725,11 +746,12 @@ struct DFlashDraftModel::Impl {
         k_cache.resize(cfg.n_layers);
         v_cache.resize(cfg.n_layers);
         for (int L = 0; L < cfg.n_layers; L++) {
-            k_cache[L] = alloc<bf16>((size_t)cfg.max_seq * kvdim);
-            v_cache[L] = alloc<bf16>((size_t)cfg.max_seq * kvdim);
+            k_cache[L] = alloc<bf16>((size_t)rows0 * kvdim);
+            v_cache[L] = alloc<bf16>((size_t)rows0 * kvdim);
         }
         seq_len = 0;
-        cap = cfg.max_seq;
+        base = 0;
+        cap = rows0;
         slots.assign(1, Slot{});
         slots[0].live = true;
         cur_slot = 0;
@@ -901,14 +923,14 @@ void DFlashDraftModel::set_shared_weights(const void* embed, const void* lm_head
     }
 }
 
-void DFlashDraftModel::reset() { p_->seq_len = 0; p_->ctx_floor = 0; }
+void DFlashDraftModel::reset() { p_->seq_len = 0; p_->ctx_floor = 0; p_->base = 0; }
 
 bool DFlashDraftModel::use_slot(int i, int need) {
     Impl& s = *p_;
     if (i < 0 || s.slots.empty()) return false;
     // need <= 0: a live slot as it is, a new one at max_seq.
     const bool any = need <= 0;
-    need = (any || need > s.cfg.max_seq) ? s.cfg.max_seq : need;
+    need = s.slot_rows((any || need > s.cfg.max_seq) ? s.cfg.max_seq : need);
     if (i == s.cur_slot && (any || s.cap >= need)) return true;
     s.park_current();
     if ((size_t)i >= s.slots.size()) s.slots.resize((size_t)i + 1);
@@ -982,7 +1004,11 @@ void DFlashDraftModel::crop(int keep) {
     if (keep < 0) keep = 0;
     if (keep > p_->seq_len) keep = p_->seq_len;
     p_->seq_len = keep;
+    // Below a windowed slot's row 0 nothing is held: start over rather than read rows that are gone.
+    if (keep < p_->base) { p_->seq_len = 0; p_->base = 0; }
 }
+
+int DFlashDraftModel::slot_rows(int need) const { return p_->slot_rows(need); }
 
 int DFlashDraftModel::seq_len() const { return p_->seq_len; }
 
@@ -1427,7 +1453,8 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     if (s.arena_on && s.arena.offloaded()) return false;   // never read unmapped memory
     s.ensure_quant();
     if (!s.fc || !s.embed || !s.lm_head || !noise_ids || !out_argmax) return false;
-    if (ctx_len < 0 || ctx_len > s.cap) return false;
+    // A windowed slot's target_proj holds only the rows the window keeps (checked at the fc below).
+    if (ctx_len < 0 || (s.win_rows == 0 && ctx_len > s.cap)) return false;
     cudaStream_t st = stream ? stream : s.stream;
     const auto& c = s.cfg;
     const int H = c.hidden;
@@ -1536,9 +1563,34 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     auto q81 = [&](const bf16* src, int kk) { return q81n(src, kk, BW); };
     const float scale = 1.f / sqrtf((float)d);
     const int past = s.seq_len;
-    if (past == 0) s.ctx_floor = std::max(0, target_hidden_start);
+    if (past == 0) { s.ctx_floor = std::max(0, target_hidden_start); s.base = 0; }
+    // A windowed slot slides: when this block would run past its rows, every key older than the
+    // window this block reads (pos0 - sliding_window + 1: the earliest query is pos0, keys only
+    // grow) is dropped, the rest moved to row 0 and `base` advanced. Keys are stored rotated at
+    // their absolute positions, so moving them changes nothing; the move never overlaps (at most a
+    // window kept, at least a window dropped). The first block of a long prompt just starts at the
+    // window. Positions under `base` are then never produced, as the floor's are not.
+    if (s.win_rows > 0 && past + ctx_len + BW - s.base > s.cap) {
+        const int nb = std::max(std::max(s.base, s.ctx_floor), pos0 - c.sliding_window + 1);
+        if (nb > s.base) {
+            const int keep = past - nb;
+            if (keep > 0) {
+                const int kvd = c.n_kv_heads * c.head_dim;
+                const size_t bytes = (size_t)keep * kvd * sizeof(bf16);
+                const size_t from = (size_t)(nb - s.base) * kvd;
+                for (int L = 0; L < c.n_layers; ++L) {
+                    cu(cudaMemcpyAsync(s.k_cache[L], s.k_cache[L] + from, bytes, cudaMemcpyDeviceToDevice, st),
+                       "slot slide k");
+                    cu(cudaMemcpyAsync(s.v_cache[L], s.v_cache[L] + from, bytes, cudaMemcpyDeviceToDevice, st),
+                       "slot slide v");
+                }
+            }
+            s.base = nb;
+        }
+    }
+    const int eff_floor = s.win_rows > 0 ? std::max(s.ctx_floor, s.base) : s.ctx_floor;
     // How many of this block's context rows sit below the floor: never produced, never attended.
-    const int floor_skip = std::max(0, std::min(ctx_len, s.ctx_floor - past));
+    const int floor_skip = std::max(0, std::min(ctx_len, eff_floor - past));
     // The fixed-size (block_size) projections below can use a batched-GEMV kernel that reads
     // each weight row from DRAM once instead of once per token (see dflash_kernels.cu). It's
     // instantiated for the active width tiers below; an unsupported width falls back to the
@@ -1712,9 +1764,12 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                                    return !(e && e[0] == '0'); }();
     if (fc_rows > 0) {
         if (fc_skip < target_hidden_start) return false;
+        // A windowed slot's target_proj starts at the first row projected: a long prompt's first
+        // block keeps ~a window of its rows, not all of them.
+        if (s.win_rows > 0 && fc_rows > s.cap) return false;
         const bf16* th = (const bf16*)target_hidden +
                          (size_t)(fc_skip - target_hidden_start) * n_cap * H;
-        bf16* tp = s.target_proj + (size_t)fc_skip * H;
+        bf16* tp = s.target_proj + (size_t)(s.win_rows > 0 ? 0 : fc_skip) * H;
         const bool fc_q4 = kCtxQ4 && s.q8_fc.q4 && fc_rows >= 1 && fc_rows <= 8;
         if (ctx_gemm) {
             kernels::launch_prefill_gemm(th, s.fc, tp, fc_rows, H, n_cap * H, st);
@@ -1757,8 +1812,8 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     // the same size). Project straight into the cache slice instead; the RoPE then runs in place
     // there. Same values written to the same addresses in the same order.
     const int new_len_all = ctx_len + BW;
-    if (past + new_len_all > s.cap) {
-        fprintf(stderr, "[dflash] KV overflow past=%d new=%d max=%d\n", past, new_len_all, s.cap);
+    if (past + new_len_all - s.base > s.cap) {
+        fprintf(stderr, "[dflash] KV overflow past=%d new=%d base=%d max=%d\n", past, new_len_all, s.base, s.cap);
         return false;
     }
     // Attention geometry for this block, hoisted: the context ingestion below needs the layer's
@@ -1770,8 +1825,10 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
         int window_of_layer = (L < (int)c.sliding_layers.size() && c.sliding_layers[L])
                                         ? c.sliding_window : 0;
         if (window_of_layer == 0 && kFullWindow > 0) window_of_layer = kFullWindow;
-        bf16* const kdst = s.k_cache[L] + (size_t)past * kvdim;
-        bf16* const vdst = s.v_cache[L] + (size_t)past * kvdim;
+        // Position p lives at row p - base (base 0 unless a windowed slot has slid). After a long
+        // prompt's first block starts at the window, past < base: the rows below it are never written.
+        bf16* const kdst = s.k_cache[L] + ((long)past - s.base) * kvdim;
+        bf16* const vdst = s.v_cache[L] + ((long)past - s.base) * kvdim;
         if (L == 0)
             dflash_kernels::launch_rms(s.x, w.input_norm, s.xn, BW, H, c.rms_eps, st);
         // DFlash2: the attention conv's "prepare" (z-lab GroupedDynamicCausalConv). A per-group
@@ -1837,7 +1894,8 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
             : 0;
         const int ctx_skip = std::max(floor_skip, ctx_kv_lo > past ? std::min(ctx_kv_lo - past, ctx_len) : 0);
         const int ctx_rows = ctx_len - ctx_skip;
-        const bf16* const ctx_src = s.target_proj + (size_t)ctx_skip * H;
+        if (s.win_rows > 0 && ctx_skip < fc_skip) return false;   // rows the fc did not project
+        const bf16* const ctx_src = s.target_proj + (size_t)(ctx_skip - (s.win_rows > 0 ? fc_skip : 0)) * H;
         bf16* const kdst_ctx = kdst + (size_t)ctx_skip * kvdim;
         bf16* const vdst_ctx = vdst + (size_t)ctx_skip * kvdim;
         // The steady-state context rows went through the BF16 wk/wv while every other projection
@@ -1959,9 +2017,13 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
                                                  c.sliding_layers[L]));
         // Keys start at the context floor (0 unless a prefix-cache hit left the start unprojected):
         // the cache slice from there, with its first key at that position.
-        const int kv0 = std::min(s.ctx_floor, kv_len);
-        dflash_kernels::launch_attn_gqa(s.q, s.k_cache[L] + (size_t)kv0 * kvdim,
-                                        s.v_cache[L] + (size_t)kv0 * kvdim, s.attn,
+        // Once a windowed slot has slid, the keys below `base` are gone, so the span starts at the
+        // window itself: the range the kernel trimmed to before (it does so past ~2.2K keys, and
+        // a slot slides only past its ~4K rows), so the same keys and the same splits.
+        const int kv0 = s.base > 0 ? std::max(s.ctx_floor, pos0 - window + 1)
+                                   : std::min(s.ctx_floor, kv_len);
+        dflash_kernels::launch_attn_gqa(s.q, s.k_cache[L] + ((long)kv0 - s.base) * kvdim,
+                                        s.v_cache[L] + ((long)kv0 - s.base) * kvdim, s.attn,
                                         BW, kv_len - kv0, c.n_q_heads, c.n_kv_heads, d,
                                         q_pos0, /*k_pos0_cache=*/kv0, window, causal, scale, st,
                                         s.fa_m, s.fa_l, s.fa_acc);
@@ -2393,7 +2455,7 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
             };
             const size_t V_ = (size_t)V;
             put("target_hidden", target_hidden, (size_t)ctx_len * n_cap * H * sizeof(bf16), true);
-            put("target_proj",   s.target_proj, (size_t)ctx_len * H * sizeof(bf16), true);
+            put("target_proj",   s.target_proj, (size_t)(s.win_rows > 0 ? fc_rows : ctx_len) * H * sizeof(bf16), true);
             put("xn_last",       s.xn,          (size_t)BW * H * sizeof(bf16), true);
             // The block's token embeddings -- the draft borrows the TARGET's embed table, so this
             // is the only way to get layer 0's input without re-deriving it from a 20 GB sharded
@@ -2480,7 +2542,8 @@ bool DFlashDraftModel::forward_blocks(const BlockJob* jobs, int n_jobs, int prop
             return false;
         const Impl::Slot& sl = s.slots[(size_t)jb.slot];
         const int past = sl.seq_len;
-        if (past + jb.ctx_len != jb.pos0 || sl.ctx_floor > past || past + jb.ctx_len + BW > sl.cap)
+        // A slot that has to slide first goes through forward_block, which slides it.
+        if (past + jb.ctx_len != jb.pos0 || sl.ctx_floor > past || past + jb.ctx_len + BW - sl.base > sl.cap)
             return false;
         for (int L = 0; L < c.n_layers; ++L) {
             const int window = (L < (int)c.sliding_layers.size() && c.sliding_layers[L]) ? c.sliding_window : 0;
@@ -2619,8 +2682,8 @@ bool DFlashDraftModel::forward_blocks(const BlockJob* jobs, int n_jobs, int prop
             const BlockJob& jb = jobs[j];
             const Impl::Slot& sl = s.slots[(size_t)jb.slot];
             const int past = sl.seq_len, cl = jb.ctx_len;
-            bf16* kd = sl.k[L] + (size_t)past * kvdim;
-            bf16* vd = sl.v[L] + (size_t)past * kvdim;
+            bf16* kd = sl.k[L] + ((long)past - sl.base) * kvdim;
+            bf16* vd = sl.v[L] + ((long)past - sl.base) * kvdim;
             const bf16* ck = b.ctx_k + (size_t)coff[(size_t)j] * 2 * kvdim;
             const bf16* bq = b.q + (size_t)j * BW * nq;
             const size_t kvb = (size_t)kvdim * sizeof(bf16);
@@ -2644,10 +2707,12 @@ bool DFlashDraftModel::forward_blocks(const BlockJob* jobs, int n_jobs, int prop
                                                      s.yarn_att_scale);
             }
             const int kv_len = past + cl + BW;
-            const int kv0 = std::min(sl.ctx_floor, kv_len);
+            const int kv0 = sl.base > 0 ? std::max(sl.ctx_floor, jb.pos0 - window + 1)   // see forward_block
+                                        : std::min(sl.ctx_floor, kv_len);
             // q is read from attn's buffer and the output goes to conv_out (attn is overwritten
             // only after every job's attention, below).
-            dflash_kernels::launch_attn_gqa(qj, sl.k[L] + (size_t)kv0 * kvdim, sl.v[L] + (size_t)kv0 * kvdim,
+            dflash_kernels::launch_attn_gqa(qj, sl.k[L] + ((long)kv0 - sl.base) * kvdim,
+                                            sl.v[L] + ((long)kv0 - sl.base) * kvdim,
                                             b.conv_out + (size_t)j * BW * qdim, BW, kv_len - kv0,
                                             c.n_q_heads, c.n_kv_heads, d, jb.pos0, kv0, window, causal, scale,
                                             st, s.fa_m, s.fa_l, s.fa_acc);

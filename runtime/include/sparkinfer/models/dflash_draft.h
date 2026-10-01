@@ -84,6 +84,9 @@ public:
 
     // Crop draft KV to the first `keep` tokens (speculative accept boundary).
     void crop(int keep);
+    // Rows a slot needs to serve `need` positions: `need`, or less for a draft whose every layer
+    // attends a sliding window (its slots slide; see Impl::win_rows).
+    int slot_rows(int need) const;
 
     // Slots: independent per-generation draft state -- the KV cache, the projected target
     // context, the position and context floor -- sharing the weights and block scratch, one per

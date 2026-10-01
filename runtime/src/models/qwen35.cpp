@@ -6213,7 +6213,7 @@ int Qwen35Model::spec_group_join(const std::vector<int>& prompt, int max_new, in
             const int cap_from = std::max(prefill_from, n >= 12288 ? n - 4096 : 0);
             const size_t cap_rows = (size_t)std::max(0, std::min(s.cfg.max_seq, n + max_new + depth + 1) - cap_from);
             const size_t capture = cap_rows * dc.target_layer_ids.size() * (size_t)s.cfg.hidden * sizeof(bf16);
-            const size_t slot_bytes = (size_t)(n + max_new + 2 * (depth + 1)) *
+            const size_t slot_bytes = (size_t)draft.slot_rows(n + max_new + 2 * (depth + 1)) *
                 (2 * (size_t)dc.n_layers * dc.n_kv_heads * dc.head_dim + dc.hidden) * sizeof(bf16);
             const size_t verify = (size_t)320 << 20, margin = (size_t)256 << 20;
             // The capture buffer this join replaces is freed before the new one is allocated.
@@ -6226,7 +6226,8 @@ int Qwen35Model::spec_group_join(const std::vector<int>& prompt, int max_new, in
         }
     }
     // The slot holds what this request can reach (the bound checked above), not the draft's whole
-    // context: a group of four at 16K would otherwise borrow ~1.5 GB.
+    // context -- and for DFlash2, whose layers all attend a 2,048-token window, at most ~4K rows that
+    // slide (DFlashDraftModel::slot_rows): ~130 MB rather than ~0.5 GB for a request that can reach 16K.
     if (!draft.use_slot(slot, n + max_new + 2 * (depth + 1))) return fail("draft slot");
     int capture_start = std::max(0, n >= 12288 ? n - 4096 : 0);
     capture_start = std::max(capture_start, prefill_from);
