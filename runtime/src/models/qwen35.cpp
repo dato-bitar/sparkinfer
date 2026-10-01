@@ -6224,7 +6224,7 @@ int Qwen35Model::spec_group_join(const std::vector<int>& prompt, int max_new, in
             const size_t rows = (size_t)(n - prefill_from);
             const size_t arena = ((size_t)64 << 20) + std::min<size_t>(rows, 16384) * ((size_t)128 << 10);
             const int cap_from = std::max(prefill_from, n >= 12288 ? n - 4096 : 0);
-            const size_t cap_rows = (size_t)std::max(0, std::min(s.cfg.max_seq, reach + depth + 1) - cap_from);
+            const size_t cap_rows = (size_t)std::max(0, std::min(s.cfg.max_seq, n + depth + 1) - cap_from);
             const size_t capture = cap_rows * dc.target_layer_ids.size() * (size_t)s.cfg.hidden * sizeof(bf16);
             const size_t slot_bytes = (size_t)draft.slot_rows(reach + 2 * (depth + 1)) *
                 (2 * (size_t)dc.n_layers * dc.n_kv_heads * dc.head_dim + dc.hidden) * sizeof(bf16);
@@ -6247,7 +6247,7 @@ int Qwen35Model::spec_group_join(const std::vector<int>& prompt, int max_new, in
     // Hidden rows for a verify of every member's block (kQwen35MaxPackedRows), and this prompt's
     // context rows for its first draft block.
     set_dflash_capture(true, dc.target_layer_ids, kQwen35MaxPackedRows, capture_start,
-                       std::min(s.cfg.max_seq, reach + depth + 1));
+                       std::min(s.cfg.max_seq, n + depth + 1));   // prompt rows: verifies capture to the hidden buffer
     if (!dflash_context_buffer() || !dflash_hidden_buffer()) return fail("capture buffers");
     const uint64_t sid = hooks.seq_id;
     invalidate_decode_graph();
@@ -6372,7 +6372,7 @@ int Qwen35Model::spec_group_join_body(const std::vector<int>& prompt, int max_ne
     if (!draft.use_slot(slot, reach + 2 * (depth + 1))) return -1;
     const int capture_start = n >= 12288 ? n - 4096 : 0;
     set_dflash_capture(true, dc.target_layer_ids, kQwen35MaxPackedRows, capture_start,
-                       std::min(s.cfg.max_seq, reach + depth + 1));
+                       std::min(s.cfg.max_seq, n + depth + 1));   // prompt rows: verifies capture to the hidden buffer
     if (!dflash_context_buffer() || !dflash_hidden_buffer()) return -1;
     invalidate_decode_graph();
     if (!s.kv->allocate(hooks.seq_id, session_token_budget(prompt.size(), max_new + depth + 1, s.cfg.max_seq)))

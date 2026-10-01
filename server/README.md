@@ -74,7 +74,10 @@ leaves no device memory for the drafter, which is why this example and the conta
   without it.
 - **What speculates:** up to `SPARKINFER_SPEC_GROUP` (8) fresh requests at a time, greedy or
   sampled. A request speculates from its start up to the end of the drafter's context
-  (`SPARKINFER_DSPARK_MAX_CTX`, 16,384 positions), then decodes on as usual.
+  (`SPARKINFER_DSPARK_MAX_CTX`, 16,384 positions). One that reaches it ends speculation for its
+  group: every member decodes on as usual, and new requests speculate once they have finished.
+  With `SPARKINFER_SPEC_GROUP=1` a request whose prompt plus `max_tokens` exceeds that context does
+  not speculate at all.
 - **What does not:** requests with tools, `response_format` JSON schemas or other constraints,
   vision, penalties, logit bias, logprobs, forced tokens or a prefix session take the ordinary
   path, as do all requests while more are live than a group takes.

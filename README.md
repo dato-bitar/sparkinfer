@@ -31,9 +31,10 @@ needs ~3.8 GB of pinned host memory for the drafter to step off the device under
 - **Same tokens:** a request speculating alone gives the tokens it would without the drafter
   (greedy, or sampled with a seed). A group verifies with batch arithmetic, as packed decode does.
 - **What speculates:** a request, from its start up to the end of the drafter's 16,384-position
-  context, after which it decodes on as usual.
-- **What does not:** requests with tools, `response_format` JSON schemas, vision, penalties,
-  logit bias or logprobs take the ordinary path.
+  context. A request that reaches it ends speculation for its whole group: every member decodes on
+  as usual, and new requests speculate again once they have finished.
+- **What does not:** requests with tools, `response_format` (JSON), vision, penalties, logit bias
+  or logprobs take the ordinary path.
 - **Turning it off:** `-e SPEC_DRAFT=none` serves without a drafter. `serve-dspark` (appended
   after the image name) uses the
   [DSpark](https://huggingface.co/gittensor-model-hub/Qwen3.8-27B-DSpark-NVFP4) drafter instead.

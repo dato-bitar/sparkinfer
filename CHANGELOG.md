@@ -80,8 +80,10 @@ clients, which omit it by default, get whole answers again.
 - **A request speculates up to the end of the draft's context, then decodes on.** Speculation
   required prompt + `max_tokens` to fit the draft's 16,384 positions, so a request that left
   `max_tokens` to the server's cap (16,384 in the release container; the OpenAI SDK's default)
-  never speculated. A group member now speculates as far as the draft reaches and hands off there,
-  and the draft slot and capture buffer are sized to that reach rather than to `max_tokens`.
+  never speculated. A group now speculates until a member reaches the end of the draft's context,
+  then every member decodes on as usual. The draft slot is sized to that reach rather than to
+  `max_tokens`, and the capture buffer to the prompt (verifies capture elsewhere): ~51 MB rather
+  than ~838 MB for a 1K prompt. `SPARKINFER_SPEC_GROUP=1` keeps the old bound.
 
 - **A server with a draft loaded is as fast as one without at 16 and 32 concurrent requests, and
   up to 2.2x faster at 1-4** (Qwen3.8-27B NVFP4 + DFlash2, AIPerf, RTX 5090). Before, a loaded
