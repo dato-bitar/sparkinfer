@@ -680,6 +680,10 @@ struct DFlashDraftModel::Impl {
             const int want = e ? atoi(e) : def;
             win_rows = (all_sliding && want > 0) ? std::max(want, cfg.sliding_window + 2 * B) : 0;
             if (win_rows >= max_ctx) win_rows = 0;
+            if (win_rows > 0)
+                fprintf(stderr, "[dflash] draft slots slide: %d rows of the %d-position context "
+                                "(every layer attends a %d-token window)\n",
+                        win_rows, max_ctx, cfg.sliding_window);
         }
         const int rows0 = slot_rows(max_ctx);
         noise = alloc<bf16>((size_t)B * H);
