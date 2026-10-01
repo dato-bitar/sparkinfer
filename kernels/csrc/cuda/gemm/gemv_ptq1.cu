@@ -645,9 +645,11 @@ gemm_ptq1_dp4a_rows_kernel(const unsigned char* __restrict__ w, OutT* __restrict
 template <typename OutT, int BMAX>
 void launch_dp4a_rows_t(const unsigned char* w, OutT* y, int n_rows, int k, int batch, int slot,
                         cudaStream_t stream) {
-    constexpr int T = 256, KC = 256 / BMAX;
-    constexpr size_t smem = dp_xs_smem(BMAX * KC);
-    static const bool attr = [&] {
+    // static: under MSVC the captureless lambda below cannot read a local constexpr, and a
+    // captured one is no longer a constant expression it can use as a template argument.
+    static constexpr int T = 256, KC = 256 / BMAX;
+    static constexpr size_t smem = dp_xs_smem(BMAX * KC);
+    static const bool attr = [] {
         cudaFuncSetAttribute(gemm_ptq1_dp4a_rows_kernel<OutT, T, BMAX, KC>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
         return true;
