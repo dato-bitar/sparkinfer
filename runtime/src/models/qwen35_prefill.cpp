@@ -2629,7 +2629,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 // workspace slot; the launches, and so every row of every prompt, are unchanged.
                 // SPARKINFER_PACK_GDN_STREAMS=1 keeps them on one stream (A/B in one binary).
                 constexpr int kSegStreams = 3;
-                static const int seg_streams = [] {
+                static const int seg_streams = [&] {
                     const char* e = getenv("SPARKINFER_PACK_GDN_STREAMS");
                     const int v = e ? atoi(e) : kSegStreams;
                     return v < 1 ? 1 : v > kSegStreams ? kSegStreams : v;

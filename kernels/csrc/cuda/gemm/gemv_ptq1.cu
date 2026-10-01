@@ -647,7 +647,7 @@ void launch_dp4a_rows_t(const unsigned char* w, OutT* y, int n_rows, int k, int 
                         cudaStream_t stream) {
     constexpr int T = 256, KC = 256 / BMAX;
     constexpr size_t smem = dp_xs_smem(BMAX * KC);
-    static const bool attr = [] {
+    static const bool attr = [&] {
         cudaFuncSetAttribute(gemm_ptq1_dp4a_rows_kernel<OutT, T, BMAX, KC>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
         return true;

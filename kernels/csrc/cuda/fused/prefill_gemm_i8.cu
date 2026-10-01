@@ -198,7 +198,7 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_i8_kernel(
 
     // Registers straight to global: c0/c1 (and c2/c3) are adjacent columns, so each pair packs into
     // one 4B bf16x2 store. Dead on the split-K instantiation (it returned above).
-    if constexpr (!SPLITK)
+    if constexpr (!SPLITK) {
     #pragma unroll
     for (int i = 0; i < PF_MFRAG; i++) {
         #pragma unroll
@@ -238,6 +238,7 @@ __global__ __launch_bounds__(256, 2) void pf_gemm_i8_kernel(
                 *cp = v;
             }
         }
+    }
     }
 }
 // FULL-tile kernel with a 64x64 warp tile: the same 128x128 block, four warps instead of eight.

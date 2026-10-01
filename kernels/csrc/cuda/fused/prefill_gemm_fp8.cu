@@ -695,7 +695,7 @@ void launch_prefill_gemm_fp8(const void* A, const void* W,
         const bool mtail = (M % FP8_BM) != 0;
         if ((N % (2 * FP8_BN)) == 0 && (long)tm * (N / (2 * FP8_BN)) >= 4L * sms) {
             constexpr size_t smem = (size_t)FP8_W64_ST * (FP8_BM + 2 * FP8_BN) * FP8_BK;   // 72 KB
-            static const bool ok = [] {
+            static const bool ok = [&] {
                 return cudaFuncSetAttribute(pf_gemm_fp8_w64_kernel<4, 2, 4, false>,
                                             cudaFuncAttributeMaxDynamicSharedMemorySize,
                                             (int)smem) == cudaSuccess &&
