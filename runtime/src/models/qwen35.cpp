@@ -3984,15 +3984,12 @@ double Qwen35Model::bench_ttft(const std::vector<int>& prompt) {
 // Give the NVFP4 LM-head operand back. It exists only to serve a packed decode wide enough to
 // want a GEMM, and it is the one piece of weight residency in this model that a run can decide it
 // does not need.
-// Give the decode shadow's ternary copy back; decode then reads the folded weights, exactly as
-// with SPARKINFER_BONSAI_DECODE_SHADOW=0. The decode graphs have its pointers baked in, so they go
-// first and recapture on the next step. Returns whether anything was freed.
-template <class Impl>
 // A loaded draft is the one large allocation that can step aside at no cost to a request in
 // flight: it is not reading anything unless a speculative prefill (capture on) or group is
 // running, and it comes back at the same addresses (DFlashDraftModel::offload). On a 32 GB card a
 // burst of 16 8K-token prompts beside it had no room for its prefill arena, and the pass fell to
 // the token loop -- 38 tok/s against 167 without the draft.
+template <class Impl>
 static bool offload_idle_draft(Impl& s, int n, const char* what) {
     if (!s.dflash_draft || s.dflash_capture || s.dflash_draft->offloaded()) return false;
     cudaGetLastError();   // clear the failed allocation that brought us here
@@ -4003,6 +4000,10 @@ static bool offload_idle_draft(Impl& s, int n, const char* what) {
     return true;
 }
 
+// Give the decode shadow's ternary copy back; decode then reads the folded weights, exactly as
+// with SPARKINFER_BONSAI_DECODE_SHADOW=0. The decode graphs have its pointers baked in, so they go
+// first and recapture on the next step. Returns whether anything was freed.
+template <class Impl>
 static bool release_bonsai_shadow(Impl& s) {
     if (s.bonsai_dec_bufs.empty()) return false;
     cudaGetLastError();   // clear the failed cudaMalloc that brought us here
