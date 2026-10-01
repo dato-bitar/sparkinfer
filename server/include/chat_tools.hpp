@@ -157,7 +157,10 @@ bool parse_chat_request_json(const std::string& body, ChatRequest& request, std:
 struct RequestControls {
     bool stream = false;
     bool include_usage = false;
-    int max_tokens = 256;
+    // 0 = the request set neither max_tokens nor max_completion_tokens: the server generates until
+    // the model stops, up to its output cap (#1088). A non-zero default here made every such request
+    // look like it had asked for 256, and they were all cut off there.
+    int max_tokens = 0;
     std::vector<std::string> stop;
     // <= 0 (default) is plain greedy argmax, byte-identical to pre-sampling behavior.
     float temperature = 0.f;

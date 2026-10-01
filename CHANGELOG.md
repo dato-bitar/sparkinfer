@@ -5,6 +5,15 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Fixed
+
+- **A request without `max_tokens` is no longer cut off at 256 tokens.** #1088's fix made such a
+  request generate until the model stops, up to `SPARKINFER_MAX_OUTPUT_TOKENS` (16,384 in the
+  release container), but the parsed request still defaulted `max_tokens` to 256, so the server
+  took every request as having set it. Agents and OpenAI SDK clients that omit it (the default)
+  had every answer stopped at 256 tokens with `finish_reason: "length"`. `chat_tools_test` now
+  checks that an omitted `max_tokens` reads as unset.
+
 ### Speculative decoding
 
 - **A server with a draft loaded is as fast as one without at 16 and 32 concurrent requests, and

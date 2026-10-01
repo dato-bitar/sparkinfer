@@ -1376,6 +1376,22 @@ bool test_request_controls_sampling_set_flags() {
     return true;
 }
 
+bool test_request_controls_max_tokens_unset() {
+    // #1088: without max_tokens (or max_completion_tokens) the request must read as unset, so the
+    // server generates to its output cap instead of a hidden 256-token default.
+    RequestControls omitted;
+    std::string err;
+    CHECK(parse_request_controls(R"({})", omitted, err));
+    CHECK(omitted.max_tokens == 0);
+    RequestControls set;
+    CHECK(parse_request_controls(R"({"max_tokens":300})", set, err));
+    CHECK(set.max_tokens == 300);
+    RequestControls completion;
+    CHECK(parse_request_controls(R"({"max_completion_tokens":40})", completion, err));
+    CHECK(completion.max_tokens == 40);
+    return true;
+}
+
 bool test_request_controls_temperature_validation() {
     RequestControls controls;
     std::string err;
@@ -2137,6 +2153,7 @@ int main() {
     if (!test_validate_response_format_json_schema()) return 1;
     if (!test_request_controls_temperature_validation()) return 1;
     if (!test_request_controls_sampling_set_flags()) return 1;
+    if (!test_request_controls_max_tokens_unset()) return 1;
     if (!test_truncated_tool_turn_keeps_reasoning()) return 1;
     if (!test_context_length_exceeded_error()) return 1;
     if (!test_api_error_json_shape()) return 1;
