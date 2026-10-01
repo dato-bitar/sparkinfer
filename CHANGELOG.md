@@ -5,6 +5,42 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Speculative decoding
+
+- **A server with a draft loaded is as fast as one without at 16 and 32 concurrent requests, and
+  up to 2.2x faster at 1-4** (Qwen3.8-27B NVFP4 + DFlash2, AIPerf, RTX 5090). Before, a loaded
+  draft cost 0.23-0.66x at 16-32 requests, which is why it was not on by default.
+  - **Why it lost:** the KV pool is sized from `--ctx` alone, and the draft's ~3 GB came out of
+    the headroom concurrent serving needs for its prefill arenas and decode graphs. Prefills
+    found no arena and ran the token loop (~80 s for an 8K prompt) while every request waited.
+  - **The draft steps off the device while it cannot be used.** Its buffers live in a CUDA
+    virtual-memory arena (`VmmArena`). After live requests have stayed above the speculation
+    group size for `SPARKINFER_DRAFT_OFFLOAD_MS` (1 s), or at once when a prefill or a new session
+    runs out of memory beside it, everything goes to pinned host memory (~0.12 s). It comes back
+    at the same addresses, so every pointer it holds stays valid, when a group can form and the
+    device has room for it (`SPARKINFER_DRAFT_RESTORE_HEADROOM_MB`, 1 GB beyond the draft). One
+    round trip at load pins the host buffer and proves it works.
+  - **A join checks its room before it starts:** prefill arena, captured context, draft slot
+    and verify. Without room it prefills on the ordinary path instead of reaching the token loop
+    mid-join (`SPARKINFER_SPEC_JOIN_ROOM=0` skips the check).
+  - **A group ends at once when the requests waiting cannot all join.** Each join only asked
+    whether one more fitted, so 15 prompts arriving behind one member joined one at a time,
+    each with its own speculative prefill, until the group was full and ended anyway.
+  - **The draft quantizes at load,** so DFlash2's 2.7 GB bf16 MLP is never held until a first
+    speculative request. A 155 MB snapshot nothing reads is allocated only on first use.
+  - **Measured** (AIPerf, one server per run, output tok/s, draft loaded vs no draft):
+
+    | cell | c1 | c4 | c16 | c32 |
+    |---|---:|---:|---:|---:|
+    | chat 1024/256 | 208.1 / 94.7 | 513.2 / 308.6 | 841.2 / 858.8 | 1,246.1 / 1,069.7 |
+    | long answer 128/1024 | 216.5 / 99.8 | 725.1 / 352.1 | 1,234.6 / 1,239.3 | 1,997.7 / 2,001.9 |
+    | long prompt 8192/128 | 94.8 / 66.8 | 147.9 / 127.5 | 166.3 / 165.0 | 166.7 / 165.6 |
+
+    Speculation itself is unchanged: conc_bench c1/c2/c4/c8 at T=0.7 218/414/728/1,040 tok/s.
+  - **Tested:** `offload_check` (seeded requests before a 16-request burst and after the draft
+    comes back are identical to each other and to speculation off), `spec_group_check` and
+    `spec_multiturn_check` pass.
+
 ## [0.6.0] — 2026-10-01
 
 **Concurrent requests speculate together.** Up to eight requests share one draft pass and one
