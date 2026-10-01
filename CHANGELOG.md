@@ -7,6 +7,16 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Changed
 
+- **A request speculating alone verifies the depth that pays** (single-stream decode,
+  Qwen3.8-27B: 14.5K-token prose 96 -> 119 tok/s; spec_group_check DFlash2 T=0/0.7/1.0
+  226/198/192 -> 231/210/205, DSpark 178/155/151 -> 191/170/169; 4-turn ~7K-token chats with
+  DSpark +16-20%). The group path verified every proposal of every block. A lone member now
+  verifies the depth with the most tokens per ms: its acceptance record against the
+  single-sequence verify's measured cost curve (rows 1-4 nearly free, 5-8 ~0.75 ms each), scaled
+  by the run's own verify and draft times. Groups keep whole blocks, since rows are nearly free
+  there. Outputs stay identical to speculation off. `SPARKINFER_SPEC_ADAPTIVE_ROWS=0` verifies
+  every block whole.
+
 - **The prefix cache is sized by memory, not by a count** (AIPerf chat 1024/256 at 32 concurrent:
   971 -> 1,070 tok/s, TTFT p50 1,575 -> 1,121 ms; at 16: TTFT p50 792 -> 553 ms; Qwen3.8-27B NVFP4).
   - **Limits:** at most 32 entries in half the KV pool held about 32 chat prompts. The defaults

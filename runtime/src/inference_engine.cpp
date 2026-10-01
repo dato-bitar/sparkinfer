@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 
@@ -442,6 +443,9 @@ void ContinuousBatchEngine::run_spec_group() {
         // tail, committed whole, and the last row's token is the seed; `first_block` then marks
         // that the slot's first draft block (over the whole prompt) is still to run.
         bool tail_pending = false, first_block = false;
+        // Its draft's record, decayed: proposals accepted, and verifies that ended in a rejection.
+        // q = (acc + 1) / (acc + rej + 2) estimates the chance its next proposal is accepted.
+        float acc = 2.f, rej = 1.f;
         bool done = false;
     };
     std::vector<Member> members;
@@ -536,6 +540,8 @@ void ContinuousBatchEngine::run_spec_group() {
         for (const Member& m : members) n += !m.done;
         return n;
     };
+    // A lone member's verify (8-row equivalent) and draft times, for its depth choice.
+    float single_v8 = 14.f, single_draft = 1.8f;
     bool leave = false;
     for (;;) {
         // 1. Drafts, from the hidden rows each member's last verify captured (consumed before a
@@ -616,6 +622,7 @@ void ContinuousBatchEngine::run_spec_group() {
             m.have_block = true;
         }
         trace_draft_ms += ms_since(t_draft);
+        if (members.size() == 1 && !members[0].done) single_draft = 0.8f * single_draft + 0.2f * (float)ms_since(t_draft);
         // 2. One arrival joins per step, if the group can take it; anything else ends the group.
         Job* joiner = nullptr;
         auto t_join = std::chrono::steady_clock::now();
@@ -789,11 +796,43 @@ void ContinuousBatchEngine::run_spec_group() {
             else ++n_spec;
         }
         const int row_cap = std::max(2, (kQwen35MaxPackedRows - tail_rows) / std::max(n_spec, 1));
+        // A request speculating alone verifies the depth that makes the most tokens per ms. Its
+        // single-sequence verify costs, relative to 8 rows, about kRel[L] (measured at ~1K context:
+        // 10.45 / 10.36 / 10.89 / 11.20 / 12.46 / 13.76 / 13.18 / 14.11 ms for 1..8 rows), scaled by
+        // what this run's verifies take (v8, tracked), plus the draft (d, tracked); row L is kept with
+        // probability ~q^L. A predictable stream keeps its whole block; a hard one stops paying for
+        // rows it would reject (14.5K-token prose: 97 -> 119 tok/s). In a group, rows are nearly free
+        // (a 4 x 8 verify costs 15.2 ms against 12.4 for 1 x 8), so members keep their blocks there.
+        // SPARKINFER_SPEC_ADAPTIVE_ROWS=0 always verifies the whole block.
+        static const bool adaptive_rows = [] {
+            const char* e = getenv("SPARKINFER_SPEC_ADAPTIVE_ROWS");
+            return !(e && e[0] == '0');
+        }();
+        static constexpr float kRel[9] = {0.f, 0.74f, 0.73f, 0.77f, 0.79f, 0.88f, 0.98f, 0.93f, 1.f};
+        std::vector<int> want((size_t)n);
+        for (int g = 0; g < n; ++g) {
+            const Member& m = *act[(size_t)g];
+            want[(size_t)g] = m.tail_pending ? (int)m.block.size() : std::min((int)m.block.size(), row_cap);
+        }
+        if (adaptive_rows && n == 1 && !act[0]->tail_pending && want[0] > 2 && want[0] <= 8) {
+            const Member& m = *act[0];
+            const float q = (m.acc + 1.f) / (m.acc + m.rej + 2.f);
+            int best = want[0];
+            float best_rate = 0.f, e = 0.f, qp = 1.f;
+            for (int L = 1; L <= want[0]; ++L) {
+                e += qp;   // expected tokens kept from L rows: 1 + q + ... + q^(L-1)
+                qp *= q;
+                if (L < 2) continue;
+                const float rate = e / (single_v8 * kRel[L] + single_draft);
+                if (rate > best_rate) { best_rate = rate; best = L; }
+            }
+            want[0] = best;
+        }
         for (int g = 0; g < n; ++g) {
             Member& m = *act[(size_t)g];
             seqs[(size_t)g] = m.job->seq_id;
             blocks[(size_t)g] = m.block.data();
-            lens[(size_t)g] = m.tail_pending ? (int)m.block.size() : std::min((int)m.block.size(), row_cap);
+            lens[(size_t)g] = want[(size_t)g];
             commit[(size_t)g] = m.tail_pending;
             any_commit = any_commit || m.tail_pending;
             starts[(size_t)g] = m.pos;
@@ -826,6 +865,8 @@ void ContinuousBatchEngine::run_spec_group() {
             break;
         }
         trace_verify_ms += ms_since(t_verify);
+        if (n == 1 && lens[0] >= 1 && lens[0] <= 8)
+            single_v8 = 0.8f * single_v8 + 0.2f * (float)ms_since(t_verify) / kRel[lens[0]];
         ++trace_steps;
         trace_rows += rows;
         for (int g = 0; g < n; ++g) trace_kept += keep[(size_t)g];
@@ -851,6 +892,12 @@ void ContinuousBatchEngine::run_spec_group() {
                     m.first_block = true;
                 }
                 continue;
+            }
+            // The draft's record: k - 1 of its lens - 1 scored proposals accepted, and a rejection
+            // unless every one was. A one-row verify scored none and says nothing.
+            if (lens[(size_t)g] > 1) {
+                m.acc = 0.9f * m.acc + (float)(k - 1);
+                m.rej = 0.9f * m.rej + (k < lens[(size_t)g] ? 1.f : 0.f);
             }
             bool going = true;
             for (int i = (m.next_emitted ? 1 : 0); i < k && going; ++i) going = emit(m, m.block[(size_t)i]);
