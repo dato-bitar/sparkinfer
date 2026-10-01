@@ -572,8 +572,10 @@ above. Pass them with `-e NAME=value`. Server flags appended after the image nam
 |----------|---------|---------|
 | `CTX` | `131072` | Context length, passed as `--ctx`. `262144` fits the model's full context but leaves ~3 GB on a 32 GB card, too little for concurrent requests to batch (the server warns at startup below 5 GiB free); use it for one long conversation at a time. |
 | `SPARKINFER_MAX_OUTPUT_TOKENS` | `16384` | Per-request generation cap (see the table above) |
-| `SPARKINFER_NO_DOWNLOAD` | `0` | `1` never downloads: the weights must already be in `MODEL_DIR` (and `DRAFT_DIR` for `serve-dspark`). A missing checkpoint fails immediately with what to mount, instead of attempting an egress the box may not have. |
+| `SPARKINFER_NO_DOWNLOAD` | `0` | `1` never downloads: the weights must already be in `MODEL_DIR` (and `DRAFT_DIR` for `serve-dspark`). A missing checkpoint fails immediately with what to mount, instead of attempting an egress the box may not have. A missing default DFlash2 drafter is not an error: the server runs without speculation and says so. |
 | `MODEL_REPO` / `MODEL_DIR` | `gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090` / `/models/qwen38-nvfp4` | Target checkpoint, downloaded on first run |
+| `SPEC_DRAFT` | `dflash2` | The default `serve` mode's drafter: `dflash2` downloads and loads `DFLASH2_REPO`, `none` serves without one. Ignored by `serve-dspark` and when `SPARKINFER_DRAFT_MODEL` or `--draft-model` is given. Past a 131,072-token context the default skips the drafter (no room for it on a 32 GB card). |
+| `DFLASH2_REPO` / `DFLASH2_DIR` | `z-lab/Qwen3.8-27B-DFlash2` / `/models/qwen38-dflash2` | The default drafter |
 | `DRAFT_REPO` / `DRAFT_DIR` | `gittensor-model-hub/Qwen3.8-27B-DSpark-NVFP4` / `/models/qwen38-dspark` | DSpark drafter, used by `serve-dspark` |
 | `MODEL_NAME` | `qwen38-nvfp4` | Model id the API advertises |
 | `HOST` / `PORT` | `0.0.0.0` / `8080` | Listen address inside the container |

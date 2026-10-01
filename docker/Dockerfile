@@ -67,6 +67,9 @@ ENV MODEL_REPO=gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090 \
     MODEL_DIR=/models/qwen38-nvfp4 \
     DRAFT_REPO=gittensor-model-hub/Qwen3.8-27B-DSpark-NVFP4 \
     DRAFT_DIR=/models/qwen38-dspark \
+    SPEC_DRAFT=dflash2 \
+    DFLASH2_REPO=z-lab/Qwen3.8-27B-DFlash2 \
+    DFLASH2_DIR=/models/qwen38-dflash2 \
     MODEL_NAME=qwen38-nvfp4 \
     HOST=0.0.0.0 PORT=8080 \
     SPARKINFER_MAX_OUTPUT_TOKENS=16384 \

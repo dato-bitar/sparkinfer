@@ -20,21 +20,23 @@ docker run --gpus all -p 8080:8080 -v qwen38:/models \
   ghcr.io/gittensor-ai-lab/sparkinfer-qwen38:latest
 ```
 
-Enable DSpark speculative decoding in the API server with one additional argument:
+Speculative decoding is on by default. The first run also downloads z-lab's
+[`Qwen3.8-27B-DFlash2`](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) drafter (3.7 GB,
+Apache-2.0) into the named volume:
+- **Up to eight concurrent requests speculate together:** 1.2-2.2x the throughput of the same
+  server without a drafter at 1-4 concurrent requests.
+- **At 16-32 the drafter's device memory steps aside while it cannot be used,** so the throughput
+  is the same.
+- **It is lossless:** greedy and seeded requests give the same tokens as without it.
+- **What does not speculate:** requests with vision, penalties, logit bias or logprobs take the
+  ordinary path.
+- **Turning it off:** `-e SPEC_DRAFT=none` serves without a drafter. `serve-dspark` (appended
+  after the image name) uses the
+  [DSpark](https://huggingface.co/gittensor-model-hub/Qwen3.8-27B-DSpark-NVFP4) drafter instead.
+- **Context:** past a 131,072-token context the default serves without a drafter, because a 32 GB
+  card has no room for it beside a pool that size.
 
-```bash
-docker run --gpus all -p 8080:8080 -v qwen38:/models \
-  ghcr.io/gittensor-ai-lab/sparkinfer-qwen38:latest serve-dspark
-```
-
-The first run downloads both the target and
-[`gittensor-model-hub/Qwen3.8-27B-DSpark-NVFP4`](https://huggingface.co/gittensor-model-hub/Qwen3.8-27B-DSpark-NVFP4)
-into the named volume. Startup fails instead of silently serving autoregressively if the drafter
-cannot be loaded. It serves a 131,072-token context rather than 262,144: on a 32 GB card the
-full-context KV pool leaves no device memory for the drafter. Plain-text, single-active-request generations use DSpark, greedy or
-sampled (temperature, top_k, top_p: a seeded request gives the same tokens either way); requests with
-vision, penalties, logit bias, logprobs, or an overlapping concurrent request use the lossless
-autoregressive path. Inspect `sparkinfer_speculative_runs_total` at `/metrics` to verify use.
+`sparkinfer_speculative_runs_total` at `/metrics` counts speculated requests.
 
 ```bash
 curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
@@ -142,12 +144,11 @@ Speculation only pays when the verify costs less than what it replaces:
 story — a block that accepts more tokens but costs more to verify is slower, and for most of this
 feature's life DSpark ran *below* plain AR decode for exactly that reason.
 
-#### DFlash2 drafter (opt-in)
+#### DFlash2 drafter (the container's default)
 
-z-lab's [`Qwen3.8-27B-DFlash2`](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) also loads as the
-drafter: point `--draft-model` (or, in the image, `-e DRAFT_REPO=z-lab/Qwen3.8-27B-DFlash2
--e DRAFT_DIR=/models/qwen38-dflash2` with `serve-dspark`) at it and the checkpoint is recognised
-by its architecture. It adds a grouped dynamic convolution around every sublayer and a candidate
+z-lab's [`Qwen3.8-27B-DFlash2`](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) is the drafter
+the release container loads by default; from source, point `--draft-model` at it and the checkpoint
+is recognised by its architecture. It adds a grouped dynamic convolution around every sublayer and a candidate
 selector that walks each slot's top-16 tokens with learned pairwise scores, and it is lossless in
 the same sense DSpark is. Same box and binary, `dspark_tau_check`, 128 greedy tokens:
 
