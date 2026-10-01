@@ -3990,13 +3990,13 @@ double Qwen35Model::bench_ttft(const std::vector<int>& prompt) {
 // burst of 16 8K-token prompts beside it had no room for its prefill arena, and the pass fell to
 // the token loop -- 38 tok/s against 167 without the draft.
 template <class Impl>
-static bool offload_idle_draft(Impl& s, int n, const char* what) {
+static bool offload_idle_draft(Impl& s, const char* what) {
     if (!s.dflash_draft || s.dflash_capture || s.dflash_draft->offloaded()) return false;
     cudaGetLastError();   // clear the failed allocation that brought us here
     const size_t b = s.dflash_draft->offload();
     if (!b) return false;
-    fprintf(stderr, "[spec] draft off the device: a %d-token %s's arena did not fit beside it "
-                    "(%.2f GB freed)\n", n, what, (double)b / 1e9);
+    fprintf(stderr, "[spec] draft off the device: %s did not fit beside it (%.2f GB freed)\n",
+            what, (double)b / 1e9);
     return true;
 }
 
@@ -4240,7 +4240,7 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
     }
     // A loaded, idle draft before the head: the draft comes back when speculation resumes, and
     // the head does not.
-    if (seed < 0 && scratch_oom && offload_idle_draft(s, n, "prefill")) {
+    if (seed < 0 && scratch_oom && offload_idle_draft(s, "a prefill's arena")) {
         scratch_oom = false;
         seed = prefill_batched_run(ctx, prompt_ids, n, pos0);
     }
@@ -4510,7 +4510,7 @@ bool Qwen35Model::ingest_prompts_packed(const uint64_t* seq_ids, const int* cons
         bool oom = false;
         ctx.scratch_oom_out = &oom;
         int r = prefill_batched_run(ctx, ids.data() + off[(size_t)b], rows, 0);
-        if (r < 0 && oom && offload_idle_draft(s, rows, "packed prefill")) {
+        if (r < 0 && oom && offload_idle_draft(s, "a packed prefill's arena")) {
             oom = false;
             r = prefill_batched_run(ctx, ids.data() + off[(size_t)b], rows, 0);
         }
@@ -4685,6 +4685,8 @@ uint64_t Qwen35Model::open_session(int num_tokens, bool* alloc_failed,
         // The decode shadow is a cache of weights decode can also read folded: a request that
         // cannot get its state takes the shadow's VRAM, once, rather than failing.
         if (attempt == 0 && release_bonsai_shadow(s)) continue;
+        // An idle draft next: it comes back when speculation resumes; the head below does not.
+        if (attempt <= 1 && offload_idle_draft(s, "a session's state")) continue;
         if (attempt <= 1 && (s.lm_head_fp4_payload || s.lm_head_fp4_sf_buf)) {
             fprintf(stderr, "[compressed-tensors] NVFP4 lm_head released for a session's state\n");
             release_lm_head_fp4();
