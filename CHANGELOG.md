@@ -5,6 +5,15 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Changed
+
+- **A short prompt prefills ~3x faster when its length is not a multiple of 8** (time to first
+  token at 9-100 prompt tokens, 81-88 -> 25-31 ms, Qwen3.8-27B NVFP4). The aligned-body split
+  (`SPARKINFER_PREFILL_ALIGN8_MIN`) applied only from a 128-token body, a threshold set while the
+  1-7 leftover tokens ran as decode steps; they now take one verify forward, so the split pays
+  from an 8-token body and the default is 8. A prompt under 128 tokens no longer runs every layer
+  on the unaligned fallback.
+
 ### Added
 
 - **Concurrent requests speculate together** (`SPARKINFER_SPEC_GROUP`, default 4): aggregate

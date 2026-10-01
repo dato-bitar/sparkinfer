@@ -4087,10 +4087,13 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
     // 1,297 -> 2,242 / 2,372 -> 2,925 / 3,817 -> 4,886 / 5,455 -> 7,813 / 7,281 -> 10,914 /
     // 7,291 -> 13,039 / 7,574 -> 14,350; 135 (the worst tail, seven decode steps behind a 128-row
     // pass) still gains, and aligned lengths do not change. SPARKINFER_PREFILL_ALIGN8_MIN is the
-    // smallest body split this way (0 turns it off).
+    // smallest body split this way (0 turns it off). It was 128 while the tail ran as decode steps;
+    // with the tail one verify forward (ingest_tail_rows) the split pays from an 8-row body up --
+    // TTFT p50 of a lone request at 9 / 20 / 47 / 77 / 100 prompt tokens, 81 / 82 / 84 / 86 / 88 ->
+    // 25 / 26 / 31 / 30 / 29 ms, and a chat prompt is almost always that short.
     static const int align8_min = [] {
         const char* e = getenv("SPARKINFER_PREFILL_ALIGN8_MIN");
-        const int v = e ? atoi(e) : 128;
+        const int v = e ? atoi(e) : 8;
         return v < 0 ? 0 : v;
     }();
     const int body = n & ~7;
