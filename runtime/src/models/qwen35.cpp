@@ -3988,6 +3988,21 @@ double Qwen35Model::bench_ttft(const std::vector<int>& prompt) {
 // with SPARKINFER_BONSAI_DECODE_SHADOW=0. The decode graphs have its pointers baked in, so they go
 // first and recapture on the next step. Returns whether anything was freed.
 template <class Impl>
+// A loaded draft is the one large allocation that can step aside at no cost to a request in
+// flight: it is not reading anything unless a speculative prefill (capture on) or group is
+// running, and it comes back at the same addresses (DFlashDraftModel::offload). On a 32 GB card a
+// burst of 16 8K-token prompts beside it had no room for its prefill arena, and the pass fell to
+// the token loop -- 38 tok/s against 167 without the draft.
+static bool offload_idle_draft(Impl& s, int n, const char* what) {
+    if (!s.dflash_draft || s.dflash_capture || s.dflash_draft->offloaded()) return false;
+    cudaGetLastError();   // clear the failed allocation that brought us here
+    const size_t b = s.dflash_draft->offload();
+    if (!b) return false;
+    fprintf(stderr, "[spec] draft off the device: a %d-token %s's arena did not fit beside it "
+                    "(%.2f GB freed)\n", n, what, (double)b / 1e9);
+    return true;
+}
+
 static bool release_bonsai_shadow(Impl& s) {
     if (s.bonsai_dec_bufs.empty()) return false;
     cudaGetLastError();   // clear the failed cudaMalloc that brought us here
@@ -4220,6 +4235,12 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
         ctx.bonsai_pf_layers = nullptr;   // freed with the shadow: the retry reads the folded legs
         ctx.bonsai_pf_rs = nullptr;
         ctx.bonsai_dec_head = nullptr;
+        seed = prefill_batched_run(ctx, prompt_ids, n, pos0);
+    }
+    // A loaded, idle draft before the head: the draft comes back when speculation resumes, and
+    // the head does not.
+    if (seed < 0 && scratch_oom && offload_idle_draft(s, n, "prefill")) {
+        scratch_oom = false;
         seed = prefill_batched_run(ctx, prompt_ids, n, pos0);
     }
     // ...and the NVFP4 head, the other decode-only operand that can be given back.
@@ -4488,6 +4509,10 @@ bool Qwen35Model::ingest_prompts_packed(const uint64_t* seq_ids, const int* cons
         bool oom = false;
         ctx.scratch_oom_out = &oom;
         int r = prefill_batched_run(ctx, ids.data() + off[(size_t)b], rows, 0);
+        if (r < 0 && oom && offload_idle_draft(s, rows, "packed prefill")) {
+            oom = false;
+            r = prefill_batched_run(ctx, ids.data() + off[(size_t)b], rows, 0);
+        }
         // A pass whose arena did not fit ran nothing: give the NVFP4 head back and retry, as the
         // one-prompt pass does.
         if (r < 0 && oom && (s.lm_head_fp4_payload || s.lm_head_fp4_sf_buf)) {
