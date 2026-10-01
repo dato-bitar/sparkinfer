@@ -1308,6 +1308,8 @@ void ContinuousBatchEngine::worker_loop() {
         {
             Job* spec_job = nullptr;
             bool spec_group = false;
+            bool draft_offload = false;
+            bool draft_restore = false;
             {
                 std::lock_guard<std::mutex> lock(mu_);
                 // SPARKINFER_SPECULATIVE=0 keeps the draft loaded (the same device memory, so the
@@ -1337,7 +1339,39 @@ void ContinuousBatchEngine::worker_loop() {
                         }
                         spec_group = all;
                     }
-                    if (!spec_group && live == 1 && !only->spec_tried && only->phase == SeqPhase::PREFILL &&
+                    // The draft's memory is the headroom concurrent serving needs (a 32-request burst
+                    // overran a 32 GB card by ~1 GB with it resident), and past a group's size
+                    // nothing reads it. Once the load has stayed there for a while, it goes to the
+                    // host; the first speculation after that brings it back (~0.1 s).
+                    // SPARKINFER_DRAFT_OFFLOAD_MS=-1 keeps it resident.
+                    static const long long offload_ms = [] {
+                        const char* e = getenv("SPARKINFER_DRAFT_OFFLOAD_MS");
+                        return e ? atoll(e) : 1000LL;
+                    }();
+                    if (live > std::max(1, spec_group_max())) {
+                        const auto now = std::chrono::steady_clock::now();
+                        if (!spec_over_) {
+                            spec_over_ = true;
+                            spec_over_since_ = now;
+                        } else if (offload_ms >= 0 &&
+                                   now - spec_over_since_ >= std::chrono::milliseconds(offload_ms)) {
+                            draft_offload = true;
+                            spec_over_since_ = now;   // a failed attempt waits another interval
+                        }
+                    } else {
+                        spec_over_ = false;
+                    }
+                    const bool want_spec =
+                        spec_group ||
+                        (live == 1 && !only->spec_tried && only->phase == SeqPhase::PREFILL &&
+                         only->prefill_pos == only->req.prefill_start && spec_eligible(only->req));
+                    if (want_spec && model_->dflash_draft_offloaded()) {
+                        // Bring it back outside mu_ (a submit must not wait on the copy), then decide again.
+                        draft_restore = true;
+                        spec_group = false;
+                    }
+                    if (!draft_restore && !spec_group && live == 1 && !only->spec_tried &&
+                        only->phase == SeqPhase::PREFILL &&
                         only->prefill_pos == only->req.prefill_start && spec_eligible(only->req)) {
                         spec_job = only;
                         // Raised under mu_, which submit_locked also holds: a request submitted from
@@ -1346,6 +1380,29 @@ void ContinuousBatchEngine::worker_loop() {
                         spec_running_.store(true, std::memory_order_relaxed);
                     }
                 }
+            }
+            if (draft_restore) {
+                const auto t0 = std::chrono::steady_clock::now();
+                if (model_->dflash_draft_restore()) {
+                    fprintf(stderr, "[spec] draft back on the device (%.0f ms)\n",
+                            std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t0).count());
+                } else {
+                    // No room for it now: these requests decode token by token instead.
+                    std::lock_guard<std::mutex> lock(mu_);
+                    for (auto& kv : jobs_)
+                        if (!kv.second->done) kv.second->spec_tried = true;
+                    fprintf(stderr, "[spec] draft cannot come back on the device yet; decoding without it\n");
+                }
+                continue;
+            }
+            if (draft_offload && !model_->dflash_draft_offloaded()) {
+                const auto t0 = std::chrono::steady_clock::now();
+                if (const size_t b = model_->dflash_draft_offload())
+                    fprintf(stderr, "[spec] draft off the device: %.2f GB freed while more requests run "
+                                    "than speculation takes (%.0f ms)\n", (double)b / 1e9,
+                            std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t0).count());
             }
             if (spec_group) {
                 run_spec_group();

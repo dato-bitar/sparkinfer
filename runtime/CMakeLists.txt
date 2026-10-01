@@ -39,6 +39,8 @@ target_include_directories(sparkinfer_runtime PUBLIC include)
 # include surface.
 target_include_directories(sparkinfer_runtime PRIVATE examples)
 target_link_libraries(sparkinfer_runtime PUBLIC sparkinfer_moe sparkinfer_kernels CUDA::cudart Threads::Threads)
+# The draft's offloadable arena (models/vmm_arena.cpp) uses the virtual memory driver API.
+target_link_libraries(sparkinfer_runtime PUBLIC CUDA::cuda_driver)
 
 # GPU observability (heat/power/clock) uses NVML when available; VRAM works without it. NVML ships
 # with the CUDA toolkit as CUDA::nvml — link + flag it when present so the build degrades cleanly

@@ -710,6 +710,12 @@ public:
 
     // Attach / detach a DFlash draft model (non-owning). nullptr clears.
     void set_dflash_draft(class DFlashDraftModel* draft);
+    // The attached draft's device memory, stepped off the GPU while nothing speculates and
+    // brought back before a speculation group starts (DFlashDraftModel::offload). Bytes released;
+    // false/0 with no draft or when it cannot.
+    size_t dflash_draft_offload();
+    bool dflash_draft_restore();
+    bool dflash_draft_offloaded() const;
 
     // DFlash: capture concat hidden states at target_layer_ids per forward step.
     // Disables CUDA-graph replay while enabled (capture needs eager layer outputs).

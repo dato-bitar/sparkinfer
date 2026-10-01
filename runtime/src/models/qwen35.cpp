@@ -5809,6 +5809,22 @@ int Qwen35Model::lm_head_quant_type() const { return p_->w.lm_head_type; }
 
 void Qwen35Model::set_dflash_draft(DFlashDraftModel* draft) { p_->dflash_draft = draft; }
 
+size_t Qwen35Model::dflash_draft_offload() {
+    if (!p_->dflash_draft) return 0;
+    std::lock_guard<std::recursive_mutex> lock(device_mutex());
+    return p_->dflash_draft->offload();
+}
+
+bool Qwen35Model::dflash_draft_restore() {
+    if (!p_->dflash_draft) return false;
+    std::lock_guard<std::recursive_mutex> lock(device_mutex());
+    return p_->dflash_draft->restore();
+}
+
+bool Qwen35Model::dflash_draft_offloaded() const {
+    return p_->dflash_draft && p_->dflash_draft->offloaded();
+}
+
 void Qwen35Model::set_dflash_capture(bool on, const std::vector<int>& target_layer_ids, int max_rows,
                                     int context_start, int context_end) {
     Impl& s = *p_;

@@ -3,6 +3,7 @@
 #include "sparkinfer/token_constraint.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -330,6 +331,11 @@ private:
     bool speculative_ = false;
     std::atomic<bool> spec_running_{false};    // the worker is inside run_speculative
     std::atomic<bool> spec_interrupt_{false};  // a request was submitted meanwhile: hand over
+    // How long live requests have been more than a speculation group takes. Past
+    // SPARKINFER_DRAFT_OFFLOAD_MS of that, the draft's device memory goes to the host until a
+    // group can form again (DFlashDraftModel::offload).
+    bool spec_over_ = false;
+    std::chrono::steady_clock::time_point spec_over_since_{};
     std::atomic<uint64_t> spec_runs_{0}, spec_tokens_{0}, spec_handoffs_{0}, spec_tier_stops_{0};
     // Last count of blocks only the prefix cache holds (num_free_kv_blocks), refreshed whenever the
     // device mutex is free to read the KV refcounts under.

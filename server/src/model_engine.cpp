@@ -887,6 +887,17 @@ bool ModelEngine::load_draft(const std::string& dir, std::string& err) {
     // until something speculates -- forever, on a server whose load never drops to a group --
     // and it moves the ~1 GB transient of building them from the middle of serving to load.
     draft->ensure_quant();
+    // One round trip through host memory now: it pins the host buffer at load (pinning stalls
+    // every thread's CUDA calls, so not mid-serving) and proves the draft can step off the device
+    // before a busy server relies on it. Contents return at the same addresses, bit for bit.
+    if (const size_t b = draft->offload()) {
+        if (!draft->restore()) {
+            err = "the draft left the device for its load-time check and could not come back";
+            return false;
+        }
+        fprintf(stderr, "[sparkinfer-server] draft can step off the device under load (%.2f GB)\n",
+                (double)b / 1e9);
+    }
     impl_->model->set_dflash_draft(draft.get());
     impl_->draft = std::move(draft);
     impl_->batch_engine->enable_speculative(true);

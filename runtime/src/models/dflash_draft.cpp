@@ -1,5 +1,6 @@
 // DFlash draft runtime: safetensors load + GGUF load + block-parallel forward.
 #include "sparkinfer/models/dflash_draft.h"
+#include "vmm_arena.h"
 #include "sparkinfer/device_health.h"
 #include <atomic>
 #include "sparkinfer/models/dflash_kernels.h"
@@ -367,6 +368,16 @@ struct DFlashDraftModel::Impl {
     // block, to project 1-5 context rows. Every other projection has had a Q4 copy since #661.
     Q8W q8_fc;
     std::vector<void*> owned;
+    // Every buffer the draft keeps lives here when the CUDA virtual memory API is available, so
+    // the whole draft can step off the device while nothing speculates (see offload()).
+    VmmArena arena;
+    bool arena_on = false;
+    void* dev_alloc(size_t bytes) {
+        if (arena_on) return arena.alloc(bytes);
+        void* p = nullptr;
+        if (cudaMalloc(&p, bytes) != cudaSuccess) { cudaGetLastError(); return nullptr; }
+        return p;
+    }
 
     // Shared target pointers
     const void* embed = nullptr;
@@ -629,13 +640,13 @@ struct DFlashDraftModel::Impl {
         for (size_t i = 0; i < owned.size(); i++) {
             if (owned[i] == p) { owned.erase(owned.begin() + i); break; }
         }
-        cudaFree(p);
+        if (!(arena_on && arena.free(p))) cudaFree(p);
     }
 
     template <class T> T* alloc(size_t n) {
-        void* p = nullptr;
-        cu(cudaMalloc(&p, n * sizeof(T)), "malloc");
-        owned.push_back(p);
+        void* p = dev_alloc(n * sizeof(T));
+        if (!p) cu(cudaErrorMemoryAllocation, "malloc");
+        else owned.push_back(p);
         return (T*)p;
     }
 
@@ -796,13 +807,22 @@ DFlashDraftModel::DFlashDraftModel(const DFlashDraftConfig& cfg) : p_(new Impl()
     }
     // Non-blocking, for the same reason as Qwen35Model's stream: see qwen35.cpp.
     cudaStreamCreateWithFlags(&p_->stream, cudaStreamNonBlocking);
+    // SPARKINFER_DRAFT_OFFLOAD=0 keeps plain cudaMalloc (and so no offload).
+    static const bool vmm_env = [] {
+        const char* e = getenv("SPARKINFER_DRAFT_OFFLOAD");
+        return !(e && e[0] == '0');
+    }();
+    int dev = 0;
+    if (vmm_env && cudaGetDevice(&dev) == cudaSuccess)
+        p_->arena_on = p_->arena.init(dev, size_t(64) << 30);   // address space only
 }
 
 DFlashDraftModel::~DFlashDraftModel() {
     if (!p_) return;
     for (size_t i = 1; i < p_->slots.size(); ++i)
         if (p_->slots[i].live) p_->free_slot_buffers(p_->slots[i]);
-    for (void* p : p_->owned) cudaFree(p);
+    if (!p_->arena_on)
+        for (void* p : p_->owned) cudaFree(p);   // the arena releases its own
     if (p_->h_out) cudaFreeHost(p_->h_out);
     if (p_->h_ids) cudaFreeHost(p_->h_ids);
     if (p_->h_confidence) cudaFreeHost(p_->h_confidence);
@@ -929,6 +949,25 @@ void DFlashDraftModel::free_slot(int i) {
 }
 
 int DFlashDraftModel::current_slot() const { return p_->cur_slot; }
+
+size_t DFlashDraftModel::offload() {
+    Impl& s = *p_;
+    if (!s.arena_on || s.arena.offloaded()) return 0;
+    // Slots 1.. are per-request cudaMalloc buffers the speculation group frees when it ends; one
+    // still live means a group is, and the draft must stay.
+    for (size_t i = 1; i < s.slots.size(); ++i)
+        if (s.slots[i].live) return 0;
+    cudaStreamSynchronize(s.stream);
+    return s.arena.offload();
+}
+
+bool DFlashDraftModel::restore() { return !p_->arena_on || p_->arena.restore(); }
+
+bool DFlashDraftModel::offloaded() const { return p_->arena_on && p_->arena.offloaded(); }
+
+size_t DFlashDraftModel::resident_bytes() const {
+    return p_->arena_on && !p_->arena.offloaded() ? p_->arena.mapped_bytes() : 0;
+}
 
 
 void DFlashDraftModel::crop(int keep) {
@@ -1200,7 +1239,9 @@ bool DFlashDraftModel::load(const std::string& dir) {
             const unsigned short raw = *reinterpret_cast<const unsigned short*>(cb->data);
             unsigned int bits = (unsigned int)raw << 16;
             std::memcpy(&s.confidence_bias, &bits, sizeof(float));
-            if (cudaMalloc(&s.markov_latent, (size_t)(s.cfg.block_size + 1) * s.markov_rank * sizeof(float)) != cudaSuccess)
+            s.markov_latent = static_cast<float*>(
+                s.dev_alloc((size_t)(s.cfg.block_size + 1) * s.markov_rank * sizeof(float)));
+            if (!s.markov_latent)
                 s.confidence_w = nullptr;  // can't run the head without scratch -- disable cleanly
             else
                 s.owned.push_back(s.markov_latent);
@@ -2453,7 +2494,7 @@ bool DFlashDraftModel::forward_blocks(const BlockJob* jobs, int n_jobs, int prop
         bool ok = true;
         auto al = [&](auto*& p, size_t n) {
             using T = std::remove_pointer_t<std::remove_reference_t<decltype(p)>>;
-            if (ok && cudaMalloc(reinterpret_cast<void**>(&p), n * sizeof(T)) != cudaSuccess) ok = false;
+            if (ok && !(p = static_cast<T*>(s.dev_alloc(n * sizeof(T))))) ok = false;
             if (ok) s.owned.push_back((void*)p);
         };
         al(b.x, (size_t)RM * H); al(b.xn, (size_t)RM * H); al(b.h, (size_t)RM * H); al(b.hn, (size_t)RM * H);

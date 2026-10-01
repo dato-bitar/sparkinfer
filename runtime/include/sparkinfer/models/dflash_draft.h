@@ -109,6 +109,17 @@ public:
     // that primes the draft outside a timed region does not pay for it inside one. Idempotent.
     void ensure_quant();
 
+    // Step off the device while nothing speculates: every buffer the draft keeps goes to pinned
+    // host memory and its device memory is released; restore() brings it back at the same
+    // addresses. offload() returns the bytes released, 0 when it cannot (no virtual memory
+    // support, SPARKINFER_DRAFT_OFFLOAD=0, a speculation slot still live, already offloaded).
+    // restore() is false, and the draft still offloaded, when the device has no room for it.
+    // The caller guarantees no draft work is in flight or issued while offloaded.
+    size_t offload();
+    bool restore();
+    bool offloaded() const;
+    size_t resident_bytes() const;
+
     //   proposals:     how many rows after the seed to score (0 = the built-in default). The
     //                  verifier picks this by context length, so the draft has to be told rather
     //                  than deciding for itself, or the two disagree on how long a block is.
