@@ -9,8 +9,9 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 **Requests without `max_tokens` are no longer cut off at 256 tokens**: agents and OpenAI SDK
 clients, which omit it by default, get whole answers again.
-- A server with the DFlash2 or DSpark drafter loaded is now as fast as one without at 16-32
-  concurrent requests (it was 0.23-0.66x), and keeps 1.2-2.2x at 1-4 (AIPerf, RTX 5090).
+- A server with the DFlash2 drafter loaded is now as fast as one without at 16-32 concurrent
+  requests (it was 0.23-0.66x), and keeps 1.2-2.2x at 1-4 (AIPerf, RTX 5090). DSpark takes the
+  same offload path but was not measured.
 - Linux and Windows binaries are attached to the release again: the Windows build had failed
   since 2026-08-14, so no tag since v0.5.6 produced them.
 - Speculation stays opt-in in the container (`serve-dspark` or `--draft-model`).
