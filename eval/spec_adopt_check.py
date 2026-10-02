@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A speculation group adopts a request already decoding, and that request's tokens do not change.
+"""A speculation group adopts a request already decoding, and every request completes as it should.
 
 With SPARKINFER_SPEC_GROUP=2:
 1. three requests arrive together (more than a group takes, so they decode ordinarily);
