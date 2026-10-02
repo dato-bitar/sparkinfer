@@ -269,6 +269,8 @@ public:
         uint64_t lookups = 0, hits = 0, tokens_reused = 0, inserts = 0, evictions = 0;
         size_t entries = 0, host_bytes = 0;
         int blocks = 0;
+        uint64_t host_hits = 0, demotions = 0;   // the host KV tier
+        size_t host_entries = 0, host_kv_bytes = 0;
     };
     PrefixCacheStats prefix_cache_stats() const;
 

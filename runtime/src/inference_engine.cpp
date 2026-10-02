@@ -1216,8 +1216,10 @@ uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(
             PrefixCache::Hit hit;
             if (cache_eligible) hit = prefix_cache_->lookup(job.req.prompt);
             bool alloc_failed = false;
+            // A hit whose KV is on the host tier opens a plain session; the cache copies the KV in.
             auto open = [&](const PrefixCache::Hit& h) {
-                return model_->open_session(budget, &alloc_failed, h.tokens > 0 ? &h.blocks : nullptr);
+                return model_->open_session(budget, &alloc_failed,
+                                            h.tokens > 0 && !h.on_host ? &h.blocks : nullptr);
             };
             seq_id = open(hit);
             if (!seq_id && !alloc_failed && prefix_cache_) {
@@ -1230,6 +1232,10 @@ uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(
                 }
             }
             if (!seq_id) return fail(alloc_failed ? EnqueueError::ALLOC_FAILED : EnqueueError::OVERLOADED);
+            // The copy did not happen (the entry went, or the transfer failed): the session's blocks
+            // are its own, and the whole prompt is prefilled into them.
+            if (hit.tokens > 0 && hit.on_host && !prefix_cache_->restore_host_hit(hit, seq_id))
+                hit = PrefixCache::Hit{};
             if (hit.tokens > 0) {
                 if (model_->restore_recurrent_state(seq_id, hit.state)) {
                     job.req.prefill_start = hit.tokens;

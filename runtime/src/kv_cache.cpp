@@ -465,6 +465,10 @@ bool   KVCacheManager::int8_kv() const { return impl_->int8_kv; }
 void*  KVCacheManager::k_scale_pool() const { return impl_->k_scale; }
 void*  KVCacheManager::v_scale_pool() const { return impl_->v_scale; }
 size_t KVCacheManager::scale_layer_stride_elems() const { return impl_->scale_layer_stride; }
+size_t KVCacheManager::block_elems() const { return impl_->elems_per_block; }
+size_t KVCacheManager::block_scale_elems() const {
+    return impl_->int8_kv ? impl_->elems_per_block / impl_->cfg.head_dim : 0;
+}
 int    KVCacheManager::block_size() const { return impl_->cfg.block_size; }
 int    KVCacheManager::max_blocks_per_seq() const { return impl_->max_blocks_per_seq; }
 int    KVCacheManager::num_free_blocks() const { return (int)impl_->free_list.size(); }

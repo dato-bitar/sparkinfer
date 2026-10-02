@@ -1293,7 +1293,19 @@ int main(int argc, char** argv) {
                  << "sparkinfer_prefix_cache_kv_blocks " << pc.blocks << "\n"
                  << "# HELP sparkinfer_prefix_cache_host_bytes Pinned host memory held by recurrent-state snapshots\n"
                     "# TYPE sparkinfer_prefix_cache_host_bytes gauge\n"
-                 << "sparkinfer_prefix_cache_host_bytes " << pc.host_bytes << "\n";
+                 << "sparkinfer_prefix_cache_host_bytes " << pc.host_bytes << "\n"
+                 << "# HELP sparkinfer_prefix_cache_host_hits_total Hits served from the host KV tier\n"
+                    "# TYPE sparkinfer_prefix_cache_host_hits_total counter\n"
+                 << "sparkinfer_prefix_cache_host_hits_total " << pc.host_hits << "\n"
+                 << "# HELP sparkinfer_prefix_cache_demotions_total Cached prefixes moved off the device to the host KV tier\n"
+                    "# TYPE sparkinfer_prefix_cache_demotions_total counter\n"
+                 << "sparkinfer_prefix_cache_demotions_total " << pc.demotions << "\n"
+                 << "# HELP sparkinfer_prefix_cache_host_entries Cached prefixes whose KV is on the host only\n"
+                    "# TYPE sparkinfer_prefix_cache_host_entries gauge\n"
+                 << "sparkinfer_prefix_cache_host_entries " << pc.host_entries << "\n"
+                 << "# HELP sparkinfer_prefix_cache_host_kv_bytes Pinned host memory held by the host KV tier\n"
+                    "# TYPE sparkinfer_prefix_cache_host_kv_bytes gauge\n"
+                 << "sparkinfer_prefix_cache_host_kv_bytes " << pc.host_kv_bytes << "\n";
         }
         const auto sp = engine.speculative_stats();
         if (sp.enabled) {

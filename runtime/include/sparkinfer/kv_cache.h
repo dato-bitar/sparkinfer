@@ -170,6 +170,9 @@ public:
     void* k_scale_pool() const;
     void* v_scale_pool() const;
     size_t scale_layer_stride_elems() const;
+    // One block of one slot: K (or V) elements, and (int8) its K (or V) scales; 0 without int8.
+    size_t block_elems() const;
+    size_t block_scale_elems() const;
 
     // WINDOWED SLOTS (see KVCacheConfig::window_tokens). windowed() is false when this pool has
     // none, and then every accessor below behaves exactly as the full-context ones.

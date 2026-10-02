@@ -427,14 +427,22 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
             const long long kv_pct =
                 std::max(1LL, std::min(100LL, env_int("SPARKINFER_PREFIX_CACHE_KV_PCT", 75)));
             lim.max_blocks = (int)((long long)impl_->kv->num_total_blocks() * kv_pct / 100);
+            // Host KV tier: entries pushed off the device keep their KV in pinned host memory, a
+            // quarter of RAM up to 16 GB by default (~60 8K-token prompts on Qwen3.8-27B). The
+            // device pool holds one --ctx worth of tokens, a handful of long prompts.
+            // SPARKINFER_PREFIX_CACHE_HOST_KV_MB=0 turns it off.
+            const long long host_kv_mb = std::min(16384LL, ram_mb > 0 ? ram_mb / 4 : 0LL);
+            lim.max_host_kv_bytes =
+                (size_t)std::max(0LL, env_int("SPARKINFER_PREFIX_CACHE_HOST_KV_MB", host_kv_mb)) << 20;
             impl_->prefix_cache_min_tokens =
                 (int)std::max(1LL, env_int("SPARKINFER_PREFIX_CACHE_MIN_TOKENS", 1024));
             impl_->batch_engine->enable_prefix_cache(lim);
             impl_->prefix_cache_on = true;
             fprintf(stderr, "[sparkinfer-server] prefix cache: on (%zu entries, %zu MiB host, %d of %d "
-                            "KV blocks, checkpoints from %d tokens)\n",
+                            "KV blocks, %zu MiB host KV tier, checkpoints from %d tokens)\n",
                     lim.max_entries, lim.max_host_bytes >> 20, lim.max_blocks,
-                    impl_->kv->num_total_blocks(), impl_->prefix_cache_min_tokens);
+                    impl_->kv->num_total_blocks(), lim.max_host_kv_bytes >> 20,
+                    impl_->prefix_cache_min_tokens);
         } else {
             fprintf(stderr, "[sparkinfer-server] prefix cache: off (SPARKINFER_PREFIX_CACHE=0)\n");
         }
@@ -943,6 +951,10 @@ ModelEngine::PrefixCacheStats ModelEngine::prefix_cache_stats() const {
     out.entries = s.entries;
     out.host_bytes = s.host_bytes;
     out.blocks = s.blocks;
+    out.host_hits = s.host_hits;
+    out.demotions = s.demotions;
+    out.host_entries = s.host_entries;
+    out.host_kv_bytes = s.host_kv_bytes;
     return out;
 }
 
