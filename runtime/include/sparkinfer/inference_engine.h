@@ -305,6 +305,7 @@ private:
     // is left, or hands every member to ordinary decode when a request it cannot take arrives.
     void run_spec_group();
     static bool spec_eligible(const Request& r);
+    static bool spec_adoptable(const Job& j);
 
     Qwen35Model* model_;
     KVCacheManager* kv_;

@@ -384,6 +384,13 @@ bool prefix_hit_spec_on() {
 }
 }  // namespace
 
+// A request already decoding that a speculation group can carry without a draft: its next token is
+// ready to emit, and it would speculate if it were fresh (the verify has none of the other sampler
+// extras either).
+bool ContinuousBatchEngine::spec_adoptable(const Job& j) {
+    return !j.done && j.phase == SeqPhase::DECODE && j.next_token >= 0 && spec_eligible(j.req);
+}
+
 bool ContinuousBatchEngine::spec_eligible(const Request& r) {
     // A sampled request speculates too: every verify row draws its token with the request's
     // sampler at that token's own step (SpecHooks), so the output is the one ordinary sampled
@@ -459,7 +466,28 @@ void ContinuousBatchEngine::run_spec_group() {
             if (!kv.second->done) kv.second->spec_tried = true;
     }
     if (!model_->spec_group_begin()) return;
-    if (spec_group_trace()) fprintf(stderr, "[spec-group] start (group %d, depth %d)\n", G, depth);
+    // Requests already decoding join as members without a draft: their next token, not yet emitted,
+    // is the block, and each step's verify ingests it at prompt + decode_emitted and draws the one
+    // after with step decode_emitted + 1 -- exactly the ordinary decode step (step_job), so their
+    // tokens are the ones they would have had. At the group's end, handoff gives them back as they
+    // were. The fresh prompts join one a step below and speculate.
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        for (auto& kv : jobs_) {
+            Job* j = kv.second.get();
+            if (!spec_adoptable(*j)) continue;
+            Member m;
+            m.job = j;
+            m.slot = -1;
+            m.pos = (int)j->req.prompt.size() + j->decode_emitted;
+            m.next = j->next_token;
+            m.next_emitted = false;
+            m.no_draft = true;
+            members.push_back(m);
+        }
+    }
+    if (spec_group_trace())
+        fprintf(stderr, "[spec-group] start (group %d, depth %d, %zu adopted)\n", G, depth, members.size());
     int trace_steps = 0, trace_rows = 0, trace_kept = 0;
     double trace_draft_ms = 0, trace_join_ms = 0, trace_verify_ms = 0;
     auto ms_since = [](std::chrono::steady_clock::time_point t) {
@@ -477,7 +505,7 @@ void ContinuousBatchEngine::run_spec_group() {
             job.decode_tps = (double)job.decode_emitted * 1000.0 / decode_ms;
         }
         finish_job_impl(job);
-        slot_used[(size_t)m.slot] = false;
+        if (m.slot >= 0) slot_used[(size_t)m.slot] = false;   // an adopted member has none
         m.done = true;
     };
     // Hand one token to the caller as run_speculative does. False when the request stops here
@@ -802,6 +830,16 @@ void ContinuousBatchEngine::run_spec_group() {
             }
         }
         if (joiner) trace_join_ms += ms_since(t_join);
+        // Nothing left to speculate (every member drafts no more and nobody joined): ordinary packed
+        // decode carries those requests faster than one-row verifies.
+        if (!leave && !joiner && live_members() > 0) {
+            bool any_draft = false;
+            for (const Member& m : members) any_draft = any_draft || (!m.done && !m.no_draft);
+            if (!any_draft) {
+                if (spec_group_trace()) fprintf(stderr, "[spec-group] leave: no member drafts\n");
+                leave = true;
+            }
+        }
         if (leave) break;
         // 3. One verify for every member's block.
         std::vector<Member*> act;
@@ -1368,17 +1406,28 @@ void ContinuousBatchEngine::worker_loop() {
                         ++live;
                         only = kv.second.get();
                     }
-                    // Concurrent speculation: every live request is a fresh, eligible prompt and
-                    // there are no more of them than a group takes.
+                    // Concurrent speculation: no more live requests than a group takes, each a fresh,
+                    // eligible prompt -- or one already decoding that the group can adopt (it rides
+                    // the verify a row a step without a draft, see run_spec_group), as long as at
+                    // least one is fresh to speculate. Requiring every request to be fresh meant a
+                    // load that never drained (the next prompt arriving while others decode) never
+                    // formed a group again once one ended. SPARKINFER_SPEC_ADOPT=0 requires it.
+                    static const bool adopt_on = [] {
+                        const char* e = getenv("SPARKINFER_SPEC_ADOPT");
+                        return !(e && e[0] == '0');
+                    }();
                     if (spec_group_max() > 1 && live >= 1 && live <= spec_group_max()) {
                         bool all = true;
+                        int fresh = 0;
                         for (const auto& kv : jobs_) {
                             const Job& j = *kv.second;
                             if (j.done) continue;
-                            all = all && !j.spec_tried && j.phase == SeqPhase::PREFILL &&
-                                  j.prefill_pos == j.req.prefill_start && spec_eligible(j.req);
+                            const bool is_fresh = !j.spec_tried && j.phase == SeqPhase::PREFILL &&
+                                                  j.prefill_pos == j.req.prefill_start && spec_eligible(j.req);
+                            fresh += is_fresh;
+                            all = all && (is_fresh || (adopt_on && spec_adoptable(j)));
                         }
-                        spec_group = all;
+                        spec_group = all && fresh > 0;
                     }
                     // The draft's memory is the headroom concurrent serving needs (a 32-request burst
                     // overran a 32 GB card by ~1 GB with it resident), and past a group's size
