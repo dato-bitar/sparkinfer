@@ -5,6 +5,33 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Serving
+
+- **The prefix cache keeps long prompts in host memory once they no longer fit on the device.**
+  - **Before:** the KV pool holds one `--ctx` worth of tokens (8,200 blocks on a 32 GB card at
+    `--ctx 131072`), so the cache's share kept about eleven 8K-token prompts. AIPerf re-sends
+    earlier cells' prompts, and its 8K-prompt cells hit the cache 1% of the time (vLLM 0.30, with
+    a larger pool: 35%).
+  - **Now:** an entry pushed off the device keeps its KV in pinned host memory
+    (`SPARKINFER_PREFIX_CACHE_HOST_KV_MB`, default a quarter of RAM up to 16 GB, about 60 8K-token
+    prompts; 0 turns it off). A hit on it copies the blocks back into the new request's session
+    (~270 MB for 8K tokens, a few milliseconds, where prefilling them again takes about half a
+    second). Each direction is one kernel over host-mapped memory, with no device staging.
+    New metrics: `sparkinfer_prefix_cache_host_hits_total`, `_demotions_total`, `_host_entries`,
+    `_host_kv_bytes`.
+  - **Measured** (AIPerf, RTX 5090, Qwen3.8-27B NVFP4 + DFlash2; host tier off -> on, one binary):
+    - long prompt 8192/128: c4 147 -> 198 tok/s, c16 165 -> 191 (vLLM 0.30: 147 / 171);
+      c16 TTFT p50 1,912 -> 1,612 ms;
+    - chat 1024/256, c32: 1,269 -> 1,370 tok/s; request latency p50 / p90 / p99 6.05 / 8.95 /
+      9.83 -> 5.92 / 7.18 / 7.52 s (vLLM: 7.80 / 10.28 / 11.31); TTFT p90 / p99 2,635 / 3,390 ->
+      1,718 / 2,337 ms. TTFT p50 rises 376 -> 729 ms: the first wave of 32 requests finishes
+      sooner and closer together, so the next wave arrives at once and queues behind itself;
+    - the other cells are within run-to-run variance.
+  - **Tested:** `eval/prefix_host_tier_check.py` runs interleaved multi-turn conversations with
+    the device share at 2% (every hit from the host tier) and at the default (every hit from the
+    device), deterministic: 18/18 answers identical. `spec_multiturn_check` passes with every
+    hit from the host tier.
+
 ## [0.6.4] — 2026-10-02
 
 **Time to first token at 16-32 concurrent chats now matches vLLM.**

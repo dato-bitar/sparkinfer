@@ -1,10 +1,29 @@
 #include "sparkinfer/prefix_cache.h"
 
+#include "sparkinfer/device_health.h"
+
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <utility>
 
 namespace sparkinfer {
+
+namespace {
+// The host tier's CUDA calls: a context-killing error is recorded so the engine refuses new work
+// (see device_health.h) rather than carrying on as if the copy had merely been skipped.
+bool cu_ok(cudaError_t e, const char* what) {
+    if (e == cudaSuccess) return true;
+    cudaGetLastError();
+    const bool fatal = note_cuda_error(e);
+    static std::atomic<int> logged{0};
+    const int n = logged.fetch_add(1, std::memory_order_relaxed);
+    if (n < 20 || fatal)
+        fprintf(stderr, "[prefix-cache] %s: %s%s\n", what, cudaGetErrorString(e),
+                fatal ? "  [CONTEXT LOST -- server will refuse further work]" : "");
+    return false;
+}
+}  // namespace
 
 PrefixCache::PrefixCache(KVCacheManager* kv, const Limits& limits) : kv_(kv), limits_(limits) {
     if (limits_.max_host_kv_bytes == 0 || !kv_ || kv_->windowed() || kv_->kv_slots() <= 0) return;
@@ -270,8 +289,7 @@ bool PrefixCache::host_alloc_locked(int n, std::vector<int>& out, uint64_t keep_
 bool PrefixCache::copy_locked(const std::vector<int>& dev, const std::vector<int>& host, int n, bool to_host) {
     if (n <= 0) return true;
     if ((int)dev.size() < n || (int)host.size() < n) return false;
-    if (!stream_ && cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess) {
-        cudaGetLastError();
+    if (!stream_ && !cu_ok(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "copy stream")) {
         stream_ = nullptr;
         return false;
     }
@@ -282,9 +300,8 @@ bool PrefixCache::copy_locked(const std::vector<int>& dev, const std::vector<int
         d_ptrs_ = nullptr;
         d_cap_ = 0;
         const int cap = std::max(n, kv_->max_blocks_per_seq());
-        if (cudaMalloc(&d_ids_, (size_t)cap * sizeof(int)) != cudaSuccess ||
-            cudaMalloc(&d_ptrs_, (size_t)cap * sizeof(char*)) != cudaSuccess) {
-            cudaGetLastError();
+        if (!cu_ok(cudaMalloc(&d_ids_, (size_t)cap * sizeof(int)), "copy block ids") ||
+            !cu_ok(cudaMalloc(&d_ptrs_, (size_t)cap * sizeof(char*)), "copy host pointers")) {
             if (d_ids_) cudaFree(d_ids_);
             d_ids_ = nullptr;
             d_ptrs_ = nullptr;
@@ -296,20 +313,23 @@ bool PrefixCache::copy_locked(const std::vector<int>& dev, const std::vector<int
     for (int i = 0; i < n; ++i) {
         void* d = nullptr;
         // Mapped pinned memory: its device address (the same pointer under UVA).
-        if (cudaHostGetDevicePointer(&d, host_block(host[(size_t)i]), 0) != cudaSuccess) {
-            cudaGetLastError();
+        if (!cu_ok(cudaHostGetDevicePointer(&d, host_block(host[(size_t)i]), 0), "host block address"))
             return false;
-        }
         ptrs[(size_t)i] = static_cast<char*>(d);
     }
-    bool ok = cudaMemcpyAsync(d_ids_, dev.data(), (size_t)n * sizeof(int), cudaMemcpyHostToDevice,
-                              stream_) == cudaSuccess &&
-              cudaMemcpyAsync(d_ptrs_, ptrs.data(), (size_t)n * sizeof(char*), cudaMemcpyHostToDevice,
-                              stream_) == cudaSuccess &&
-              launch_kv_blocks_host_copy(layout_, d_ids_, d_ptrs_, n, to_host, stream_);
-    ok = (cudaStreamSynchronize(stream_) == cudaSuccess) && ok;
-    if (!ok) cudaGetLastError();
-    return ok;
+    // Ordering against the model's streams: an entry's blocks are complete and read-only (a cached
+    // prefix is never written again), and the blocks a restore writes were just allocated to a new
+    // session, while a block returns to the pool only after its last holder's final step read its
+    // result back on the host, so no kernel can still be writing it.
+    bool ok = cu_ok(cudaMemcpyAsync(d_ids_, dev.data(), (size_t)n * sizeof(int), cudaMemcpyHostToDevice,
+                                    stream_), "copy block ids upload") &&
+              cu_ok(cudaMemcpyAsync(d_ptrs_, ptrs.data(), (size_t)n * sizeof(char*),
+                                    cudaMemcpyHostToDevice, stream_), "copy host pointers upload");
+    if (ok && !launch_kv_blocks_host_copy(layout_, d_ids_, d_ptrs_, n, to_host, stream_)) {
+        cu_ok(cudaGetLastError(), "kv host copy launch");
+        ok = false;
+    }
+    return cu_ok(cudaStreamSynchronize(stream_), to_host ? "kv to host" : "kv from host") && ok;
 }
 
 }  // namespace sparkinfer
