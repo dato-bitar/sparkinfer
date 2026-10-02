@@ -424,3 +424,28 @@ Later still, 2026-10-01:
   - Bonsai prefill @512 (10,152 → 9,460): noise, ~10,100 on both.
   - Muse cb c32 (2,136 → 388): real, and v0.5.14 has it too. The run is bimodal on an out-of-memory edge; fixed in #1236.
 - Final speculation on main (DFlash2, real prompts): c1/c2/c4/c8 212/410/714/1,040 tok/s at T=0.7, 215/402/675/1,011 at T=1.0.
+
+0.6.1 and 0.6.2, 2026-10-01 to 10-02: speculation is on by default (the "Phase B" of the 0.6.0 plan).
+- **v0.6.0 released:** tag 459f71e, Docker image only. The Windows build had been red since 2026-08-14, so the release job never ran.
+- **#1238:** the Windows build compiles again. MSVC rejected `if constexpr` before `#pragma unroll`, captureless lambdas reading local `constexpr`s, and a GCC-only attribute, and the NVFP4-off stubs had drifted. Tags produce binaries again from v0.6.1.
+- **Eval box storage fault:** `/root` is gocryptfs (Lium). One 1 MiB block of the ModelOpt checkpoint went unreadable, and the server took a SIGBUS on load. Fixed with a CRC-verified re-download, with a spare copy in `/root/perfcheck/q38mo_copy`.
+- **#1239, draft offload.** A loaded DFlash2 cost 0.23–0.66x at c16–c32: the KV pool is sized from `--ctx` alone, so the draft's ~3 GB came out of the serving headroom.
+  - The draft lives in a CUDA virtual-memory arena (driver entry points resolved at runtime, so no libcuda link).
+  - It moves to pinned host memory while live > group size, or on out-of-memory, and comes back at the same addresses.
+  - Speculation pins it while running.
+  - A join checks its room first.
+  - A group ends at once when the waiting requests cannot all join.
+  - AIPerf, draft vs none: 1.15–2.22x at c1–c4, 0.96–1.16x at c16–c32.
+- **#1241:** requests without `max_tokens` were cut at 256 tokens. #1088's fix never took effect because the parsed default was 256.
+- **v0.6.1 released:** #1238, #1239 and #1241, with binaries.
+- **#1243, window-sized DFlash2 slots.** Every layer attends a 2,048-token window, so a slot slides over 4,112 rows instead of up to 16,384: ~130 MB instead of ~0.5 GB, slot 0 included.
+  - tau and steps are identical to main at 8K and 16K prompts and over 4K-token generations.
+  - Without it, long answers at c4/c8 ran 0.95x / 0.92x: slots filled the device, a declined join ended the group, and speculation stopped for the load.
+- **#1240:** the container's `serve` loads DFlash2 by default (`SPEC_DRAFT=none` to opt out), and a request speculates up to the end of the draft's context, then hands off.
+  - Long answers without `max_tokens`: c4 859.7 vs 294.6 tok/s (2.92x), c8 527.1 vs 466.7 (1.13x), with 0 declined joins.
+  - The real entrypoint was run end to end on the box: with a staged drafter, and with a fresh 3.8 GB download.
+- **v0.6.2 released:** #1243 and #1240. **#1245:** the log names the loaded draft.
+- **Open:**
+  - a declined join still ends its group, and `spec_tried` is one-shot, so a long-running load that never drains back to all-fresh requests stops speculating after a group ends;
+  - speculation above 8 concurrent requests ("Phase C");
+  - T2 (long-context greedy) needs better draft acceptance.
