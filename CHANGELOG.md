@@ -5,6 +5,16 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Speculative decoding
+
+- **A group member that reaches the end of the draft's context no longer ends speculation for
+  the group.** It stops drafting and verifies one row a step (lossless, as every verify is),
+  while the other members keep speculating and new requests keep joining. Before, the first
+  answer to pass 16K tokens, which a thinking model without `max_tokens` writes, handed every
+  member off. Speculation then stopped for the rest of a continuous load.
+- **A batched draft slides a member's slot itself** (#1247) instead of sending every member
+  through the per-slot draft for that step.
+
 ## [0.6.2] — 2026-10-02
 
 **The release container speculates by default** with z-lab's DFlash2 drafter:
