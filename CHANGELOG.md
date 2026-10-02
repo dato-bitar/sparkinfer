@@ -5,9 +5,20 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.3] — 2026-10-02
+
+**Speculation keeps working under a continuous load.**
+- **Before:** once a group ended, a new one formed only after every live request was a fresh
+  prompt, and one answer passing the drafter's 16K context ended speculation for its whole group.
+- **Now:** requests already decoding join a group without a draft (#1249), and a member that
+  reaches the drafter's context keeps going the same way (#1248).
+- **Measured:** under Poisson arrivals at 1 request/s (`eval/spec_open_arrivals.py`, RTX 5090,
+  Qwen3.8-27B + DFlash2), mean latency is 2.77 s against 4.29 s for the drafter without
+  adoption and 4.64 s without a drafter; p90 is 6.16 s against 8.55 / 8.71.
+
 ### Speculative decoding
 
-- **A speculation group can form while other requests are already decoding.** A group needed every
+- **A speculation group can form while other requests are already decoding** (#1249). A group needed every
   live request to be a fresh prompt, so under a load that never drained (the next prompt arriving
   while others decode) no group formed again once one ended. Now a group forms when at least one
   fresh prompt is waiting.
@@ -21,12 +32,14 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
   - `SPARKINFER_SPEC_ADOPT=0` requires every request to be fresh, as before.
 
 - **A group member that reaches the end of the draft's context no longer ends speculation for
-  the group.** It stops drafting and verifies one row a step (lossless, as every verify is),
+  the group** (#1248). It stops drafting and verifies one row a step (lossless, as every verify is),
   while the other members keep speculating and new requests keep joining. Before, the first
   answer to pass 16K tokens, which a thinking model without `max_tokens` writes, handed every
   member off. Speculation then stopped for the rest of a continuous load.
 - **A batched draft slides a member's slot itself** (#1247) instead of sending every member
   through the per-slot draft for that step.
+- **The startup log names the loaded draft** (DFlash2 or DSpark) instead of calling every draft
+  DSpark (#1245).
 
 ## [0.6.2] — 2026-10-02
 
