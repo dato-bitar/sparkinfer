@@ -1297,7 +1297,7 @@ int main(int argc, char** argv) {
         }
         const auto sp = engine.speculative_stats();
         if (sp.enabled) {
-            body << "# HELP sparkinfer_speculative_runs_total Requests decoded speculatively (DSpark)\n"
+            body << "# HELP sparkinfer_speculative_runs_total Requests decoded speculatively (with the loaded draft)\n"
                     "# TYPE sparkinfer_speculative_runs_total counter\n"
                  << "sparkinfer_speculative_runs_total " << sp.runs << "\n"
                  << "# HELP sparkinfer_speculative_tokens_total Tokens produced by speculative decoding\n"

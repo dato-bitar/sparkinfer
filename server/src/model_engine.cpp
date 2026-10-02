@@ -877,7 +877,7 @@ bool ModelEngine::load_draft(const std::string& dir, std::string& err) {
         // The usual cause is device memory, not the checkpoint: the target's KV pool is sized for
         // the whole --ctx before the draft loads, and at --ctx 262144 a 32 GB card has no room
         // left for it (#1086).
-        err = "cannot load a DSpark draft from " + dir + " at --ctx " +
+        err = "cannot load a draft from " + dir + " at --ctx " +
               std::to_string(impl_->cfg.max_seq) +
               " -- if the log above shows CUDA out-of-memory errors, lower --ctx (131072 fits a 32 GB card)";
         return false;
@@ -901,8 +901,8 @@ bool ModelEngine::load_draft(const std::string& dir, std::string& err) {
     impl_->model->set_dflash_draft(draft.get());
     impl_->draft = std::move(draft);
     impl_->batch_engine->enable_speculative(true);
-    fprintf(stderr, "[sparkinfer-server] speculative decoding: DSpark draft %s (block %d, draft context %d)\n",
-            dir.c_str(), impl_->draft->config().block_size, impl_->draft->config().max_seq);
+    fprintf(stderr, "[sparkinfer-server] speculative decoding: %s draft %s (block %d, draft context %d)\n",
+            impl_->draft->config().dflash2 ? "DFlash2" : "DSpark", dir.c_str(), impl_->draft->config().block_size, impl_->draft->config().max_seq);
     return true;
 }
 
