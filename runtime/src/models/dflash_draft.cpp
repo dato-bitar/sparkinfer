@@ -499,6 +499,34 @@ struct DFlashDraftModel::Impl {
     // slot holds its whole reach (DSpark, whose layers attend everything).
     int win_rows = 0;
     int slot_rows(int need) const { return win_rows > 0 ? std::min(need, win_rows) : need; }
+    // A windowed slot slides: when a block (ctx_len context rows then BW block rows, the context
+    // starting at position `past`, the block at pos0) would run past its rows, every key older than
+    // the window the block reads (pos0 - sliding_window + 1: the earliest query is pos0, and keys
+    // only grow) is dropped, the rest moved to row 0 and `base` advanced. Keys are stored rotated at
+    // their absolute positions, so moving them changes nothing; the move never overlaps (at most a
+    // window kept, at least a window dropped: win_rows >= 2 * (window + block)). The first block of
+    // a long prompt just starts at the window. Positions under `base` are then never produced, as
+    // the floor's are not. Used on the current slot (forward_block) and on a parked one
+    // (forward_blocks); false when the window starts past every row the block has.
+    bool slide(std::vector<bf16*>& kc, std::vector<bf16*>& vc, int& b, int floor, int rows, int past,
+               int ctx_len, int pos0, int BW, cudaStream_t st) {
+        if (win_rows == 0 || past + ctx_len + BW - b <= rows) return true;
+        const int nb = std::max(std::max(b, floor), pos0 - cfg.sliding_window + 1);
+        if (nb > b) {
+            const int keep = past - nb;
+            if (keep > 0) {
+                const int kvd = cfg.n_kv_heads * cfg.head_dim;
+                const size_t bytes = (size_t)keep * kvd * sizeof(bf16);
+                const size_t from = (size_t)(nb - b) * kvd;
+                for (int L = 0; L < cfg.n_layers; ++L) {
+                    cu(cudaMemcpyAsync(kc[L], kc[L] + from, bytes, cudaMemcpyDeviceToDevice, st), "slot slide k");
+                    cu(cudaMemcpyAsync(vc[L], vc[L] + from, bytes, cudaMemcpyDeviceToDevice, st), "slot slide v");
+                }
+            }
+            b = nb;
+        }
+        return b <= past + ctx_len;
+    }
     void park_current() {
         Slot& sl = slots[(size_t)cur_slot];
         sl.k = k_cache; sl.v = v_cache; sl.tp = target_proj;
@@ -1578,31 +1606,8 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     // on without the draft, as after any failed block).
     if (s.win_rows > 0 && past > 0 && past + ctx_len != pos0) return false;
     if (past == 0) { s.ctx_floor = std::max(0, target_hidden_start); s.base = 0; }
-    // A windowed slot slides: when this block would run past its rows, every key older than the
-    // window this block reads (pos0 - sliding_window + 1: the earliest query is pos0, keys only
-    // grow) is dropped, the rest moved to row 0 and `base` advanced. Keys are stored rotated at
-    // their absolute positions, so moving them changes nothing; the move never overlaps (at most a
-    // window kept, at least a window dropped). The first block of a long prompt just starts at the
-    // window. Positions under `base` are then never produced, as the floor's are not.
-    if (s.win_rows > 0 && past + ctx_len + BW - s.base > s.cap) {
-        const int nb = std::max(std::max(s.base, s.ctx_floor), pos0 - c.sliding_window + 1);
-        if (nb > s.base) {
-            const int keep = past - nb;
-            if (keep > 0) {
-                const int kvd = c.n_kv_heads * c.head_dim;
-                const size_t bytes = (size_t)keep * kvd * sizeof(bf16);
-                const size_t from = (size_t)(nb - s.base) * kvd;
-                for (int L = 0; L < c.n_layers; ++L) {
-                    cu(cudaMemcpyAsync(s.k_cache[L], s.k_cache[L] + from, bytes, cudaMemcpyDeviceToDevice, st),
-                       "slot slide k");
-                    cu(cudaMemcpyAsync(s.v_cache[L], s.v_cache[L] + from, bytes, cudaMemcpyDeviceToDevice, st),
-                       "slot slide v");
-                }
-            }
-            s.base = nb;
-        }
-        if (s.base > past + ctx_len) return false;   // the window starts past every row this block has
-    }
+    // A windowed slot slides before a block that would run past its rows (Impl::slide).
+    if (!s.slide(s.k_cache, s.v_cache, s.base, s.ctx_floor, s.cap, past, ctx_len, pos0, BW, st)) return false;
     const int eff_floor = s.win_rows > 0 ? std::max(s.ctx_floor, s.base) : s.ctx_floor;
     // How many of this block's context rows sit below the floor: never produced, never attended.
     const int floor_skip = std::max(0, std::min(ctx_len, eff_floor - past));
@@ -2555,10 +2560,15 @@ bool DFlashDraftModel::forward_blocks(const BlockJob* jobs, int n_jobs, int prop
         if (jb.slot < 0 || (size_t)jb.slot >= s.slots.size() || !s.slots[(size_t)jb.slot].live ||
             !jb.target_hidden || !jb.noise_ids || !jb.out_argmax || jb.ctx_len < 1 || jb.ctx_len > 8)
             return false;
-        const Impl::Slot& sl = s.slots[(size_t)jb.slot];
+        Impl::Slot& sl = s.slots[(size_t)jb.slot];
         const int past = sl.seq_len;
-        // A slot that has to slide first goes through forward_block, which slides it.
-        if (past + jb.ctx_len != jb.pos0 || sl.ctx_floor > past || past + jb.ctx_len + BW - sl.base > sl.cap)
+        if (past + jb.ctx_len != jb.pos0 || sl.ctx_floor > past) return false;
+        // A slot that has run out of rows slides here, as forward_block would at the start of its
+        // block, so the batch keeps the members together: declining sent every member through
+        // forward_block one at a time, about one group step in 75 at eight members. If a later job
+        // declines the batch, the slid slot is simply already slid for forward_block.
+        if (!s.slide(sl.k, sl.v, sl.base, sl.ctx_floor, sl.cap, past, jb.ctx_len, jb.pos0, BW, s.stream) ||
+            past + jb.ctx_len + BW - sl.base > sl.cap)
             return false;
         for (int L = 0; L < c.n_layers; ++L) {
             const int window = (L < (int)c.sliding_layers.size() && c.sliding_layers[L]) ? c.sliding_window : 0;
