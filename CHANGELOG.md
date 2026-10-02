@@ -7,6 +7,19 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Speculative decoding
 
+- **A speculation group can form while other requests are already decoding.** A group needed every
+  live request to be a fresh prompt, so under a load that never drained (the next prompt arriving
+  while others decode) no group formed again once one ended. Now a group forms when at least one
+  fresh prompt is waiting.
+  - **Adoption:** requests already decoding are adopted as members without a draft. Their next
+    token is a one-row block, verified at the position and sampling step the ordinary decode step
+    would use.
+  - **Recurrent state:** each adopted session's GDN state goes back from packed decode's bf16 to
+    fp32, which is exact.
+  - **Leaving:** when no member drafts any more and nobody joins, the group hands them back to
+    packed decode.
+  - `SPARKINFER_SPEC_ADOPT=0` requires every request to be fresh, as before.
+
 - **A group member that reaches the end of the draft's context no longer ends speculation for
   the group.** It stops drafting and verifies one row a step (lossless, as every verify is),
   while the other members keep speculating and new requests keep joining. Before, the first
