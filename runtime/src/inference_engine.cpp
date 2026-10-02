@@ -456,6 +456,7 @@ void ContinuousBatchEngine::run_spec_group() {
         // Past the draft's context (spec_group_reach): it stays in the group without proposals, its
         // block just `next`, so a one-row verify decodes it while the others keep speculating.
         bool no_draft = false;
+        bool adopted = false;   // joined while decoding ordinarily (never speculated)
         bool done = false;
     };
     std::vector<Member> members;
@@ -468,9 +469,10 @@ void ContinuousBatchEngine::run_spec_group() {
     if (!model_->spec_group_begin()) return;
     // Requests already decoding join as members without a draft: their next token, not yet emitted,
     // is the block, and each step's verify ingests it at prompt + decode_emitted and draws the one
-    // after with step decode_emitted + 1 -- exactly the ordinary decode step (step_job), so their
-    // tokens are the ones they would have had. At the group's end, handoff gives them back as they
-    // were. The fresh prompts join one a step below and speculate.
+    // after with step decode_emitted + 1 -- the position and sampler step of the ordinary decode
+    // step (step_job). The arithmetic differs as a group's does: the grouped verify's kernels, and
+    // the GDN state in fp32 where packed decode keeps rounding it to bf16. At the group's end,
+    // handoff gives them back as they were. The fresh prompts join one a step below and speculate.
     {
         std::lock_guard<std::mutex> lock(mu_);
         for (auto& kv : jobs_) {
@@ -486,6 +488,7 @@ void ContinuousBatchEngine::run_spec_group() {
             m.next = j->next_token;
             m.next_emitted = false;
             m.no_draft = true;
+            m.adopted = true;
             members.push_back(m);
         }
     }
@@ -567,7 +570,7 @@ void ContinuousBatchEngine::run_spec_group() {
         job.prefill_pos = (int)job.req.prompt.size();
         job.phase = SeqPhase::DECODE;
         job.next_token = m.next;
-        spec_handoffs_.fetch_add(1, std::memory_order_relaxed);
+        if (!m.adopted) spec_handoffs_.fetch_add(1, std::memory_order_relaxed);
     };
     auto live_members = [&] {
         int n = 0;
@@ -871,13 +874,16 @@ void ContinuousBatchEngine::run_spec_group() {
         // prompt tail (at most 7 rows) is verified whole, committed, and the others share the rest.
         std::unique_ptr<bool[]> commit(new bool[(size_t)n]());
         bool any_commit = false;
-        int tail_rows = 0, n_spec = 0;
+        // Members without a draft take one row each and are not counted among the sharers: seven
+        // adopted beside one drafter would otherwise have cut its block to four rows.
+        int tail_rows = 0, n_spec = 0, one_rows = 0;
         for (int g = 0; g < n; ++g) {
             const Member& m = *act[(size_t)g];
             if (m.tail_pending) tail_rows += (int)m.block.size();
+            else if (m.no_draft) ++one_rows;
             else ++n_spec;
         }
-        const int row_cap = std::max(2, (kQwen35MaxPackedRows - tail_rows) / std::max(n_spec, 1));
+        const int row_cap = std::max(2, (kQwen35MaxPackedRows - tail_rows - one_rows) / std::max(n_spec, 1));
         // A request speculating alone verifies the depth that makes the most tokens per ms. Its
         // single-sequence verify costs, relative to 8 rows, about kRel[L] (measured at ~1K context:
         // 10.45 / 10.36 / 10.89 / 11.20 / 12.46 / 13.76 / 13.18 / 14.11 ms for 1..8 rows), scaled by
@@ -939,11 +945,16 @@ void ContinuousBatchEngine::run_spec_group() {
         if (!model_->spec_group_verify(n, seqs.data(), blocks.data(), lens.data(), starts.data(),
                                        any_sampled ? &samp : nullptr, out.data(), keep.data(),
                                        any_commit ? commit.get() : nullptr)) {
+            // A verify that fails has committed nothing. An adopted member is still exactly where its
+            // ordinary decode left it, so it goes back to that decode with the rest (leave, below)
+            // instead of failing a request that was never speculating.
             for (Member* pm : act) {
+                if (pm->adopted && !pm->next_emitted) continue;
                 pm->job->error = "speculative decode failed; the request was aborted";
                 pm->job->internal_error = true;
                 finish(*pm);
             }
+            leave = true;
             break;
         }
         trace_verify_ms += ms_since(t_verify);
@@ -990,7 +1001,7 @@ void ContinuousBatchEngine::run_spec_group() {
             m.have_block = false;
             m.feed_off = off;
             m.feed_len = k;
-            spec_tokens_.fetch_add((uint64_t)k, std::memory_order_relaxed);
+            if (!m.adopted) spec_tokens_.fetch_add((uint64_t)k, std::memory_order_relaxed);
             // A bonus EOS ends the request here, as dflash_generate does.
             if (m.next == cfg.eos_id || (cfg.eos_id2 >= 0 && m.next == cfg.eos_id2))
                 if (emit(m, m.next)) m.next_emitted = true;
@@ -1425,8 +1436,14 @@ void ContinuousBatchEngine::worker_loop() {
                         for (const auto& kv : jobs_) {
                             const Job& j = *kv.second;
                             if (j.done) continue;
+                            // ...and one the join would take: it speculates at least 64 positions
+                            // inside the draft's context (spec_group_join's own test). Anything else
+                            // started a group only to be declined, and with requests decoding beside
+                            // it that cost each of them a state conversion and packed decode its graphs.
                             const bool is_fresh = !j.spec_tried && j.phase == SeqPhase::PREFILL &&
-                                                  j.prefill_pos == j.req.prefill_start && spec_eligible(j.req);
+                                                  j.prefill_pos == j.req.prefill_start && spec_eligible(j.req) &&
+                                                  j.req.max_new_tokens >= 64 &&
+                                                  (int)j.req.prompt.size() + 64 <= model_->spec_group_reach();
                             fresh += is_fresh;
                             all = all && (is_fresh || (adopt_on && spec_adoptable(j)));
                         }

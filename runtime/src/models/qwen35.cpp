@@ -6201,6 +6201,38 @@ int Qwen35Model::spec_group_reach() const {
     return s.dflash_draft->config().max_seq - 2 * (spec_group_depth() + 1);
 }
 
+// Room for a whole join, checked before anything is touched, so a decline is like "draft slot": the
+// ordinary path prefills the request. Without it a long join started on a device that a busy
+// stretch had filled got its slot and capture, then no arena for its pass, and a checkpointed or
+// resumed prompt -- which cannot decline mid-way -- ran the token loop: ~80 s for 8K tokens with
+// every other request waiting (AIPerf 8K prompts at c16, 0.37x). The pass's arena is ~128 KB a row
+// (1,035 MB at 8,240) up to the 16K window; the capture, the slot and the verify arenas are sized as
+// the join allocates them. Both joins use it (spec_group_join, spec_group_join_body).
+// SPARKINFER_SPEC_JOIN_ROOM=0 skips it.
+template <class Impl>
+static bool join_has_room(Impl& s, DFlashDraftModel& draft, int n, int prefill_from, int reach, int depth) {
+    static const bool room_check = [] {
+        const char* e = getenv("SPARKINFER_SPEC_JOIN_ROOM");
+        return !(e && e[0] == '0');
+    }();
+    if (!room_check) return true;
+    const DFlashDraftConfig& dc = draft.config();
+    const size_t rows = (size_t)(n - prefill_from);
+    const size_t arena = ((size_t)64 << 20) + std::min<size_t>(rows, 16384) * ((size_t)128 << 10);
+    const int cap_from = std::max(prefill_from, n >= 12288 ? n - 4096 : 0);
+    const size_t cap_rows = (size_t)std::max(0, std::min(s.cfg.max_seq, n + depth + 1) - cap_from);
+    const size_t capture = cap_rows * dc.target_layer_ids.size() * (size_t)s.cfg.hidden * sizeof(bf16);
+    const size_t slot_bytes = (size_t)draft.slot_rows(reach + 2 * (depth + 1)) *
+        (2 * (size_t)dc.n_layers * dc.n_kv_heads * dc.head_dim + dc.hidden) * sizeof(bf16);
+    const size_t verify = (size_t)320 << 20, margin = (size_t)256 << 20;
+    // The capture buffer this join replaces is freed before the new one is allocated.
+    const size_t reused = s.dflash_context
+        ? (size_t)s.dflash_ctx_cap * s.dflash_n_cap * s.cfg.hidden * sizeof(bf16) : 0;
+    size_t fb = 0, tb = 0;
+    return !(cudaMemGetInfo(&fb, &tb) == cudaSuccess &&
+             fb + reused < arena + capture + slot_bytes + verify + margin);
+}
+
 int Qwen35Model::spec_group_join(const std::vector<int>& prompt, int max_new, int slot,
                                  const SpecHooks& hooks, SpecResume* resume, int* proposals) {
     Impl& s = *p_;
@@ -6229,37 +6261,8 @@ int Qwen35Model::spec_group_join(const std::vector<int>& prompt, int max_new, in
         return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_join0).count();
     };
     double t_setup = 0, t_prefill = 0, t_seed = 0;
-    // Room for the whole join, checked before anything is touched -- so a decline here is like
-    // "draft slot" below, and the ordinary path prefills the request. Without it a long join
-    // started on a device that a busy stretch had filled got its slot and capture, then no arena
-    // for its pass, and a checkpointed or resumed prompt -- which cannot decline mid-way -- ran
-    // the token loop: ~80 s for 8K tokens with every other request waiting (AIPerf 8K prompts at
-    // c16, 0.37x). The pass's arena is ~128 KB a row (1,035 MB at 8,240) up to the 16K window;
-    // the capture, the slot and the verify arenas are sized as they are allocated below.
-    // SPARKINFER_SPEC_JOIN_ROOM=0 skips the check.
-    {
-        static const bool room_check = [] {
-            const char* e = getenv("SPARKINFER_SPEC_JOIN_ROOM");
-            return !(e && e[0] == '0');
-        }();
-        if (room_check) {
-            const size_t rows = (size_t)(n - prefill_from);
-            const size_t arena = ((size_t)64 << 20) + std::min<size_t>(rows, 16384) * ((size_t)128 << 10);
-            const int cap_from = std::max(prefill_from, n >= 12288 ? n - 4096 : 0);
-            const size_t cap_rows = (size_t)std::max(0, std::min(s.cfg.max_seq, n + depth + 1) - cap_from);
-            const size_t capture = cap_rows * dc.target_layer_ids.size() * (size_t)s.cfg.hidden * sizeof(bf16);
-            const size_t slot_bytes = (size_t)draft.slot_rows(reach + 2 * (depth + 1)) *
-                (2 * (size_t)dc.n_layers * dc.n_kv_heads * dc.head_dim + dc.hidden) * sizeof(bf16);
-            const size_t verify = (size_t)320 << 20, margin = (size_t)256 << 20;
-            // The capture buffer this join replaces is freed before the new one is allocated.
-            const size_t reused = s.dflash_context
-                ? (size_t)s.dflash_ctx_cap * s.dflash_n_cap * s.cfg.hidden * sizeof(bf16) : 0;
-            size_t fb = 0, tb = 0;
-            if (cudaMemGetInfo(&fb, &tb) == cudaSuccess &&
-                fb + reused < arena + capture + slot_bytes + verify + margin)
-                return fail("no room for the join");
-        }
-    }
+    // Room for the whole join, before anything is touched (join_has_room).
+    if (!join_has_room(s, draft, n, prefill_from, reach, depth)) return fail("no room for the join");
     // The slot holds what this request can reach (the bound checked above), not the draft's whole
     // context -- and for DFlash2, whose layers all attend a 2,048-token window, at most ~4K rows that
     // slide (DFlashDraftModel::slot_rows): ~130 MB rather than ~0.5 GB for a request that can reach 16K.
@@ -6391,6 +6394,9 @@ int Qwen35Model::spec_group_join_body(const std::vector<int>& prompt, int max_ne
         !batched_prefill_windowed_enabled(s.gguf, s.cfg, b, s.kv))
         return -1;
     std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+    // The same room test as spec_group_join: this is the path a first joiner beside adopted members
+    // takes, so it runs exactly when the device is busiest. Declined, the caller tries spec_group_join.
+    if (!join_has_room(s, draft, n, 0, reach, depth)) return -1;
     if (!draft.use_slot(slot, reach + 2 * (depth + 1))) return -1;
     const int capture_start = n >= 12288 ? n - 4096 : 0;
     set_dflash_capture(true, dc.target_layer_ids, kQwen35MaxPackedRows, capture_start,
