@@ -446,6 +446,9 @@ void ContinuousBatchEngine::run_spec_group() {
         // Its draft's record, decayed: proposals accepted, and verifies that ended in a rejection.
         // q = (acc + 1) / (acc + rej + 2) estimates the chance its next proposal is accepted.
         float acc = 2.f, rej = 1.f;
+        // Past the draft's context (spec_group_reach): it stays in the group without proposals, its
+        // block just `next`, so a one-row verify decodes it while the others keep speculating.
+        bool no_draft = false;
         bool done = false;
     };
     std::vector<Member> members;
@@ -545,17 +548,22 @@ void ContinuousBatchEngine::run_spec_group() {
     bool leave = false;
     const int reach = model_->spec_group_reach();
     for (;;) {
-        // 0. A member that has reached the end of the draft's context hands off with the rest:
-        //    its next block would draft and capture past it. Speculation covered the request up to
-        //    there; it decodes on from its committed position.
-        for (const Member& m : members) {
-            if (m.done || m.pos <= reach) continue;
+        // 0. A member that has reached the end of the draft's context stops drafting: its next block
+        //    would draft and capture past it. It stays in the group and verifies one row a step
+        //    (lossless, as every verify is), so the others keep speculating. Ending the group for it
+        //    stopped speculation for every member, and for the load, as soon as one answer passed
+        //    16K tokens (a thinking model without max_tokens).
+        for (Member& m : members) {
+            if (m.done || m.no_draft || m.pos <= reach) continue;
+            m.no_draft = true;
             if (spec_group_trace())
-                fprintf(stderr, "[spec-group] leave: a member reached the draft's context (%d)\n", m.pos);
-            leave = true;
-            break;
+                fprintf(stderr, "[spec-group] a member reached the draft's context (%d): it drafts no more\n", m.pos);
         }
-        if (leave) break;
+        for (Member& m : members)
+            if (!m.done && m.no_draft && !m.have_block) {
+                m.block.assign(1, m.next);
+                m.have_block = true;
+            }
         // 1. Drafts, from the hidden rows each member's last verify captured (consumed before a
         //    join below re-arms the capture buffers).
         auto t_draft = std::chrono::steady_clock::now();
