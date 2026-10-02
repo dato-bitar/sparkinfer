@@ -565,19 +565,63 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
     for (int rr_ = (split_sink ? 0 : 1); rr_ < 2; rr_++) {
         const int lo = (rr_ == 0) ? 0 : (SINK ? (split_sink ? blk_rs : 0) : blk_rs);
         const int hi = (rr_ == 0) ? BLKSZ : (last_q + 1);
+        // The next group's K fragments are loaded into a second register set at the TOP of this
+        // group's body, so the pool latency -- the only per-group term that is neither mma,
+        // shared traffic nor barrier -- is spent under this group's QK/softmax/PV instead of
+        // serialized in front of its QK. The prefetched fragments are consumed by a register copy
+        // after the group's PV: 32 MOVs against the latency of eight 16-byte loads per lane. Same
+        // pages, same fragments, same per-key order, so the arithmetic is unchanged. With one
+        // block per SM there is no other block's warp to hide the load behind, which is why the
+        // pipeline has to be explicit here.
+        constexpr int KREG = (SPL == RQH) ? 1 : KSTEPS;
+        auto load_kfr = [&](int kf_k0, int kf_gblk, unsigned (&kf)[KREG][2][2]) {
+            if (warp >= kf_gblk) return;
+            const int pb = block_table[(kf_k0 / BLKSZ) + warp];
+            if constexpr (WIDEK) {
+                // Lane j owns [j*16 + c*64, +16) of its key row, so the four lanes of a key
+                // read 64 consecutive bytes and the load is one 16-byte-per-lane vector.
+                const signed char* kw = k_pool
+                    + ((size_t)pb * BLKSZ * n_kv_heads + kvh) * HEAD_DIM
+                    + (size_t)(lane >> 2) * KVLD + (lane & 3) * 16;
+                #pragma unroll
+                for (int t = 0; t < 2; t++)
+                    #pragma unroll
+                    for (int c = 0; c < 4; c++) {
+                        const uint4 w = *reinterpret_cast<const uint4*>(
+                            kw + (size_t)t * 8 * KVLD + c * 64);
+                        kf[(4 * c + 0) >> 1][t][(4 * c + 0) & 1] = w.x;
+                        kf[(4 * c + 1) >> 1][t][(4 * c + 1) & 1] = w.y;
+                        kf[(4 * c + 2) >> 1][t][(4 * c + 2) & 1] = w.z;
+                        kf[(4 * c + 3) >> 1][t][(4 * c + 3) & 1] = w.w;
+                    }
+            } else if constexpr (SPL != RQH) {
+                const signed char* kl = k_pool
+                    + ((size_t)pb * BLKSZ * n_kv_heads + kvh) * HEAD_DIM
+                    + (size_t)(lane >> 2) * KVLD + (lane & 3) * 4;
+                #pragma unroll
+                for (int kk = 0; kk < KSTEPS; kk++)
+                    #pragma unroll
+                    for (int t = 0; t < 2; t++) {
+                        const signed char* p = kl + (size_t)t * 8 * KVLD + kk * 32;
+                        kf[kk][t][0] = *reinterpret_cast<const unsigned*>(p);
+                        kf[kk][t][1] = *reinterpret_cast<const unsigned*>(p + 16);
+                    }
+            }
+        };
+        unsigned kfr[KREG][2][2];
+        {
+            const int nk0 = min(GN, hi - lo), gb0 = (nk0 + 15) / 16;
+            load_kfr(lo, gb0, kfr);
+        }
         for (int k0 = lo; k0 < hi; k0 += GN) {
             const int nk   = min(GN, hi - k0);
             const int gblk = (nk + 15) / 16;
-            // K/V dequant scales for the group -- shared across all RQH heads (one kv-head).
-            for (int j = tid; j < gblk * 16; j += blockDim.x) {
-                const int lb = (k0 / BLKSZ) + j / 16, within = j & 15;
-                const int pb = block_table[lb];
-                const size_t si = (size_t)(pb * BLKSZ + within) * SLD + kvh;
-                s_ks[j] = k_scale[si];
-                s_vs[j] = v_scale[si];
+            unsigned kfr_n[KREG][2][2];
+            const bool have_n = (k0 + GN < hi);
+            if (have_n) {
+                const int nk1 = min(GN, hi - (k0 + GN)), gb1 = (nk1 + 15) / 16;
+                load_kfr(k0 + GN, gb1, kfr_n);
             }
-
-            // ---- QK: load each K page fragment ONCE, feed the block's q-heads ----
             // One 16x32 K slice covers two m16n8k32 B operands (keys 0-7 and 8-15). The B operand
             // is n x k col-major, which for K[key][dim] means lane l holds key (l>>2), dims
             // (l&3)*4 .. +3 and the same four 16 bytes later -- two 4-byte loads straight out of
@@ -588,41 +632,23 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
             // per block per group however many q-heads the block owns. That is the whole traffic
             // argument -- see the RQH=6 dispatch note. At SPL == RQH there is only one pass and
             // the loads stay inside the k-step loop exactly as they were.
-            constexpr int KREG = (SPL == RQH) ? 1 : KSTEPS;
-            unsigned kfr[KREG][2][2];
+            // K/V dequant scales for the group -- shared across all RQH heads (one kv-head).
+            for (int j = tid; j < gblk * 16; j += blockDim.x) {
+                const int lb = (k0 / BLKSZ) + j / 16, within = j & 15;
+                const int pb = block_table[lb];
+                const size_t si = (size_t)(pb * BLKSZ + within) * SLD + kvh;
+                s_ks[j] = k_scale[si];
+                s_vs[j] = v_scale[si];
+            }
+
+            // ---- QK: each K page fragment was prefetched into kfr at the top of this
+            // iteration (see the pipeline note above the loop) and is read once per block. ----
             const signed char* kl = nullptr;
-            if (warp < gblk) {
-                const int pb = block_table[(k0 / BLKSZ) + warp];
-                kl = k_pool + ((size_t)pb * BLKSZ * n_kv_heads + kvh) * HEAD_DIM
-                   + (size_t)(lane >> 2) * KVLD + (lane & 3) * 4;
-                if constexpr (WIDEK) {
-                    // Lane j owns [j*16 + c*64, +16) of its key row, so the four lanes of a key
-                    // read 64 consecutive bytes and the load is one 16-byte-per-lane vector.
-                    // The 16 unsigneds it returns ARE kfr's 16 slots, in u = kk*2 + h2 order --
-                    // a rename, not a copy, so this costs no register over the narrow form.
-                    const signed char* kw = k_pool
-                        + ((size_t)pb * BLKSZ * n_kv_heads + kvh) * HEAD_DIM
-                        + (size_t)(lane >> 2) * KVLD + (lane & 3) * 16;
-                    #pragma unroll
-                    for (int t = 0; t < 2; t++)
-                        #pragma unroll
-                        for (int c = 0; c < 4; c++) {
-                            const uint4 w = *reinterpret_cast<const uint4*>(
-                                kw + (size_t)t * 8 * KVLD + c * 64);
-                            kfr[(4 * c + 0) >> 1][t][(4 * c + 0) & 1] = w.x;
-                            kfr[(4 * c + 1) >> 1][t][(4 * c + 1) & 1] = w.y;
-                            kfr[(4 * c + 2) >> 1][t][(4 * c + 2) & 1] = w.z;
-                            kfr[(4 * c + 3) >> 1][t][(4 * c + 3) & 1] = w.w;
-                        }
-                } else if constexpr (SPL != RQH) {
-                    #pragma unroll
-                    for (int kk = 0; kk < KSTEPS; kk++)
-                        #pragma unroll
-                        for (int t = 0; t < 2; t++) {
-                            const signed char* p = kl + (size_t)t * 8 * KVLD + kk * 32;
-                            kfr[kk][t][0] = *reinterpret_cast<const unsigned*>(p);
-                            kfr[kk][t][1] = *reinterpret_cast<const unsigned*>(p + 16);
-                        }
+            if constexpr (SPL == RQH) {
+                if (warp < gblk) {
+                    const int pb = block_table[(k0 / BLKSZ) + warp];
+                    kl = k_pool + ((size_t)pb * BLKSZ * n_kv_heads + kvh) * HEAD_DIM
+                       + (size_t)(lane >> 2) * KVLD + (lane & 3) * 4;
                 }
             }
             // H0T is a compile-time head base: qa_base lives in registers, so a runtime index
@@ -1054,6 +1080,17 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
                                                   __fmul_rn(ofr[h][dd][e], up ? cr_hi : cr_lo));
                     }
                 }
+            }
+            // Consume the prefetch: this group's fragments were loaded at the top of the
+            // iteration and have had the whole group to land, so the copy moves registers only.
+            if (have_n) {
+                #pragma unroll
+                for (int ka = 0; ka < KREG; ka++)
+                    #pragma unroll
+                    for (int kb2 = 0; kb2 < 2; kb2++)
+                        #pragma unroll
+                        for (int kc = 0; kc < 2; kc++)
+                            kfr[ka][kb2][kc] = kfr_n[ka][kb2][kc];
             }
         }
     }
