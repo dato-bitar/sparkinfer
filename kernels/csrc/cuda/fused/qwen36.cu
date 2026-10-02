@@ -720,6 +720,27 @@ bool launch_qwen36_gdn_state_to_b16(float* state, void* staging, size_t n, cudaS
     return cudaPeekAtLastError() == cudaSuccess;
 }
 
+// The reverse, for a session that leaves packed decode for a path that reads fp32 state (a
+// speculation group adopting it): bf16 -> fp32 is exact. Staged for the same reason: the fp32
+// destination overlaps the bf16 source.
+__global__ void gdn_state_b16_to_f32_kernel(const __nv_bfloat16* __restrict__ src,
+                                            float* __restrict__ dst, size_t n) {
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (size_t)gridDim.x * blockDim.x)
+        dst[i] = __bfloat162float(src[i]);
+}
+bool launch_qwen36_gdn_state_from_b16(float* state, void* staging, size_t n, cudaStream_t stream) {
+    if (!state || !staging || n == 0) return false;
+    const int threads = 256;
+    int blocks = (int)((n + threads - 1) / threads);
+    if (blocks > 8192) blocks = 8192;
+    auto* stg = reinterpret_cast<__nv_bfloat16*>(staging);
+    gdn_state_b16_copy_kernel<<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(state), stg, n);
+    gdn_state_b16_to_f32_kernel<<<blocks, threads, 0, stream>>>(stg, state, n);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
 bool launch_qwen36_gdn_ar_batched(const void* q_bf16, const void* k_bf16, const void* v_bf16,
                                   const void* alpha_bf16, const void* beta_bf16,
                                   const void* dt_bf16, const void* a_bf16,

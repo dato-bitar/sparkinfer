@@ -476,6 +476,9 @@ void ContinuousBatchEngine::run_spec_group() {
         for (auto& kv : jobs_) {
             Job* j = kv.second.get();
             if (!spec_adoptable(*j)) continue;
+            // Not adopted if its state cannot take the verify's form: it then counts as waiting and
+            // not fresh, and the group ends at its first join check, as before adoption existed.
+            if (!model_->spec_adopt_session(j->seq_id)) continue;
             Member m;
             m.job = j;
             m.slot = -1;

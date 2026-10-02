@@ -714,6 +714,9 @@ public:
     // brought back before a speculation group starts (DFlashDraftModel::offload). Bytes released;
     // false/0 with no draft or when it cannot.
     size_t dflash_draft_offload();
+    // A session leaving ordinary decode for a speculation group (adopted without a draft): its
+    // recurrent state back to the fp32 form the grouped verify reads. False if it cannot be.
+    bool spec_adopt_session(uint64_t seq_id);
     bool dflash_draft_restore();
     bool dflash_draft_offloaded() const;
 

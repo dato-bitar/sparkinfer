@@ -419,6 +419,7 @@ void launch_qwen36_conv_split_l2norm_part(const float* part, int splits, const v
 // One-off fp32 -> compacted-bf16 conversion of a GDN state array (see qwen36.cu). `staging` must
 // hold n bf16 values; the result lands in the first half of `state`.
 bool launch_qwen36_gdn_state_to_b16(float* state, void* staging, size_t n, cudaStream_t stream);
+bool launch_qwen36_gdn_state_from_b16(float* state, void* staging, size_t n, cudaStream_t stream);
 bool launch_qwen36_gdn_ar_batched(const void* q_bf16, const void* k_bf16, const void* v_bf16,
                                   const void* alpha_bf16, const void* beta_bf16,
                                   const void* dt_bf16, const void* a_bf16,

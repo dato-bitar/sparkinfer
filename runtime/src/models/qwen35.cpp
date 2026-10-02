@@ -5858,6 +5858,28 @@ int Qwen35Model::lm_head_quant_type() const { return p_->w.lm_head_type; }
 
 void Qwen35Model::set_dflash_draft(DFlashDraftModel* draft) { p_->dflash_draft = draft; }
 
+bool Qwen35Model::spec_adopt_session(uint64_t seq_id) {
+    Impl& s = *p_;
+    std::lock_guard<std::recursive_mutex> lock(s.device_mu);
+    auto it = s.sessions.find(seq_id);
+    if (seq_id == 0 || it == s.sessions.end()) return false;
+    if (!it->second.lin_state_b16) return true;
+    // Packed decode compacted this session's GDN state to bf16; the grouped verify reads fp32.
+    const size_t st_n = (size_t)gdn_state_slots(s.cfg) * s.cfg.linear_v_heads *
+                        s.cfg.linear_head_dim * s.cfg.linear_head_dim;
+    if (!s.gdn_state_stage && cudaMalloc(&s.gdn_state_stage, st_n * sizeof(bf16)) != cudaSuccess) {
+        cudaGetLastError();
+        s.gdn_state_stage = nullptr;
+        return false;
+    }
+    if (!kernels::launch_qwen36_gdn_state_from_b16(it->second.lin_state, s.gdn_state_stage, st_n, s.stream))
+        return false;
+    it->second.lin_state_b16 = false;
+    if (s.active_seq_id == seq_id) s.active_lin_state_b16 = false;
+    invalidate_decode_graph();
+    return true;
+}
+
 size_t Qwen35Model::dflash_draft_offload() {
     if (!p_->dflash_draft) return 0;
     std::lock_guard<std::recursive_mutex> lock(device_mutex());
